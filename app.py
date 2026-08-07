@@ -25,7 +25,6 @@ st.set_page_config(
 st.title("Sistema de Presupuestación Asistida")
 st.caption("Presupuestos preliminares para remodelación e interiorismo.")
 
-st.info("Uso académico. Validar cantidades, precios y alcances antes de cualquier uso profesional.")
 
 
 # =========================================================
