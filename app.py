@@ -142,17 +142,64 @@ REGLAS IMPORTANTES
     claramente los datos faltantes.
 """
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=PresupuestoIA,
-            temperature=0.2,
-        ),
-    )
+    # Intentamos primero el modelo seleccionado. Si Google devuelve un error
+    # de modelo no disponible (404), probamos alternativas estables.
+    modelos_a_probar = []
+    for modelo in [
+        model_name,
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+    ]:
+        if modelo and modelo not in modelos_a_probar:
+            modelos_a_probar.append(modelo)
 
-    return PresupuestoIA.model_validate_json(response.text)
+    ultimo_error = None
+
+    for modelo in modelos_a_probar:
+        try:
+            response = client.models.generate_content(
+                model=modelo,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=PresupuestoIA,
+                ),
+            )
+
+            if not response.text:
+                raise RuntimeError(
+                    f"Gemini ({modelo}) devolvió una respuesta vacía."
+                )
+
+            resultado = PresupuestoIA.model_validate_json(response.text)
+            return resultado
+
+        except Exception as e:
+            ultimo_error = e
+            mensaje = str(e).lower()
+
+            # Solo hacemos fallback automático cuando parece un problema
+            # de disponibilidad/nombre del modelo. Otros errores (API key,
+            # cuota, permisos, esquema, etc.) se muestran directamente.
+            es_error_modelo = (
+                "404" in mensaje
+                or "not_found" in mensaje
+                or "not found" in mensaje
+                or "model" in mensaje and (
+                    "no longer available" in mensaje
+                    or "not available" in mensaje
+                    or "not supported" in mensaje
+                )
+            )
+
+            if not es_error_modelo:
+                raise
+
+    raise RuntimeError(
+        "No se pudo usar ninguno de los modelos Gemini disponibles. "
+        f"Último error: {ultimo_error}"
+    )
 
 
 def preparar_dataframe(resultado: PresupuestoIA) -> pd.DataFrame:
@@ -399,8 +446,8 @@ with st.sidebar:
 
     model_name = st.text_input(
         "Modelo Gemini",
-        value="gemini-2.5-flash",
-        help="Puedes cambiarlo si tu cuenta tiene acceso a otro modelo."
+        value="gemini-3.6-flash",
+        help="Predeterminado: gemini-3.6-flash. Si no está disponible, la app prueba alternativas automáticamente."
     )
 
     indirectos_pct = st.number_input(
