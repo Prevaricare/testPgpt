@@ -774,7 +774,7 @@ if "resultado" in st.session_state:
 
     with e1:
         st.download_button(
-            "Descargar presupuesto CSV",
+            "CSV",
             data=csv_presupuesto,
             file_name="presupuesto_preliminar.csv",
             mime="text/csv",
