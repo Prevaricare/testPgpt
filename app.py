@@ -18,19 +18,14 @@ from openpyxl.utils import get_column_letter
 
 st.set_page_config(
     page_title="Presupuestador IA",
-    page_icon="🏗️",
+    page_icon=None,
     layout="wide",
 )
 
-st.title("🏗️ Presupuestador IA")
-st.caption(
-    "Generador preliminar de presupuestos para remodelación e interiorismo."
-)
+st.title("Sistema de Presupuestación Asistida")
+st.caption("Presupuestos preliminares para remodelación e interiorismo.")
 
-st.warning(
-    "Uso académico / preliminar. Las cantidades y precios generados por IA "
-    "deben revisarse antes de usarse en un presupuesto real."
-)
+st.info("Uso académico. Validar cantidades, precios y alcances antes de cualquier uso profesional.")
 
 
 # =========================================================
@@ -51,13 +46,22 @@ class Partida(BaseModel):
         description="Precio unitario preliminar estimado en MXN"
     )
     criterio_cuantificacion: str = Field(
-        description="Explicación breve de cómo se obtuvo la cantidad"
+        description="Método o fórmula utilizada para obtener la cantidad"
+    )
+    fundamento_inclusion: str = Field(
+        description="Razón técnica breve por la que esta partida forma parte del alcance"
+    )
+    datos_utilizados: str = Field(
+        description="Datos del usuario o supuestos específicos empleados para cuantificar"
+    )
+    nivel_confianza: str = Field(
+        description="Alta, Media o Baja según la calidad de la información disponible"
     )
     requiere_cotizacion: bool = Field(
         description="True si el precio depende fuertemente de marca/modelo/proveedor"
     )
     observaciones: str = Field(
-        description="Supuestos o advertencias importantes"
+        description="Supuestos, restricciones o advertencias importantes"
     )
 
 
@@ -140,6 +144,16 @@ REGLAS IMPORTANTES
 13. La clave debe ser corta y ordenada, como PRE-01, DEM-01, ACA-01.
 14. Si la descripción es insuficiente, genera solo lo justificable y enumera
     claramente los datos faltantes.
+15. Para cada partida incluye un fundamento técnico breve de por qué debe existir.
+16. Indica explícitamente qué datos utilizaste para cuantificar cada concepto.
+17. Clasifica el nivel de confianza de cada cantidad como Alta, Media o Baja.
+18. Explica los criterios de cuantificación de forma verificable, usando fórmulas,
+    relaciones geométricas o supuestos claros cuando corresponda.
+19. No muestres razonamiento interno ni cadenas de pensamiento. Entrega únicamente
+    una justificación técnica resumida, suficiente para que otra persona pueda revisar
+    el criterio aplicado.
+20. Si un precio es especialmente incierto, indícalo en observaciones y marca que
+    requiere cotización.
 """
 
     # Intentamos primero el modelo seleccionado. Si Google devuelve un error
@@ -219,6 +233,9 @@ def preparar_dataframe(resultado: PresupuestoIA) -> pd.DataFrame:
                 ),
                 "Requiere cotización": "Sí" if p.requiere_cotizacion else "No",
                 "Criterio de cuantificación": p.criterio_cuantificacion,
+                "Fundamento de inclusión": p.fundamento_inclusion,
+                "Datos utilizados": p.datos_utilizados,
+                "Nivel de confianza": p.nivel_confianza,
                 "Observaciones": p.observaciones,
             }
         )
@@ -263,10 +280,10 @@ def crear_excel(
 
     ws["A1"] = resultado.nombre_proyecto
     ws["A1"].font = Font(size=16, bold=True)
-    ws.merge_cells("A1:J1")
+    ws.merge_cells("A1:M1")
 
     ws["A2"] = "Presupuesto preliminar generado con asistencia de IA"
-    ws.merge_cells("A2:J2")
+    ws.merge_cells("A2:M2")
 
     encabezados = list(df.columns)
     fila_header = 4
@@ -321,21 +338,24 @@ def crear_excel(
     widths = {
         "A": 12,
         "B": 20,
-        "C": 48,
-        "D": 12,
+        "C": 42,
+        "D": 10,
         "E": 12,
         "F": 16,
         "G": 16,
         "H": 18,
-        "I": 45,
-        "J": 45,
+        "I": 34,
+        "J": 38,
+        "K": 38,
+        "L": 18,
+        "M": 42,
     }
 
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
 
     ws.freeze_panes = "A5"
-    ws.auto_filter.ref = f"A4:J{fila_fin}"
+    ws.auto_filter.ref = f"A4:M{fila_fin}"
 
     # -----------------------------------------------------
     # Hoja 2: Resumen
@@ -442,12 +462,12 @@ def crear_excel(
 # =========================================================
 
 with st.sidebar:
-    st.header("Configuración")
+    st.header("Parámetros")
 
     model_name = st.text_input(
-        "Modelo Gemini",
+        "Modelo",
         value="gemini-3.6-flash",
-        help="Predeterminado: gemini-3.6-flash. Si no está disponible, la app prueba alternativas automáticamente."
+        help="Modelo principal. La app utiliza alternativas si no está disponible."
     )
 
     indirectos_pct = st.number_input(
@@ -512,7 +532,7 @@ with st.form("form_proyecto"):
 
         ubicacion = st.text_input(
             "Ubicación",
-            placeholder="Ej. Ciudad de México"
+            placeholder="Ciudad o zona de referencia"
         )
 
     with col2:
@@ -540,17 +560,13 @@ with st.form("form_proyecto"):
         )
 
     descripcion = st.text_area(
-        "Describe los trabajos",
+        "Descripción de trabajos",
         height=180,
-        placeholder=(
-            "Ejemplo: retirar loseta existente, colocar porcelanato nuevo "
-            "en piso y muros, cambiar WC y lavabo, sustituir regadera y "
-            "pintar plafón..."
-        ),
+        placeholder="Trabajos, materiales, elementos a retirar o instalar y restricciones conocidas.",
     )
 
     generar = st.form_submit_button(
-        "✨ Analizar y generar presupuesto",
+        "Generar presupuesto",
         type="primary",
         use_container_width=True,
     )
@@ -578,7 +594,7 @@ if generar:
         st.error("Largo, ancho y altura deben ser mayores que cero.")
         st.stop()
 
-    with st.spinner("Analizando alcance y generando partidas..."):
+    with st.spinner("Procesando información..."):
         try:
             resultado = analizar_con_gemini(
                 api_key=api_key,
@@ -620,13 +636,13 @@ if "resultado" in st.session_state:
     df_original = st.session_state["df_presupuesto"]
 
     st.divider()
-    st.subheader("1. Interpretación de la IA")
+    st.subheader("1. Alcance interpretado")
     st.write(resultado.alcance_resumido)
 
     c1, c2 = st.columns(2)
 
     with c1:
-        st.markdown("**Supuestos detectados**")
+        st.markdown("**Supuestos**")
         if resultado.supuestos_generales:
             for item in resultado.supuestos_generales:
                 st.write("•", item)
@@ -634,19 +650,16 @@ if "resultado" in st.session_state:
             st.write("Sin supuestos relevantes.")
 
     with c2:
-        st.markdown("**Datos que convendría confirmar**")
+        st.markdown("**Datos pendientes de confirmar**")
         if resultado.datos_faltantes:
             for item in resultado.datos_faltantes:
                 st.write("•", item)
         else:
             st.write("No se detectaron datos faltantes importantes.")
 
-    st.subheader("2. Revisar presupuesto")
+    st.subheader("2. Presupuesto preliminar")
 
-    st.info(
-        "Puedes editar cantidades y precios unitarios directamente. "
-        "El importe se recalculará para el resumen y para el Excel."
-    )
+    st.caption("Cantidades y precios unitarios son editables. Los importes se recalculan automáticamente.")
 
     columnas_editables = [
         "Clave",
@@ -657,6 +670,9 @@ if "resultado" in st.session_state:
         "P.U. estimado",
         "Requiere cotización",
         "Criterio de cuantificación",
+        "Fundamento de inclusión",
+        "Datos utilizados",
+        "Nivel de confianza",
         "Observaciones",
     ]
 
@@ -682,7 +698,27 @@ if "resultado" in st.session_state:
 
     df_final = recalcular_importes(df_editor)
 
-    st.subheader("3. Resumen")
+    st.subheader("3. Criterios técnicos")
+
+    criterios_df = df_final[
+        [
+            "Clave",
+            "Concepto",
+            "Criterio de cuantificación",
+            "Fundamento de inclusión",
+            "Datos utilizados",
+            "Nivel de confianza",
+            "Observaciones",
+        ]
+    ].copy()
+
+    st.dataframe(
+        criterios_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("4. Resumen económico")
 
     costo_directo = float(df_final["Importe"].sum())
     indirectos = costo_directo * indirectos_pct / 100
@@ -697,7 +733,7 @@ if "resultado" in st.session_state:
     m3.metric("IVA", f"${iva:,.2f}")
     m4.metric("TOTAL", f"${total:,.2f}")
 
-    with st.expander("Ver tabla con importes"):
+    with st.expander("Tabla consolidada"):
         st.dataframe(
             df_final[
                 [
@@ -723,8 +759,49 @@ if "resultado" in st.session_state:
         iva_pct=iva_pct,
     )
 
+    st.subheader("5. Exportación")
+
+    csv_presupuesto = df_final.to_csv(index=False).encode("utf-8-sig")
+    csv_criterios = criterios_df.to_csv(index=False).encode("utf-8-sig")
+
+    resumen_categoria_export = (
+        df_final.groupby("Categoría", as_index=False)["Importe"]
+        .sum()
+        .sort_values("Importe", ascending=False)
+    )
+    csv_resumen = resumen_categoria_export.to_csv(index=False).encode("utf-8-sig")
+
+    e1, e2, e3 = st.columns(3)
+
+    with e1:
+        st.download_button(
+            "Descargar presupuesto CSV",
+            data=csv_presupuesto,
+            file_name="presupuesto_preliminar.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with e2:
+        st.download_button(
+            "Descargar criterios CSV",
+            data=csv_criterios,
+            file_name="criterios_tecnicos.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with e3:
+        st.download_button(
+            "Descargar resumen CSV",
+            data=csv_resumen,
+            file_name="resumen_categorias.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
     st.download_button(
-        "📥 Descargar presupuesto en Excel",
+        "Descargar Excel",
         data=excel_bytes,
         file_name="presupuesto_preliminar.xlsx",
         mime=(
