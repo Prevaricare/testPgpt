@@ -926,9 +926,19 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
+DATABASE_CACHE_VERSION = "2026-08-12-v6.1"
+
+
 @st.cache_resource(show_spinner=False)
-def get_database(database_url: str | None):
-    """Usa PostgreSQL si DATABASE_URL existe; SQLite solo para desarrollo sin URL."""
+def get_database(database_url: str | None, cache_version: str):
+    """
+    Usa PostgreSQL si DATABASE_URL existe; SQLite solo para desarrollo sin URL.
+
+    cache_version forma parte deliberadamente de la clave de caché. Esto evita
+    reutilizar una instancia de Database creada con una versión anterior de la
+    clase después de actualizar app.py en Streamlit Community Cloud.
+    """
+    _ = cache_version
     if database_url:
         # En producción no se hace fallback silencioso: si Supabase falla,
         # se detiene para evitar guardar datos en un SQLite efímero por accidente.
@@ -2625,7 +2635,12 @@ def render_admin_database(db: Database):
             sm2.metric("Presupuestos", stats_now["budgets"])
             sm3.metric("Conceptos", stats_now["concepts"])
 
-        latest = db.get_latest_project_record()
+        try:
+            latest = db.get_latest_project_record()
+        except Exception as exc:
+            latest = None
+            st.error(f"No fue posible consultar el último proyecto: {exc}")
+
         with st.container(border=True):
             st.markdown("### Último proyecto guardado")
             if latest:
@@ -2724,7 +2739,20 @@ st.caption("Generación inicial de presupuestos para remodelación e interiorism
 
 database_url = get_secret("DATABASE_URL")
 try:
-    db, db_error = get_database(database_url)
+    db, db_error = get_database(database_url, DATABASE_CACHE_VERSION)
+
+    # Protección adicional para despliegues en caliente:
+    # si Streamlit llegara a conservar un objeto Database de una versión
+    # anterior, se limpia la caché de recursos y se crea uno nuevo.
+    required_database_methods = (
+        "get_latest_project_record",
+        "clear_all_data",
+        "delete_generation",
+        "save_generation",
+    )
+    if any(not hasattr(db, method) for method in required_database_methods):
+        st.cache_resource.clear()
+        db, db_error = get_database(database_url, DATABASE_CACHE_VERSION)
 except Exception as exc:
     st.error("No fue posible conectar con la base PostgreSQL configurada.")
     st.caption(
@@ -2835,7 +2863,12 @@ with st.sidebar:
                 "Permite retirar el último proyecto guardado si una prueba se cargó "
                 "por error. No requiere rol administrador, pero sí la clave de eliminación."
             )
-            latest_sidebar = db.get_latest_project_record()
+            try:
+                latest_sidebar = db.get_latest_project_record()
+            except Exception as exc:
+                latest_sidebar = None
+                st.error(f"No fue posible consultar el último proyecto: {exc}")
+
             if latest_sidebar:
                 st.write(
                     f"**{latest_sidebar.get('code') or ''} — "
