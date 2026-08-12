@@ -1665,17 +1665,20 @@ def _df_or_empty(rows: list[dict], columns: list[str] | None = None) -> pd.DataF
     return pd.DataFrame(rows)
 
 
+
 def render_admin_database(db: Database):
-    st.header("Base interna")
-    st.caption("Consulta y administración del catálogo, historial de precios, proyectos y presupuestos.")
+    st.header("Catálogo e historial")
+    st.caption(
+        "Consulta y administra conceptos, precios históricos, proyectos y presupuestos "
+        "sin editar directamente las tablas de la base de datos."
+    )
 
     if db.persistent:
-        st.success("Base persistente PostgreSQL activa.")
-
-    if not db.persistent:
+        st.success("Base persistente PostgreSQL conectada.")
+    else:
         st.warning(
-            "La app está usando SQLite local. En Streamlit Community Cloud este archivo no debe considerarse "
-            "almacenamiento empresarial permanente. Para producción configure DATABASE_URL con PostgreSQL."
+            "SQLite local activo. Úselo únicamente para desarrollo. "
+            "En Streamlit Community Cloud configure DATABASE_URL para persistencia."
         )
 
     try:
@@ -1688,95 +1691,386 @@ def render_admin_database(db: Database):
         st.error(f"No fue posible consultar la base: {exc}")
         return
 
-    tab_concepts, tab_projects, tab_budgets, tab_export = st.tabs(
-        ["Conceptos y precios", "Proyectos", "Presupuestos", "Exportar datos"]
+    st.divider()
+
+    tab_concepts, tab_prices, tab_projects, tab_budgets, tab_export = st.tabs(
+        ["Conceptos", "Precios", "Proyectos", "Presupuestos", "Exportar"]
     )
 
-    # -----------------------------------------------------
-    # Conceptos y precios
-    # -----------------------------------------------------
+    source_labels = {
+        "COTIZACION_PROVEEDOR": "Cotización de proveedor",
+        "COSTO_REAL": "Costo real de obra",
+        "REFERENCIA_EXTERNA": "Referencia externa",
+        "IA_ESTIMADO": "Estimación de IA",
+        "MANUAL": "Registro manual",
+        "BASE_INTERNA": "Base interna",
+        "HISTORICO_IA": "Histórico generado por IA",
+    }
+    status_labels = {
+        "VALIDADO": "Validado",
+        "COTIZADO_PROVEEDOR": "Cotizado por proveedor",
+        "COSTO_REAL": "Costo real",
+        "REFERENCIA_EXTERNA": "Referencia externa",
+        "ESTIMADO_IA": "Estimado por IA",
+    }
+
+    def friendly_source(value):
+        return source_labels.get(str(value or "").upper(), value or "Sin fuente")
+
+    def friendly_status(value):
+        return status_labels.get(str(value or "").upper(), value or "Sin estado")
+
+    # =====================================================
+    # CONCEPTOS
+    # =====================================================
     with tab_concepts:
-        st.subheader("Catálogo interno")
-        search = st.text_input(
-            "Buscar concepto",
-            placeholder="Descripción, código, partida o subpartida",
-            key="admin_concept_search",
+        st.subheader("Catálogo de conceptos")
+        st.caption(
+            "Busque un concepto, abra su ficha y, si es necesario, modifique sus datos. "
+            "Los precios se administran por separado en la pestaña Precios."
         )
-        concepts = db.list_concepts(search)
+
+        all_concepts = db.list_concepts("", limit=1000)
+        categories = sorted(
+            {str(c.get("category") or "").strip() for c in all_concepts if str(c.get("category") or "").strip()}
+        )
+
+        f1, f2 = st.columns([2, 1])
+        with f1:
+            search = st.text_input(
+                "Buscar",
+                placeholder="Ej. cancelería, demolición, pintura, PRE-01",
+                key="catalog_search",
+            )
+        with f2:
+            category_filter = st.selectbox(
+                "Partida",
+                ["Todas"] + categories,
+                key="catalog_category",
+            )
+
+        concepts = db.list_concepts(search, limit=1000)
+        if category_filter != "Todas":
+            concepts = [
+                c for c in concepts
+                if str(c.get("category") or "").strip() == category_filter
+            ]
+
+        st.caption(f"{len(concepts)} concepto(s) encontrados.")
 
         if concepts:
-            display_rows = []
-            for r in concepts:
-                display_rows.append({
-                    "Código": r.get("code"),
-                    "Partida": r.get("category"),
-                    "Subpartida": r.get("subcategory"),
-                    "Concepto": r.get("description"),
-                    "Unidad": r.get("unit"),
-                    "Último costo": r.get("latest_cost"),
-                    "Fuente": r.get("latest_source"),
-                    "Estado": r.get("latest_status"),
-                    "Usos": r.get("usage_count", 0),
-                })
+            catalog_df = pd.DataFrame([
+                {
+                    "Código": c.get("code") or "",
+                    "Concepto": c.get("description") or "",
+                    "Partida": c.get("category") or "",
+                    "Subpartida": c.get("subcategory") or "",
+                    "Unidad": c.get("unit") or "",
+                    "Último costo": c.get("latest_cost"),
+                    "Fuente": friendly_source(c.get("latest_source")),
+                    "Usos": int(c.get("usage_count") or 0),
+                }
+                for c in concepts
+            ])
             st.dataframe(
-                pd.DataFrame(display_rows),
+                catalog_df,
                 use_container_width=True,
                 hide_index=True,
-                column_config={"Último costo": st.column_config.NumberColumn(format="$ %.2f")},
+                column_config={
+                    "Último costo": st.column_config.NumberColumn(format="$ %.2f"),
+                    "Usos": st.column_config.NumberColumn(format="%d"),
+                },
             )
 
             concept_map = {
-                r["id"]: f"{r.get('code') or 'SIN-COD'} | {r.get('description') or ''}"
-                for r in concepts
+                c["id"]: f"{c.get('code') or 'SIN-COD'} — {c.get('description') or ''}"
+                for c in concepts
             }
-            selected_concept_id = st.selectbox(
-                "Seleccionar concepto",
+            selected_id = st.selectbox(
+                "Abrir concepto",
                 options=list(concept_map.keys()),
                 format_func=lambda x: concept_map[x],
-                key="admin_selected_concept",
+                key="catalog_open_concept",
             )
-            concept = db.get_concept(selected_concept_id)
 
+            concept = db.get_concept(selected_id)
             if concept:
-                st.markdown("#### Editar concepto")
-                with st.form("admin_edit_concept"):
-                    e1, e2 = st.columns(2)
-                    with e1:
-                        c_code = st.text_input("Código", value=concept.get("code") or "")
-                        c_category = st.text_input("Partida", value=concept.get("category") or "")
-                        c_subcategory = st.text_input("Subpartida", value=concept.get("subcategory") or "")
-                    with e2:
-                        c_unit = st.text_input("Unidad", value=concept.get("unit") or "")
-                        c_description = st.text_area(
-                            "Descripción",
-                            value=concept.get("description") or "",
-                            height=130,
-                        )
-                    update_concept_btn = st.form_submit_button("Guardar cambios")
+                usage = db.concept_usage(selected_id)
+                prices = db.list_prices(selected_id)
 
-                if update_concept_btn:
-                    if not c_description.strip() or not c_unit.strip():
+                with st.container(border=True):
+                    st.markdown(f"### {concept.get('description') or 'Concepto'}")
+                    st.caption(f"Código: {concept.get('code') or 'Sin código'}")
+
+                    d1, d2, d3 = st.columns(3)
+                    d1.metric("Unidad", concept.get("unit") or "—")
+                    d2.metric("Usos en presupuestos", int(usage.get("budget_items") or 0))
+                    d3.metric("Precios registrados", int(usage.get("prices") or 0))
+
+                    st.markdown("**Partida**")
+                    st.write(concept.get("category") or "Sin partida")
+                    st.markdown("**Subpartida**")
+                    st.write(concept.get("subcategory") or "Sin subpartida")
+
+                    if prices:
+                        last = prices[0]
+                        st.markdown("**Precio más reciente**")
+                        st.write(
+                            f"{formato_moneda(float(last['unit_cost']))} · "
+                            f"{friendly_source(last.get('source'))} · "
+                            f"{friendly_status(last.get('status'))}"
+                        )
+                    else:
+                        st.info("Este concepto todavía no tiene precios registrados.")
+
+                edit_key = f"editing_concept_{selected_id}"
+                if edit_key not in st.session_state:
+                    st.session_state[edit_key] = False
+
+                b1, b2 = st.columns([1, 3])
+                with b1:
+                    if st.button(
+                        "Editar concepto",
+                        key=f"open_edit_{selected_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[edit_key] = True
+                        st.rerun()
+                with b2:
+                    st.caption(
+                        "Para agregar, revisar o eliminar costos históricos use la pestaña Precios."
+                    )
+
+                if st.session_state.get(edit_key):
+                    with st.container(border=True):
+                        st.markdown("#### Editar concepto")
+                        st.caption(
+                            "Modificar estos datos no altera los precios históricos ni los presupuestos ya generados."
+                        )
+                        with st.form(f"edit_concept_form_{selected_id}"):
+                            ec1, ec2 = st.columns(2)
+                            with ec1:
+                                c_code = st.text_input(
+                                    "Código",
+                                    value=concept.get("code") or "",
+                                )
+                                c_category = st.text_input(
+                                    "Partida",
+                                    value=concept.get("category") or "",
+                                )
+                                c_subcategory = st.text_input(
+                                    "Subpartida",
+                                    value=concept.get("subcategory") or "",
+                                )
+                            with ec2:
+                                c_unit = st.text_input(
+                                    "Unidad",
+                                    value=concept.get("unit") or "",
+                                )
+                                c_description = st.text_area(
+                                    "Descripción",
+                                    value=concept.get("description") or "",
+                                    height=145,
+                                )
+                            save_col, cancel_col = st.columns(2)
+                            save_edit = save_col.form_submit_button(
+                                "Guardar cambios",
+                                type="primary",
+                                use_container_width=True,
+                            )
+                            cancel_edit = cancel_col.form_submit_button(
+                                "Cancelar",
+                                use_container_width=True,
+                            )
+
+                        if cancel_edit:
+                            st.session_state[edit_key] = False
+                            st.rerun()
+
+                        if save_edit:
+                            if not c_description.strip() or not c_unit.strip():
+                                st.error("Descripción y unidad son obligatorias.")
+                            else:
+                                db.update_concept(
+                                    selected_id,
+                                    c_code,
+                                    c_category,
+                                    c_subcategory,
+                                    c_description,
+                                    c_unit,
+                                )
+                                st.session_state[edit_key] = False
+                                st.success("Concepto actualizado.")
+                                st.rerun()
+
+                if prices:
+                    st.markdown("#### Últimos precios")
+                    recent_prices = prices[:5]
+                    recent_df = pd.DataFrame([
+                        {
+                            "Costo": p["unit_cost"],
+                            "Fuente": friendly_source(p.get("source")),
+                            "Estado": friendly_status(p.get("status")),
+                            "Confianza": p.get("confidence") or "",
+                            "Fecha": p.get("created_at") or "",
+                        }
+                        for p in recent_prices
+                    ])
+                    st.dataframe(
+                        recent_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Costo": st.column_config.NumberColumn(format="$ %.2f")
+                        },
+                    )
+
+                with st.expander("Opciones avanzadas"):
+                    st.warning(
+                        "Eliminar un concepto es una acción administrativa. "
+                        "Los presupuestos históricos conservan los datos de la actividad, "
+                        "pero pueden perder el vínculo con el catálogo."
+                    )
+                    st.write(
+                        f"Usos en presupuestos: {usage['budget_items']} · "
+                        f"Precios históricos: {usage['prices']}"
+                    )
+                    confirm_concept = st.text_input(
+                        "Para eliminar, escriba ELIMINAR CONCEPTO",
+                        key=f"confirm_delete_concept_{selected_id}",
+                    )
+                    if st.button(
+                        "Eliminar concepto",
+                        key=f"delete_concept_{selected_id}",
+                    ):
+                        if confirm_concept.strip().upper() != "ELIMINAR CONCEPTO":
+                            st.error("Confirmación incorrecta.")
+                        else:
+                            db.delete_concept(selected_id)
+                            st.success("Concepto eliminado.")
+                            st.rerun()
+        else:
+            st.info("No se encontraron conceptos con esos filtros.")
+
+        st.divider()
+
+        create_flag = "admin_create_concept_open"
+        if create_flag not in st.session_state:
+            st.session_state[create_flag] = False
+
+        if not st.session_state[create_flag]:
+            if st.button("Crear concepto nuevo", use_container_width=True):
+                st.session_state[create_flag] = True
+                st.rerun()
+        else:
+            with st.container(border=True):
+                st.markdown("### Nuevo concepto")
+                st.caption(
+                    "Úselo para registrar manualmente una actividad que todavía no existe en el catálogo."
+                )
+                with st.form("catalog_create_concept"):
+                    nc1, nc2 = st.columns(2)
+                    with nc1:
+                        a_code = st.text_input("Código", value="MAN-001")
+                        a_category = st.text_input("Partida")
+                        a_subcategory = st.text_input("Subpartida")
+                    with nc2:
+                        a_unit = st.text_input("Unidad", value="LOTE")
+                        a_description = st.text_area("Descripción", height=145)
+
+                    add_col, cancel_col = st.columns(2)
+                    create_btn = add_col.form_submit_button(
+                        "Crear concepto",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                    cancel_create = cancel_col.form_submit_button(
+                        "Cancelar",
+                        use_container_width=True,
+                    )
+
+                if cancel_create:
+                    st.session_state[create_flag] = False
+                    st.rerun()
+
+                if create_btn:
+                    if not a_description.strip() or not a_unit.strip():
                         st.error("Descripción y unidad son obligatorias.")
                     else:
-                        db.update_concept(
-                            selected_concept_id, c_code, c_category, c_subcategory,
-                            c_description, c_unit,
+                        new_id = db.create_concept(
+                            a_code,
+                            a_category,
+                            a_subcategory,
+                            a_description,
+                            a_unit,
                         )
-                        st.success("Concepto actualizado.")
+                        st.session_state[create_flag] = False
+                        st.success("Concepto creado. Puede agregarle un precio desde la pestaña Precios.")
                         st.rerun()
 
-                st.markdown("#### Historial de precios")
-                prices = db.list_prices(selected_concept_id)
+    # =====================================================
+    # PRECIOS
+    # =====================================================
+    with tab_prices:
+        st.subheader("Historial de precios")
+        st.caption(
+            "Los precios se guardan como registros históricos. Agregar un precio nuevo "
+            "no elimina ni reemplaza automáticamente los anteriores."
+        )
+
+        concepts_for_prices = db.list_concepts("", limit=1500)
+
+        if not concepts_for_prices:
+            st.info("Primero debe existir al menos un concepto en el catálogo.")
+        else:
+            price_search = st.text_input(
+                "Buscar concepto para administrar sus precios",
+                placeholder="Ej. pintura, carpintería, cancel",
+                key="price_concept_search",
+            )
+            if price_search.strip():
+                filtered_price_concepts = db.list_concepts(price_search, limit=500)
+            else:
+                filtered_price_concepts = concepts_for_prices
+
+            if not filtered_price_concepts:
+                st.info("No se encontraron conceptos.")
+            else:
+                price_concept_map = {
+                    c["id"]: f"{c.get('code') or 'SIN-COD'} — {c.get('description') or ''} [{c.get('unit') or ''}]"
+                    for c in filtered_price_concepts
+                }
+                price_concept_id = st.selectbox(
+                    "Concepto",
+                    options=list(price_concept_map.keys()),
+                    format_func=lambda x: price_concept_map[x],
+                    key="price_selected_concept",
+                )
+
+                concept = db.get_concept(price_concept_id)
+                prices = db.list_prices(price_concept_id)
+
+                with st.container(border=True):
+                    st.markdown(f"### {concept.get('description') or 'Concepto'}")
+                    pinfo1, pinfo2, pinfo3 = st.columns(3)
+                    pinfo1.metric("Código", concept.get("code") or "—")
+                    pinfo2.metric("Unidad", concept.get("unit") or "—")
+                    pinfo3.metric("Registros", len(prices))
+
+                    st.caption(
+                        f"{concept.get('category') or 'Sin partida'} / "
+                        f"{concept.get('subcategory') or 'Sin subpartida'}"
+                    )
+
                 if prices:
                     price_df = pd.DataFrame([
                         {
-                            "ID": p["id"],
-                            "Costo": p["unit_cost"],
-                            "Fuente": p["source"],
-                            "Detalle": p.get("source_detail"),
-                            "Estado": p["status"],
-                            "Confianza": p.get("confidence"),
-                            "Fecha": p["created_at"],
+                            "Costo unitario": p["unit_cost"],
+                            "Fuente": friendly_source(p.get("source")),
+                            "Estado": friendly_status(p.get("status")),
+                            "Confianza": p.get("confidence") or "",
+                            "Detalle": p.get("source_detail") or "",
+                            "Fecha": p.get("created_at") or "",
                         }
                         for p in prices
                     ])
@@ -1784,61 +2078,111 @@ def render_admin_database(db: Database):
                         price_df,
                         use_container_width=True,
                         hide_index=True,
-                        column_config={"Costo": st.column_config.NumberColumn(format="$ %.2f")},
+                        column_config={
+                            "Costo unitario": st.column_config.NumberColumn(format="$ %.2f")
+                        },
                     )
                 else:
-                    st.caption("El concepto todavía no tiene historial de precios.")
+                    st.info("No hay precios registrados para este concepto.")
 
-                with st.form("admin_add_price"):
-                    p1, p2, p3 = st.columns(3)
-                    with p1:
-                        new_cost = st.number_input("Nuevo costo unitario", min_value=0.0, step=100.0)
-                        new_source = st.selectbox(
-                            "Fuente",
-                            ["COTIZACION_PROVEEDOR", "COSTO_REAL", "REFERENCIA_EXTERNA", "IA_ESTIMADO", "MANUAL"],
+                st.markdown("#### Agregar precio")
+                st.caption(
+                    "Registre una nueva referencia. El historial anterior se conserva."
+                )
+
+                source_options = [
+                    "COTIZACION_PROVEEDOR",
+                    "COSTO_REAL",
+                    "REFERENCIA_EXTERNA",
+                    "IA_ESTIMADO",
+                    "MANUAL",
+                ]
+                status_options = [
+                    "VALIDADO",
+                    "COTIZADO_PROVEEDOR",
+                    "COSTO_REAL",
+                    "REFERENCIA_EXTERNA",
+                    "ESTIMADO_IA",
+                ]
+
+                with st.form(f"add_price_form_{price_concept_id}"):
+                    ap1, ap2 = st.columns(2)
+                    with ap1:
+                        new_cost = st.number_input(
+                            "Costo unitario",
+                            min_value=0.0,
+                            step=100.0,
+                            format="%.2f",
                         )
-                    with p2:
-                        new_status = st.selectbox(
+                        source_label_choice = st.selectbox(
+                            "Origen del precio",
+                            options=source_options,
+                            format_func=lambda x: source_labels[x],
+                        )
+                        confidence = st.selectbox(
+                            "Nivel de confianza",
+                            ["Alta", "Media", "Baja"],
+                        )
+                    with ap2:
+                        status_choice = st.selectbox(
                             "Estado",
-                            ["VALIDADO", "COTIZADO_PROVEEDOR", "COSTO_REAL", "REFERENCIA_EXTERNA", "ESTIMADO_IA"],
+                            options=status_options,
+                            format_func=lambda x: status_labels[x],
                         )
-                        new_confidence = st.selectbox("Confianza", ["Alta", "Media", "Baja"])
-                    with p3:
-                        new_detail = st.text_area("Detalle / proveedor / referencia", height=105)
-                    add_price_btn = st.form_submit_button("Agregar precio")
+                        detail = st.text_area(
+                            "Referencia / proveedor / nota",
+                            height=125,
+                            placeholder="Ej. Cotización Proveedor X, agosto 2026.",
+                        )
+                    add_price = st.form_submit_button(
+                        "Agregar al historial",
+                        type="primary",
+                        use_container_width=True,
+                    )
 
-                if add_price_btn:
+                if add_price:
                     if new_cost <= 0:
                         st.error("El costo debe ser mayor que cero.")
                     else:
                         db.add_price(
-                            selected_concept_id,
+                            price_concept_id,
                             new_cost,
-                            new_source,
-                            new_detail,
-                            new_status,
-                            new_confidence,
+                            source_label_choice,
+                            detail,
+                            status_choice,
+                            confidence,
                         )
                         st.success("Precio agregado al historial.")
                         st.rerun()
 
                 if prices:
-                    with st.expander("Eliminar un precio"):
+                    with st.expander("Eliminar un precio registrado"):
+                        st.caption(
+                            "Utilícelo únicamente para eliminar registros incorrectos. "
+                            "No es necesario borrar precios antiguos."
+                        )
                         price_map = {
-                            p["id"]: f"{formato_moneda(float(p['unit_cost']))} | {p['source']} | {p['created_at']}"
+                            p["id"]: (
+                                f"{formato_moneda(float(p['unit_cost']))} — "
+                                f"{friendly_source(p.get('source'))} — "
+                                f"{p.get('created_at') or ''}"
+                            )
                             for p in prices
                         }
                         price_to_delete = st.selectbox(
-                            "Precio",
+                            "Registro",
                             options=list(price_map.keys()),
                             format_func=lambda x: price_map[x],
-                            key="admin_price_delete_select",
+                            key=f"delete_price_select_{price_concept_id}",
                         )
                         confirm_price = st.text_input(
-                            "Escriba ELIMINAR PRECIO",
-                            key="admin_confirm_delete_price",
+                            "Para eliminar, escriba ELIMINAR PRECIO",
+                            key=f"delete_price_confirm_{price_concept_id}",
                         )
-                        if st.button("Eliminar precio seleccionado", key="admin_delete_price_btn"):
+                        if st.button(
+                            "Eliminar registro",
+                            key=f"delete_price_button_{price_concept_id}",
+                        ):
                             if confirm_price.strip().upper() != "ELIMINAR PRECIO":
                                 st.error("Confirmación incorrecta.")
                             else:
@@ -1846,68 +2190,49 @@ def render_admin_database(db: Database):
                                 st.success("Precio eliminado.")
                                 st.rerun()
 
-                with st.expander("Eliminar concepto"):
-                    usage = db.concept_usage(selected_concept_id)
-                    st.write(
-                        f"Usos en presupuestos: {usage['budget_items']} | Registros de precio: {usage['prices']}"
-                    )
-                    if usage["budget_items"]:
-                        st.warning(
-                            "El concepto ya fue utilizado en presupuestos. Al eliminarlo, los presupuestos históricos "
-                            "conservarán sus datos, pero perderán el vínculo al concepto y se eliminará su historial de precios."
-                        )
-                    confirm_concept = st.text_input(
-                        "Escriba ELIMINAR CONCEPTO",
-                        key="admin_confirm_delete_concept",
-                    )
-                    if st.button("Eliminar concepto", key="admin_delete_concept_btn"):
-                        if confirm_concept.strip().upper() != "ELIMINAR CONCEPTO":
-                            st.error("Confirmación incorrecta.")
-                        else:
-                            db.delete_concept(selected_concept_id)
-                            st.success("Concepto eliminado.")
-                            st.rerun()
-        else:
-            st.info("No se encontraron conceptos.")
-
-        st.divider()
-        st.markdown("#### Alta manual de concepto")
-        with st.form("admin_create_concept"):
-            a1, a2 = st.columns(2)
-            with a1:
-                a_code = st.text_input("Código sugerido", value="MAN-001")
-                a_category = st.text_input("Partida", key="admin_new_category")
-                a_subcategory = st.text_input("Subpartida", key="admin_new_subcategory")
-            with a2:
-                a_unit = st.text_input("Unidad", value="LOTE", key="admin_new_unit")
-                a_description = st.text_area("Descripción", height=120, key="admin_new_description")
-            create_concept_btn = st.form_submit_button("Crear concepto")
-        if create_concept_btn:
-            if not a_description.strip() or not a_unit.strip():
-                st.error("Descripción y unidad son obligatorias.")
-            else:
-                new_id = db.create_concept(a_code, a_category, a_subcategory, a_description, a_unit)
-                st.success("Concepto creado. Puede seleccionarlo para agregar precios.")
-                st.rerun()
-
-    # -----------------------------------------------------
-    # Proyectos
-    # -----------------------------------------------------
+    # =====================================================
+    # PROYECTOS
+    # =====================================================
     with tab_projects:
-        st.subheader("Proyectos registrados")
-        projects = db.list_projects()
+        st.subheader("Historial de proyectos")
+        st.caption(
+            "Consulte los proyectos que han generado presupuestos reales. "
+            "Las simulaciones no aparecen aquí porque no se guardan."
+        )
+
+        projects = db.list_projects(limit=1000)
+        project_search = st.text_input(
+            "Buscar proyecto",
+            placeholder="Código, nombre, ubicación o tipo de obra",
+            key="project_history_search",
+        )
+
+        if project_search.strip():
+            q = normalizar_texto(project_search)
+            projects = [
+                p for p in projects
+                if q in normalizar_texto(
+                    " ".join([
+                        str(p.get("code") or ""),
+                        str(p.get("name") or ""),
+                        str(p.get("location") or ""),
+                        str(p.get("project_type") or ""),
+                    ])
+                )
+            ]
+
         if not projects:
-            st.info("No hay proyectos registrados.")
+            st.info("No se encontraron proyectos.")
         else:
             project_df = pd.DataFrame([
                 {
-                    "Código": p["code"],
-                    "Nombre": p["name"],
-                    "Tipo": p["project_type"],
-                    "Ubicación": p.get("location"),
-                    "Presupuestos": p.get("budget_count", 0),
+                    "Código": p.get("code") or "",
+                    "Proyecto": p.get("name") or "",
+                    "Tipo": p.get("project_type") or "",
+                    "Ubicación": p.get("location") or "",
+                    "Presupuestos": int(p.get("budget_count") or 0),
                     "Último total": p.get("latest_total"),
-                    "Fecha": p["created_at"],
+                    "Fecha": p.get("created_at") or "",
                 }
                 for p in projects
             ])
@@ -1915,64 +2240,60 @@ def render_admin_database(db: Database):
                 project_df,
                 use_container_width=True,
                 hide_index=True,
-                column_config={"Último total": st.column_config.NumberColumn(format="$ %.2f")},
+                column_config={
+                    "Último total": st.column_config.NumberColumn(format="$ %.2f")
+                },
             )
 
-            project_map = {p["id"]: f"{p['code']} | {p['name']}" for p in projects}
-            selected_project_id = st.selectbox(
-                "Seleccionar proyecto",
+            project_map = {
+                p["id"]: f"{p.get('code') or ''} — {p.get('name') or ''}"
+                for p in projects
+            }
+            project_id = st.selectbox(
+                "Abrir proyecto",
                 options=list(project_map.keys()),
                 format_func=lambda x: project_map[x],
-                key="admin_selected_project",
+                key="open_project_history",
             )
-            project = db.get_project(selected_project_id)
+            project = db.get_project(project_id)
 
             if project:
-                with st.form("admin_edit_project"):
-                    p1, p2 = st.columns(2)
-                    with p1:
-                        pr_name = st.text_input("Nombre", value=project.get("name") or "")
-                        pr_type = st.text_input("Tipo", value=project.get("project_type") or "")
-                        pr_location = st.text_input("Ubicación", value=project.get("location") or "")
-                        pr_activity = st.text_input("Actividad principal", value=project.get("main_activity") or "")
-                    with p2:
-                        pr_dimensions = st.text_area("Dimensiones", value=project.get("dimensions_text") or "", height=90)
-                        pr_description = st.text_area("Descripción", value=project.get("description") or "", height=130)
-                        pr_guide = st.text_area("Texto guía", value=project.get("guide_text") or "", height=90)
-                    save_project_btn = st.form_submit_button("Guardar cambios")
+                project_budgets = db.list_budgets(project_id=project_id)
 
-                if save_project_btn:
-                    if not pr_name.strip():
-                        st.error("El nombre es obligatorio.")
-                    else:
-                        db.update_project(
-                            selected_project_id,
-                            pr_name,
-                            pr_type,
-                            pr_location,
-                            pr_activity,
-                            pr_dimensions,
-                            pr_description,
-                            pr_guide,
-                        )
-                        st.success("Proyecto actualizado.")
-                        st.rerun()
+                with st.container(border=True):
+                    st.markdown(f"### {project.get('name') or 'Proyecto'}")
+                    st.caption(project.get("code") or "")
 
-                project_budgets = db.list_budgets(selected_project_id)
+                    pr1, pr2, pr3 = st.columns(3)
+                    pr1.metric("Tipo", project.get("project_type") or "—")
+                    pr2.metric("Ubicación", project.get("location") or "—")
+                    pr3.metric("Presupuestos", len(project_budgets))
+
+                    if project.get("main_activity"):
+                        st.markdown("**Actividad principal**")
+                        st.write(project.get("main_activity"))
+                    if project.get("dimensions_text"):
+                        st.markdown("**Dimensiones / referencias**")
+                        st.write(project.get("dimensions_text"))
+                    if project.get("description"):
+                        st.markdown("**Descripción inicial**")
+                        st.write(project.get("description"))
+
                 if project_budgets:
                     st.markdown("#### Presupuestos del proyecto")
+                    pb_df = pd.DataFrame([
+                        {
+                            "Versión": b.get("version"),
+                            "Estado": b.get("status"),
+                            "Costo directo": b.get("direct_cost"),
+                            "Venta sin IVA": b.get("sale_before_tax"),
+                            "Total": b.get("total"),
+                            "Fecha": b.get("created_at"),
+                        }
+                        for b in project_budgets
+                    ])
                     st.dataframe(
-                        pd.DataFrame([
-                            {
-                                "Versión": b["version"],
-                                "Estado": b["status"],
-                                "Costo directo": b["direct_cost"],
-                                "Venta sin IVA": b["sale_before_tax"],
-                                "Total": b["total"],
-                                "Fecha": b["created_at"],
-                            }
-                            for b in project_budgets
-                        ]),
+                        pb_df,
                         use_container_width=True,
                         hide_index=True,
                         column_config={
@@ -1982,40 +2303,155 @@ def render_admin_database(db: Database):
                         },
                     )
 
-                with st.expander("Eliminar proyecto"):
-                    st.warning("Esta acción elimina también los presupuestos asociados al proyecto.")
-                    confirm_project = st.text_input(
-                        "Escriba ELIMINAR PROYECTO",
-                        key="admin_confirm_delete_project",
+                edit_project_key = f"editing_project_{project_id}"
+                if edit_project_key not in st.session_state:
+                    st.session_state[edit_project_key] = False
+
+                if st.button(
+                    "Editar datos del proyecto",
+                    key=f"edit_project_button_{project_id}",
+                ):
+                    st.session_state[edit_project_key] = True
+                    st.rerun()
+
+                if st.session_state.get(edit_project_key):
+                    with st.container(border=True):
+                        st.markdown("#### Editar proyecto")
+                        st.caption(
+                            "Esta edición corrige los datos descriptivos del proyecto. "
+                            "No recalcula presupuestos existentes."
+                        )
+                        with st.form(f"edit_project_form_{project_id}"):
+                            ep1, ep2 = st.columns(2)
+                            with ep1:
+                                p_name = st.text_input(
+                                    "Nombre",
+                                    value=project.get("name") or "",
+                                )
+                                p_type = st.text_input(
+                                    "Tipo de obra",
+                                    value=project.get("project_type") or "",
+                                )
+                                p_location = st.text_input(
+                                    "Ubicación",
+                                    value=project.get("location") or "",
+                                )
+                                p_main_activity = st.text_input(
+                                    "Actividad principal",
+                                    value=project.get("main_activity") or "",
+                                )
+                            with ep2:
+                                p_dimensions = st.text_area(
+                                    "Dimensiones / referencias",
+                                    value=project.get("dimensions_text") or "",
+                                    height=90,
+                                )
+                                p_description = st.text_area(
+                                    "Descripción",
+                                    value=project.get("description") or "",
+                                    height=120,
+                                )
+                                p_guide = st.text_area(
+                                    "Texto guía",
+                                    value=project.get("guide_text") or "",
+                                    height=90,
+                                )
+                            save_pc, cancel_pc = st.columns(2)
+                            save_project = save_pc.form_submit_button(
+                                "Guardar cambios",
+                                type="primary",
+                                use_container_width=True,
+                            )
+                            cancel_project = cancel_pc.form_submit_button(
+                                "Cancelar",
+                                use_container_width=True,
+                            )
+
+                        if cancel_project:
+                            st.session_state[edit_project_key] = False
+                            st.rerun()
+
+                        if save_project:
+                            if not p_name.strip():
+                                st.error("El nombre del proyecto es obligatorio.")
+                            else:
+                                db.update_project(
+                                    project_id,
+                                    p_name,
+                                    p_type,
+                                    p_location,
+                                    p_main_activity,
+                                    p_dimensions,
+                                    p_description,
+                                    p_guide,
+                                )
+                                st.session_state[edit_project_key] = False
+                                st.success("Proyecto actualizado.")
+                                st.rerun()
+
+                with st.expander("Opciones avanzadas"):
+                    st.warning(
+                        "Eliminar el proyecto elimina también sus presupuestos y partidas asociadas."
                     )
-                    if st.button("Eliminar proyecto", key="admin_delete_project_btn"):
+                    confirm_project = st.text_input(
+                        "Para eliminar, escriba ELIMINAR PROYECTO",
+                        key=f"confirm_delete_project_{project_id}",
+                    )
+                    if st.button(
+                        "Eliminar proyecto",
+                        key=f"delete_project_button_{project_id}",
+                    ):
                         if confirm_project.strip().upper() != "ELIMINAR PROYECTO":
                             st.error("Confirmación incorrecta.")
                         else:
-                            db.delete_project(selected_project_id)
+                            db.delete_project(project_id)
                             st.success("Proyecto eliminado.")
                             st.rerun()
 
-    # -----------------------------------------------------
-    # Presupuestos
-    # -----------------------------------------------------
+    # =====================================================
+    # PRESUPUESTOS
+    # =====================================================
     with tab_budgets:
-        st.subheader("Presupuestos registrados")
-        budgets = db.list_budgets()
+        st.subheader("Historial de presupuestos")
+        st.caption(
+            "Consulte presupuestos ya guardados. Esta sección es de consulta; "
+            "las correcciones comerciales siguen realizándose en el Excel generado."
+        )
+
+        budgets = db.list_budgets(limit=1000)
+
+        budget_search = st.text_input(
+            "Buscar presupuesto",
+            placeholder="Código de proyecto, nombre o ubicación",
+            key="budget_history_search",
+        )
+        if budget_search.strip():
+            q = normalizar_texto(budget_search)
+            budgets = [
+                b for b in budgets
+                if q in normalizar_texto(
+                    " ".join([
+                        str(b.get("project_code") or ""),
+                        str(b.get("project_name") or ""),
+                        str(b.get("project_location") or ""),
+                    ])
+                )
+            ]
+
         if not budgets:
-            st.info("No hay presupuestos registrados.")
+            st.info("No se encontraron presupuestos.")
         else:
             budget_df = pd.DataFrame([
                 {
-                    "Proyecto": b["project_code"],
-                    "Nombre": b["project_name"],
-                    "Estado": b["status"],
-                    "Costo directo": b["direct_cost"],
-                    "Indirectos": b["indirect_cost"],
-                    "Utilidad": b["profit"],
-                    "Venta sin IVA": b["sale_before_tax"],
-                    "Total": b["total"],
-                    "Fecha": b["created_at"],
+                    "Proyecto": b.get("project_code") or "",
+                    "Nombre": b.get("project_name") or "",
+                    "Estado": b.get("status") or "",
+                    "Costo directo": b.get("direct_cost"),
+                    "Indirectos": b.get("indirect_cost"),
+                    "Utilidad": b.get("profit"),
+                    "Venta sin IVA": b.get("sale_before_tax"),
+                    "Total": b.get("total"),
+                    "Fecha": b.get("created_at") or "",
                 }
                 for b in budgets
             ])
@@ -2033,41 +2469,61 @@ def render_admin_database(db: Database):
             )
 
             budget_map = {
-                b["id"]: f"{b['project_code']} | {b['project_name']} | {formato_moneda(float(b['total']))}"
+                b["id"]: (
+                    f"{b.get('project_code') or ''} — "
+                    f"{b.get('project_name') or ''} — "
+                    f"{formato_moneda(float(b.get('total') or 0))}"
+                )
                 for b in budgets
             }
-            selected_budget_id = st.selectbox(
-                "Seleccionar presupuesto",
+            budget_id = st.selectbox(
+                "Abrir presupuesto",
                 options=list(budget_map.keys()),
                 format_func=lambda x: budget_map[x],
-                key="admin_selected_budget",
+                key="open_budget_history",
             )
-            budget = db.get_budget(selected_budget_id)
-            if budget:
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Costo directo", formato_moneda(float(budget["direct_cost"])))
-                m2.metric("Indirectos", formato_moneda(float(budget["indirect_cost"])))
-                m3.metric("Utilidad", formato_moneda(float(budget["profit"])))
-                m4.metric("Total", formato_moneda(float(budget["total"])))
 
-                budget_items = db.list_budget_items(selected_budget_id)
-                if budget_items:
+            budget = db.get_budget(budget_id)
+            items = db.list_budget_items(budget_id)
+
+            if budget:
+                with st.container(border=True):
+                    st.markdown(
+                        f"### {budget.get('project_code') or ''} — "
+                        f"{budget.get('project_name') or ''}"
+                    )
+                    bm1, bm2, bm3, bm4 = st.columns(4)
+                    bm1.metric("Costo directo", formato_moneda(float(budget.get("direct_cost") or 0)))
+                    bm2.metric("Indirectos", formato_moneda(float(budget.get("indirect_cost") or 0)))
+                    bm3.metric("Utilidad", formato_moneda(float(budget.get("profit") or 0)))
+                    bm4.metric("Total", formato_moneda(float(budget.get("total") or 0)))
+
+                    st.caption(
+                        f"Indirectos: {float(budget.get('indirect_pct') or 0):.2f}% · "
+                        f"Utilidad: {float(budget.get('profit_pct') or 0):.2f}% · "
+                        f"IVA: {float(budget.get('iva_pct') or 0):.2f}% · "
+                        f"Estado: {budget.get('status') or ''}"
+                    )
+
+                if items:
+                    st.markdown("#### Actividades")
+                    item_df = pd.DataFrame([
+                        {
+                            "Partida": i.get("category") or "",
+                            "Subpartida": i.get("subcategory") or "",
+                            "Código": i.get("code") or "",
+                            "Actividad": i.get("description") or "",
+                            "Unidad": i.get("unit") or "",
+                            "Cantidad": i.get("quantity"),
+                            "Costo unitario": i.get("unit_cost"),
+                            "Venta unitaria": i.get("unit_sale"),
+                            "Venta": i.get("sale_amount"),
+                            "Fuente": friendly_source(i.get("price_source")),
+                        }
+                        for i in items
+                    ])
                     st.dataframe(
-                        pd.DataFrame([
-                            {
-                                "Partida": i["category"],
-                                "Subpartida": i["subcategory"],
-                                "Código": i["code"],
-                                "Concepto": i["description"],
-                                "Unidad": i["unit"],
-                                "Cantidad": i["quantity"],
-                                "Costo unitario": i["unit_cost"],
-                                "Venta unitaria": i["unit_sale"],
-                                "Venta": i["sale_amount"],
-                                "Fuente": i.get("price_source"),
-                            }
-                            for i in budget_items
-                        ]),
+                        item_df,
                         use_container_width=True,
                         hide_index=True,
                         column_config={
@@ -2076,47 +2532,64 @@ def render_admin_database(db: Database):
                             "Venta": st.column_config.NumberColumn(format="$ %.2f"),
                         },
                     )
+                else:
+                    st.info("Este presupuesto no contiene actividades registradas.")
 
-                with st.expander("Eliminar presupuesto"):
+                with st.expander("Opciones avanzadas"):
                     st.warning(
-                        "Se eliminarán las partidas e historial vinculados a este presupuesto. "
-                        "Si es el único presupuesto del proyecto, también se eliminará el proyecto."
+                        "Eliminar un presupuesto elimina sus actividades e historial vinculado. "
+                        "Si es el único presupuesto del proyecto, también puede eliminarse el proyecto."
                     )
                     confirm_budget = st.text_input(
-                        "Escriba ELIMINAR PRESUPUESTO",
-                        key="admin_confirm_delete_budget",
+                        "Para eliminar, escriba ELIMINAR PRESUPUESTO",
+                        key=f"confirm_delete_budget_{budget_id}",
                     )
-                    if st.button("Eliminar presupuesto", key="admin_delete_budget_btn"):
+                    if st.button(
+                        "Eliminar presupuesto",
+                        key=f"delete_budget_button_{budget_id}",
+                    ):
                         if confirm_budget.strip().upper() != "ELIMINAR PRESUPUESTO":
                             st.error("Confirmación incorrecta.")
                         else:
-                            db.delete_budget(selected_budget_id)
+                            db.delete_budget(budget_id)
                             st.success("Presupuesto eliminado.")
                             st.rerun()
 
-    # -----------------------------------------------------
-    # Exportación de base
-    # -----------------------------------------------------
+    # =====================================================
+    # EXPORTAR
+    # =====================================================
     with tab_export:
-        st.subheader("Exportar base interna")
-        st.caption("Exportación administrativa en CSV. No modifica la base de datos.")
-        for table_name, label in [
-            ("concepts", "Conceptos"),
-            ("price_history", "Historial de precios"),
-            ("projects", "Proyectos"),
-            ("budgets", "Presupuestos"),
-            ("budget_items", "Partidas de presupuestos"),
-        ]:
-            rows = db.export_table(table_name)
-            csv_bytes = pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                f"Descargar {label} CSV",
-                data=csv_bytes,
-                file_name=f"{table_name}.csv",
-                mime="text/csv",
-                key=f"download_{table_name}",
-                use_container_width=True,
-            )
+        st.subheader("Exportar información")
+        st.caption(
+            "Descarga copias CSV para revisión, respaldo o análisis. "
+            "Estas descargas no modifican la base de datos."
+        )
+
+        export_items = [
+            ("concepts", "Catálogo de conceptos", "conceptos.csv"),
+            ("price_history", "Historial de precios", "historial_precios.csv"),
+            ("projects", "Proyectos", "proyectos.csv"),
+            ("budgets", "Presupuestos", "presupuestos.csv"),
+            ("budget_items", "Actividades de presupuestos", "actividades_presupuestos.csv"),
+        ]
+
+        for table_name, label, filename in export_items:
+            with st.container(border=True):
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    st.markdown(f"**{label}**")
+                    st.caption(filename)
+                rows = db.export_table(table_name)
+                csv_bytes = pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
+                with c2:
+                    st.download_button(
+                        "Descargar CSV",
+                        data=csv_bytes,
+                        file_name=filename,
+                        mime="text/csv",
+                        key=f"friendly_download_{table_name}",
+                        use_container_width=True,
+                    )
 
 
 # =========================================================
@@ -2158,7 +2631,7 @@ with st.sidebar:
     st.header("Navegación")
     sections = ["Generar presupuesto"]
     if is_admin:
-        sections.append("Base interna")
+        sections.append("Catálogo e historial")
 
     section = st.radio(
         "Sección",
@@ -2241,9 +2714,9 @@ with st.sidebar:
 # =========================================================
 
 
-if section == "Base interna":
+if section == "Catálogo e historial":
     if not is_admin:
-        st.error("No tiene permisos para administrar la base interna.")
+        st.error("No tiene permisos para administrar el catálogo e historial.")
         st.stop()
     render_admin_database(db)
     st.stop()
