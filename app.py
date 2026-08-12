@@ -1,5 +1,6 @@
 import os
 import re
+import hmac
 import sqlite3
 import unicodedata
 import uuid
@@ -55,6 +56,21 @@ def get_secret(nombre: str, default=None):
     except Exception:
         pass
     return os.getenv(nombre, default)
+
+
+def get_delete_key() -> str | None:
+    """Clave privada para operaciones destructivas, almacenada en Secrets."""
+    value = get_secret("DELETE_KEY")
+    if value is None:
+        return None
+    return str(value).strip()
+
+
+def validar_clave_borrado(valor: str) -> bool:
+    esperada = get_delete_key()
+    if not esperada:
+        return False
+    return hmac.compare_digest(str(valor or "").strip(), esperada)
 
 
 def _secrets_to_dict(value):
@@ -370,6 +386,36 @@ class Database:
             "budgets": self.fetchone("SELECT COUNT(*) AS n FROM budgets")["n"],
             "concepts": self.fetchone("SELECT COUNT(*) AS n FROM concepts")["n"],
         }
+
+    def get_latest_project_record(self) -> dict | None:
+        """Devuelve el último proyecto guardado y su último total conocido."""
+        return self.fetchone(
+            """
+            SELECT p.*,
+                   (SELECT COUNT(*) FROM budgets b WHERE b.project_id = p.id) AS budget_count,
+                   (SELECT b.total FROM budgets b
+                    WHERE b.project_id = p.id
+                    ORDER BY b.created_at DESC LIMIT 1) AS latest_total
+            FROM projects p
+            ORDER BY p.created_at DESC
+            LIMIT 1
+            """
+        )
+
+    def clear_all_data(self):
+        """
+        Elimina todos los datos empresariales de las tablas de la aplicación.
+        Conserva el esquema para que la app siga funcionando inmediatamente.
+        """
+        # El orden evita conflictos de claves foráneas tanto en PostgreSQL como SQLite.
+        for table in [
+            "budget_items",
+            "price_history",
+            "budgets",
+            "concepts",
+            "projects",
+        ]:
+            self.execute(f"DELETE FROM {table}")
 
     def next_project_code(self, location: str, project_type: str) -> str:
         prefix = f"{abreviar(location or 'Proyecto')}-{abreviacion_tipo(project_type)}"
@@ -1693,8 +1739,8 @@ def render_admin_database(db: Database):
 
     st.divider()
 
-    tab_concepts, tab_prices, tab_projects, tab_budgets, tab_export = st.tabs(
-        ["Conceptos", "Precios", "Proyectos", "Presupuestos", "Exportar"]
+    tab_concepts, tab_prices, tab_projects, tab_budgets, tab_maintenance, tab_export = st.tabs(
+        ["Conceptos", "Precios", "Proyectos", "Presupuestos", "Mantenimiento", "Exportar"]
     )
 
     source_labels = {
@@ -1935,20 +1981,18 @@ def render_admin_database(db: Database):
                         f"Usos en presupuestos: {usage['budget_items']} · "
                         f"Precios históricos: {usage['prices']}"
                     )
-                    confirm_concept = st.text_input(
-                        "Para eliminar, escriba ELIMINAR CONCEPTO",
+                    confirm_concept = st.checkbox(
+                        "Confirmo que deseo eliminar este concepto.",
                         key=f"confirm_delete_concept_{selected_id}",
                     )
                     if st.button(
                         "Eliminar concepto",
                         key=f"delete_concept_{selected_id}",
+                        disabled=not confirm_concept,
                     ):
-                        if confirm_concept.strip().upper() != "ELIMINAR CONCEPTO":
-                            st.error("Confirmación incorrecta.")
-                        else:
-                            db.delete_concept(selected_id)
-                            st.success("Concepto eliminado.")
-                            st.rerun()
+                        db.delete_concept(selected_id)
+                        st.success("Concepto eliminado.")
+                        st.rerun()
         else:
             st.info("No se encontraron conceptos con esos filtros.")
 
@@ -2391,21 +2435,23 @@ def render_admin_database(db: Database):
 
                 with st.expander("Opciones avanzadas"):
                     st.warning(
-                        "Eliminar el proyecto elimina también sus presupuestos y partidas asociadas."
+                        "Eliminar el proyecto borra sus presupuestos, partidas y los conceptos/precios "
+                        "creados exclusivamente por ese proyecto."
                     )
-                    confirm_project = st.text_input(
-                        "Para eliminar, escriba ELIMINAR PROYECTO",
+                    project_delete_key = st.text_input(
+                        "Clave de eliminación",
+                        type="password",
                         key=f"confirm_delete_project_{project_id}",
                     )
                     if st.button(
-                        "Eliminar proyecto",
+                        "Eliminar proyecto completo",
                         key=f"delete_project_button_{project_id}",
                     ):
-                        if confirm_project.strip().upper() != "ELIMINAR PROYECTO":
-                            st.error("Confirmación incorrecta.")
+                        if not validar_clave_borrado(project_delete_key):
+                            st.error("Clave de eliminación incorrecta o no configurada.")
                         else:
                             db.delete_project(project_id)
-                            st.success("Proyecto eliminado.")
+                            st.success("Proyecto y su trazabilidad asociada fueron eliminados.")
                             st.rerun()
 
     # =====================================================
@@ -2554,6 +2600,80 @@ def render_admin_database(db: Database):
                             db.delete_budget(budget_id)
                             st.success("Presupuesto eliminado.")
                             st.rerun()
+
+    # =====================================================
+    # MANTENIMIENTO
+    # =====================================================
+    with tab_maintenance:
+        st.subheader("Mantenimiento")
+        st.caption(
+            "Herramientas para la etapa de pruebas. Las acciones de esta sección "
+            "afectan datos persistentes y requieren la clave de eliminación."
+        )
+
+        if not get_delete_key():
+            st.error(
+                "Falta DELETE_KEY en Streamlit Secrets. "
+                "Las operaciones destructivas permanecerán bloqueadas."
+            )
+
+        stats_now = db.stats()
+        with st.container(border=True):
+            st.markdown("### Estado actual")
+            sm1, sm2, sm3 = st.columns(3)
+            sm1.metric("Proyectos", stats_now["projects"])
+            sm2.metric("Presupuestos", stats_now["budgets"])
+            sm3.metric("Conceptos", stats_now["concepts"])
+
+        latest = db.get_latest_project_record()
+        with st.container(border=True):
+            st.markdown("### Último proyecto guardado")
+            if latest:
+                st.write(f"**{latest.get('code') or ''} — {latest.get('name') or ''}**")
+                st.caption(
+                    f"{latest.get('project_type') or ''} · "
+                    f"{latest.get('location') or 'Sin ubicación'} · "
+                    f"{latest.get('created_at') or ''}"
+                )
+                if latest.get("latest_total") is not None:
+                    st.write(f"Último total: **{formato_moneda(float(latest['latest_total']))}**")
+                st.caption(
+                    "Para borrar este proyecto sin ser administrador también existe "
+                    "la herramienta de corrección en la sección Generar presupuesto."
+                )
+            else:
+                st.info("La base no contiene proyectos.")
+
+        with st.container(border=True):
+            st.markdown("### Eliminar todos los datos de la aplicación")
+            st.error(
+                "Esta acción borra proyectos, presupuestos, actividades, conceptos e historial "
+                "de precios. La estructura de las tablas se conserva para que la aplicación "
+                "pueda seguir funcionando."
+            )
+            wipe_key = st.text_input(
+                "Clave de eliminación",
+                type="password",
+                key="maintenance_wipe_key",
+            )
+            wipe_confirm = st.checkbox(
+                "Confirmo que deseo vaciar toda la base de datos de la aplicación.",
+                key="maintenance_wipe_confirm",
+            )
+            if st.button(
+                "Eliminar todos los datos",
+                type="primary",
+                use_container_width=True,
+                disabled=not wipe_confirm,
+                key="maintenance_wipe_database",
+            ):
+                if not validar_clave_borrado(wipe_key):
+                    st.error("Clave de eliminación incorrecta o no configurada.")
+                else:
+                    db.clear_all_data()
+                    st.session_state.pop("generated", None)
+                    st.success("Todos los datos de la aplicación fueron eliminados.")
+                    st.rerun()
 
     # =====================================================
     # EXPORTAR
@@ -2708,6 +2828,47 @@ with st.sidebar:
 
         if not get_api_key_runtime():
             st.error("Falta GEMINI_API_KEY en Streamlit Secrets.")
+
+        st.divider()
+        with st.expander("Corrección de última carga"):
+            st.caption(
+                "Permite retirar el último proyecto guardado si una prueba se cargó "
+                "por error. No requiere rol administrador, pero sí la clave de eliminación."
+            )
+            latest_sidebar = db.get_latest_project_record()
+            if latest_sidebar:
+                st.write(
+                    f"**{latest_sidebar.get('code') or ''} — "
+                    f"{latest_sidebar.get('name') or ''}**"
+                )
+                if latest_sidebar.get("latest_total") is not None:
+                    st.caption(
+                        f"Total: {formato_moneda(float(latest_sidebar['latest_total']))}"
+                    )
+                last_delete_key = st.text_input(
+                    "Clave",
+                    type="password",
+                    key="sidebar_last_delete_key",
+                )
+                if st.button(
+                    "Borrar último proyecto y trazabilidad",
+                    key="sidebar_delete_last_project",
+                    use_container_width=True,
+                ):
+                    if not validar_clave_borrado(last_delete_key):
+                        st.error("Clave incorrecta o no configurada.")
+                    else:
+                        current = st.session_state.get("generated")
+                        db.delete_project(latest_sidebar["id"])
+                        if (
+                            current
+                            and current.get("project_id") == latest_sidebar["id"]
+                        ):
+                            st.session_state.pop("generated", None)
+                        st.success("Último proyecto eliminado por completo.")
+                        st.rerun()
+            else:
+                st.caption("No hay proyectos guardados.")
 
 # =========================================================
 # BASE INTERNA
@@ -3007,10 +3168,125 @@ else:
             )
 
     st.divider()
-    if st.button("Modificar datos iniciales", use_container_width=True):
-        try:
-            if not g.get("simulation") and g.get("project_id") and g.get("budget_id"):
-                db.delete_generation(g["project_id"], g["budget_id"])
-        finally:
-            del st.session_state["generated"]
-            st.rerun()
+    st.subheader("Acciones sobre esta generación")
+
+    if g.get("simulation"):
+        st.caption(
+            "Esta corrida es una simulación. Puede guardarla como proyecto real "
+            "sin volver a ejecutar Gemini."
+        )
+
+        ac1, ac2 = st.columns(2)
+        with ac1:
+            if st.button(
+                "Guardar simulación en la base de datos",
+                type="primary",
+                use_container_width=True,
+                key="promote_simulation",
+            ):
+                try:
+                    real_code = db.next_project_code(
+                        g["project_data"]["location"],
+                        g["project_data"]["project_type"],
+                    )
+                    project_id, budget_id = db.save_generation(
+                        project_code=real_code,
+                        project_data=g["project_data"],
+                        result=result,
+                        items=items,
+                        params=g["params"],
+                        financials=financials,
+                    )
+
+                    # Regenera los archivos con el código definitivo, sin llamar de nuevo a Gemini.
+                    excel_bytes = crear_excel(
+                        project_code=real_code,
+                        project_data=g["project_data"],
+                        result=result,
+                        items=items,
+                        params=g["params"],
+                    )
+                    txt_bytes = crear_txt(
+                        project_code=real_code,
+                        project_data=g["project_data"],
+                        result=result,
+                        items=items,
+                        params=g["params"],
+                        financials=financials,
+                    )
+                    zip_bytes = crear_paquete_zip(real_code, excel_bytes, txt_bytes)
+
+                    g.update(
+                        {
+                            "project_id": project_id,
+                            "budget_id": budget_id,
+                            "simulation": False,
+                            "project_code": real_code,
+                            "excel_bytes": excel_bytes,
+                            "txt_bytes": txt_bytes,
+                            "zip_bytes": zip_bytes,
+                            "items": items,
+                        }
+                    )
+                    st.session_state["generated"] = g
+                    st.success("La simulación fue guardada como proyecto real.")
+                    st.rerun()
+                except Exception as exc:
+                    st.exception(exc)
+
+        with ac2:
+            if st.button(
+                "Modificar datos iniciales",
+                use_container_width=True,
+                key="modify_simulation",
+            ):
+                st.session_state.pop("generated", None)
+                st.rerun()
+
+    else:
+        st.caption(
+            "Esta generación ya está guardada. Para retirarla completamente de la "
+            "base se requiere la clave de eliminación."
+        )
+        current_delete_key = st.text_input(
+            "Clave de eliminación",
+            type="password",
+            key="current_generation_delete_key",
+        )
+
+        ac1, ac2 = st.columns(2)
+
+        with ac1:
+            if st.button(
+                "Eliminar esta generación de la base",
+                use_container_width=True,
+                key="delete_current_generation",
+            ):
+                if not validar_clave_borrado(current_delete_key):
+                    st.error("Clave incorrecta o no configurada.")
+                elif not g.get("project_id") or not g.get("budget_id"):
+                    st.error("No se encontró la referencia guardada de esta generación.")
+                else:
+                    db.delete_generation(g["project_id"], g["budget_id"])
+                    st.session_state.pop("generated", None)
+                    st.success("La generación y su trazabilidad fueron eliminadas.")
+                    st.rerun()
+
+        with ac2:
+            if st.button(
+                "Modificar datos iniciales",
+                use_container_width=True,
+                key="modify_real_generation",
+            ):
+                if not validar_clave_borrado(current_delete_key):
+                    st.error(
+                        "Para modificar una generación ya guardada debe ingresar la "
+                        "clave, ya que primero se elimina la versión anterior."
+                    )
+                else:
+                    try:
+                        if g.get("project_id") and g.get("budget_id"):
+                            db.delete_generation(g["project_id"], g["budget_id"])
+                    finally:
+                        st.session_state.pop("generated", None)
+                        st.rerun()

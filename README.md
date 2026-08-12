@@ -589,8 +589,8 @@ Ejemplo:
 
 ```toml
 GEMINI_API_KEY = "TU_API_KEY"
-
 DATABASE_URL = "postgresql://..."
+DELETE_KEY = "TU_CLAVE_PRIVADA"
 
 [auth_cookie]
 name = "presupuestador_empresa_auth"
@@ -1113,3 +1113,157 @@ la empresa revisa
 ```
 
 Cuantos más costos reales, cotizaciones y proyectos se registren correctamente, mayor será el valor de la base interna y menor la dependencia de estimaciones puramente generadas por IA.
+
+---
+
+# 37. Clave de eliminación y herramientas de pruebas
+
+Durante la etapa inicial existe una clave adicional para operaciones destructivas.
+
+Debe configurarse en Streamlit Secrets:
+
+```toml
+DELETE_KEY = "TU_CLAVE_PRIVADA"
+```
+
+Para la configuración actual de pruebas, el valor definido por la empresa debe cargarse únicamente en Streamlit Secrets.
+
+**No se recomienda escribir esta clave directamente dentro de `app.py` ni incluirla en un repositorio público.**
+
+La clave se utiliza para:
+
+- eliminar el último proyecto guardado y toda su trazabilidad;
+- eliminar una generación real desde su pantalla de resultados;
+- modificar los datos iniciales de una generación ya guardada, porque la versión anterior se elimina primero;
+- eliminar un proyecto completo desde la administración;
+- vaciar todos los datos de la aplicación.
+
+---
+
+# 38. Borrar el último proyecto guardado
+
+En la sección **Generar presupuesto**, dentro de la barra lateral, existe:
+
+```text
+Corrección de última carga
+```
+
+Esta herramienta está disponible para usuarios normales y administradores.
+
+Su finalidad es corregir rápidamente casos como:
+
+- una prueba que debía haberse ejecutado como simulación;
+- un proyecto guardado accidentalmente;
+- un error grave en los datos iniciales;
+- una corrida inválida que contaminó el catálogo.
+
+La aplicación muestra cuál es el último proyecto guardado antes de borrarlo.
+
+Al confirmar con la clave, se elimina:
+
+- proyecto;
+- presupuestos;
+- actividades del presupuesto;
+- precios generados por ese presupuesto;
+- conceptos creados exclusivamente por esa generación.
+
+Los conceptos y precios históricos previos que solo fueron reutilizados por el proyecto no se eliminan.
+
+---
+
+# 39. Guardar una simulación como proyecto real
+
+Una simulación puede convertirse posteriormente en una generación real.
+
+En la pantalla de resultados aparece:
+
+```text
+Guardar simulación en la base de datos
+```
+
+Al utilizarlo:
+
+1. NO se vuelve a llamar a Gemini;
+2. se conserva exactamente el resultado de la simulación;
+3. se calcula un código real de proyecto;
+4. se guarda proyecto, presupuesto, partidas y nuevos conceptos/precios;
+5. se regeneran Excel, TXT y ZIP con el código definitivo;
+6. la corrida deja de mostrarse como simulación.
+
+Esto permite utilizar una prueba satisfactoria sin repetir el consumo de API.
+
+---
+
+# 40. Eliminar una generación desde sus resultados
+
+Cuando una generación NO es simulada, la pantalla final muestra:
+
+```text
+Eliminar esta generación de la base
+```
+
+La acción requiere la clave de eliminación.
+
+Su propósito es retirar inmediatamente una generación incorrecta.
+
+También existe:
+
+```text
+Modificar datos iniciales
+```
+
+Para una generación real, esta opción requiere la misma clave porque primero elimina la versión guardada y después regresa al formulario.
+
+En una simulación no se requiere clave para modificar los datos iniciales porque todavía no existe información persistida.
+
+---
+
+# 41. Mantenimiento administrativo
+
+Los administradores disponen de una pestaña adicional:
+
+```text
+Catálogo e historial
+→ Mantenimiento
+```
+
+Desde ella pueden revisar el estado general de la base y vaciar todos los datos de la aplicación.
+
+La opción:
+
+```text
+Eliminar todos los datos
+```
+
+borra el contenido de:
+
+- `budget_items`;
+- `price_history`;
+- `budgets`;
+- `concepts`;
+- `projects`.
+
+Las tablas NO se destruyen.
+
+El esquema permanece disponible y la aplicación puede continuar utilizándose inmediatamente después.
+
+Esta decisión evita tener que volver a crear manualmente la estructura PostgreSQL/Supabase.
+
+---
+
+# 42. Eliminación de conceptos
+
+Ya no es necesario escribir la frase:
+
+```text
+ELIMINAR CONCEPTO
+```
+
+Para un concepto individual, el administrador:
+
+1. abre **Opciones avanzadas**;
+2. marca una casilla de confirmación;
+3. presiona **Eliminar concepto**.
+
+Las operaciones de mayor impacto continúan protegidas por `DELETE_KEY`.
+
