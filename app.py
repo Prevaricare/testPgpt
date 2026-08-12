@@ -8,9 +8,11 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
+from collections.abc import Mapping
 
 import pandas as pd
 import streamlit as st
+import streamlit_authenticator as stauth
 from google import genai
 from google.genai import types
 from openpyxl import Workbook
@@ -36,9 +38,6 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("Sistema de Presupuestación Asistida")
-st.caption("Generación inicial de presupuestos para remodelación e interiorismo.")
-
 
 # =========================================================
 # UTILIDADES
@@ -56,6 +55,85 @@ def get_secret(nombre: str, default=None):
     except Exception:
         pass
     return os.getenv(nombre, default)
+
+
+def _secrets_to_dict(value):
+    """Convierte estructuras de st.secrets a dict/list normales."""
+    if isinstance(value, Mapping):
+        return {k: _secrets_to_dict(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_secrets_to_dict(v) for v in value]
+    return value
+
+
+def crear_autenticador():
+    """Crea Streamlit-Authenticator usando exclusivamente Streamlit Secrets."""
+    try:
+        credentials = _secrets_to_dict(st.secrets["credenciales_app"])
+        cookie_cfg = _secrets_to_dict(st.secrets["auth_cookie"])
+    except Exception as exc:
+        st.error(
+            "Falta la configuración de acceso. Configure [credenciales_app] "
+            "y [auth_cookie] en Streamlit Secrets."
+        )
+        st.caption(f"Detalle técnico: {exc}")
+        st.stop()
+
+    if not isinstance(credentials, dict) or "usernames" not in credentials:
+        st.error("[credenciales_app] debe contener la sección 'usernames'.")
+        st.stop()
+
+    required_cookie = {"name", "key", "expiry_days"}
+    missing = required_cookie - set(cookie_cfg or {})
+    if missing:
+        st.error(f"Faltan valores en [auth_cookie]: {', '.join(sorted(missing))}")
+        st.stop()
+
+    return stauth.Authenticate(
+        credentials,
+        str(cookie_cfg["name"]),
+        str(cookie_cfg["key"]),
+        float(cookie_cfg["expiry_days"]),
+        auto_hash=True,
+    )
+
+
+def autenticar_usuario():
+    """Bloquea toda la aplicación hasta que exista una sesión válida."""
+    authenticator = crear_autenticador()
+
+    st.title("Sistema de Presupuestación Asistida")
+    if st.session_state.get("authentication_status") is not True:
+        st.caption("Acceso interno")
+
+    try:
+        authenticator.login(
+            location="main",
+            max_login_attempts=5,
+            fields={
+                "Form name": "Acceso",
+                "Username": "Usuario",
+                "Password": "Contraseña",
+                "Login": "Ingresar",
+            },
+        )
+    except Exception as exc:
+        st.error(f"No fue posible iniciar el módulo de autenticación: {exc}")
+        st.stop()
+
+    status = st.session_state.get("authentication_status")
+    if status is False:
+        st.error("Usuario o contraseña incorrectos.")
+        st.stop()
+    if status is None:
+        st.stop()
+
+    roles = st.session_state.get("roles") or []
+    if isinstance(roles, str):
+        roles = [roles]
+    roles = [str(r).strip().lower() for r in roles]
+
+    return authenticator, roles
 
 
 def normalizar_texto(texto: str) -> str:
@@ -140,7 +218,12 @@ class Database:
         if self.kind == "postgres":
             if psycopg is None:
                 raise RuntimeError("psycopg no está instalado.")
-            return psycopg.connect(self.database_url, row_factory=dict_row)
+            return psycopg.connect(
+                self.database_url,
+                row_factory=dict_row,
+                prepare_threshold=None,
+                connect_timeout=15,
+            )
 
         conn = sqlite3.connect(self.sqlite_path)
         conn.row_factory = sqlite3.Row
@@ -518,16 +601,293 @@ class Database:
             self.execute("DELETE FROM projects WHERE id = ?", (project_id,))
 
 
+    # -----------------------------------------------------
+    # Administración de la base interna
+    # -----------------------------------------------------
+
+    def list_concepts(self, search: str = "", limit: int = 500) -> list[dict]:
+        search_n = normalizar_texto(search)
+        if search_n:
+            rows = self.fetchall(
+                """
+                SELECT c.*,
+                       (SELECT ph.unit_cost FROM price_history ph
+                        WHERE ph.concept_id = c.id
+                        ORDER BY ph.created_at DESC LIMIT 1) AS latest_cost,
+                       (SELECT ph.source FROM price_history ph
+                        WHERE ph.concept_id = c.id
+                        ORDER BY ph.created_at DESC LIMIT 1) AS latest_source,
+                       (SELECT ph.status FROM price_history ph
+                        WHERE ph.concept_id = c.id
+                        ORDER BY ph.created_at DESC LIMIT 1) AS latest_status,
+                       (SELECT COUNT(*) FROM budget_items bi
+                        WHERE bi.concept_id = c.id) AS usage_count
+                FROM concepts c
+                WHERE c.normalized_description LIKE ?
+                   OR LOWER(COALESCE(c.code, '')) LIKE ?
+                   OR LOWER(COALESCE(c.category, '')) LIKE ?
+                   OR LOWER(COALESCE(c.subcategory, '')) LIKE ?
+                ORDER BY c.description
+                LIMIT ?
+                """,
+                (f"%{search_n}%", f"%{search.lower()}%", f"%{search.lower()}%", f"%{search.lower()}%", limit),
+            )
+        else:
+            rows = self.fetchall(
+                """
+                SELECT c.*,
+                       (SELECT ph.unit_cost FROM price_history ph
+                        WHERE ph.concept_id = c.id
+                        ORDER BY ph.created_at DESC LIMIT 1) AS latest_cost,
+                       (SELECT ph.source FROM price_history ph
+                        WHERE ph.concept_id = c.id
+                        ORDER BY ph.created_at DESC LIMIT 1) AS latest_source,
+                       (SELECT ph.status FROM price_history ph
+                        WHERE ph.concept_id = c.id
+                        ORDER BY ph.created_at DESC LIMIT 1) AS latest_status,
+                       (SELECT COUNT(*) FROM budget_items bi
+                        WHERE bi.concept_id = c.id) AS usage_count
+                FROM concepts c
+                ORDER BY c.created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        return rows
+
+    def get_concept(self, concept_id: str) -> dict | None:
+        return self.fetchone("SELECT * FROM concepts WHERE id = ?", (concept_id,))
+
+    def create_concept(self, code: str, category: str, subcategory: str, description: str, unit: str) -> str:
+        concept_id = str(uuid.uuid4())
+        self.execute(
+            """
+            INSERT INTO concepts (
+                id, code, category, subcategory, description, unit,
+                normalized_description, created_budget_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                concept_id,
+                limpiar_codigo(code, "MAN-001"),
+                category.strip(),
+                subcategory.strip(),
+                description.strip(),
+                unit.strip().upper(),
+                normalizar_texto(description),
+                None,
+                ahora_iso(),
+            ),
+        )
+        return concept_id
+
+    def update_concept(self, concept_id: str, code: str, category: str, subcategory: str, description: str, unit: str):
+        self.execute(
+            """
+            UPDATE concepts
+            SET code = ?, category = ?, subcategory = ?, description = ?,
+                unit = ?, normalized_description = ?
+            WHERE id = ?
+            """,
+            (
+                limpiar_codigo(code, "CON-001"),
+                category.strip(),
+                subcategory.strip(),
+                description.strip(),
+                unit.strip().upper(),
+                normalizar_texto(description),
+                concept_id,
+            ),
+        )
+
+    def concept_usage(self, concept_id: str) -> dict:
+        return {
+            "budget_items": self.fetchone(
+                "SELECT COUNT(*) AS n FROM budget_items WHERE concept_id = ?", (concept_id,)
+            )["n"],
+            "prices": self.fetchone(
+                "SELECT COUNT(*) AS n FROM price_history WHERE concept_id = ?", (concept_id,)
+            )["n"],
+        }
+
+    def delete_concept(self, concept_id: str):
+        self.execute("DELETE FROM concepts WHERE id = ?", (concept_id,))
+
+    def list_prices(self, concept_id: str) -> list[dict]:
+        return self.fetchall(
+            """
+            SELECT * FROM price_history
+            WHERE concept_id = ?
+            ORDER BY created_at DESC
+            """,
+            (concept_id,),
+        )
+
+    def add_price(
+        self,
+        concept_id: str,
+        unit_cost: float,
+        source: str,
+        source_detail: str,
+        status: str,
+        confidence: str,
+    ) -> str:
+        price_id = str(uuid.uuid4())
+        self.execute(
+            """
+            INSERT INTO price_history (
+                id, concept_id, unit_cost, source, source_detail,
+                status, confidence, project_id, budget_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                price_id,
+                concept_id,
+                float(unit_cost),
+                source.strip().upper(),
+                source_detail.strip(),
+                status.strip().upper(),
+                confidence.strip(),
+                None,
+                None,
+                ahora_iso(),
+            ),
+        )
+        return price_id
+
+    def delete_price(self, price_id: str):
+        self.execute("DELETE FROM price_history WHERE id = ?", (price_id,))
+
+    def list_projects(self, limit: int = 500) -> list[dict]:
+        return self.fetchall(
+            """
+            SELECT p.*,
+                   (SELECT COUNT(*) FROM budgets b WHERE b.project_id = p.id) AS budget_count,
+                   (SELECT MAX(b.total) FROM budgets b WHERE b.project_id = p.id) AS latest_total
+            FROM projects p
+            ORDER BY p.created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+    def get_project(self, project_id: str) -> dict | None:
+        return self.fetchone("SELECT * FROM projects WHERE id = ?", (project_id,))
+
+    def update_project(
+        self,
+        project_id: str,
+        name: str,
+        project_type: str,
+        location: str,
+        main_activity: str,
+        dimensions_text: str,
+        description: str,
+        guide_text: str,
+    ):
+        self.execute(
+            """
+            UPDATE projects
+            SET name = ?, project_type = ?, location = ?, main_activity = ?,
+                dimensions_text = ?, description = ?, guide_text = ?
+            WHERE id = ?
+            """,
+            (
+                name.strip(), project_type.strip(), location.strip(), main_activity.strip(),
+                dimensions_text.strip(), description.strip(), guide_text.strip(), project_id,
+            ),
+        )
+
+    def delete_project(self, project_id: str):
+        budget_rows = self.fetchall("SELECT id FROM budgets WHERE project_id = ?", (project_id,))
+        budget_ids = [r["id"] for r in budget_rows]
+        self.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
+        # Limpieza de conceptos que nacieron en presupuestos del proyecto eliminado
+        # y que ya no cuentan con uso ni historial.
+        for budget_id in budget_ids:
+            self.execute(
+                """
+                DELETE FROM concepts
+                WHERE created_budget_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM budget_items bi WHERE bi.concept_id = concepts.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM price_history ph WHERE ph.concept_id = concepts.id
+                  )
+                """,
+                (budget_id,),
+            )
+
+    def list_budgets(self, project_id: str | None = None, limit: int = 500) -> list[dict]:
+        if project_id:
+            return self.fetchall(
+                """
+                SELECT b.*, p.code AS project_code, p.name AS project_name,
+                       p.location AS project_location
+                FROM budgets b
+                JOIN projects p ON p.id = b.project_id
+                WHERE b.project_id = ?
+                ORDER BY b.created_at DESC
+                LIMIT ?
+                """,
+                (project_id, limit),
+            )
+        return self.fetchall(
+            """
+            SELECT b.*, p.code AS project_code, p.name AS project_name,
+                   p.location AS project_location
+            FROM budgets b
+            JOIN projects p ON p.id = b.project_id
+            ORDER BY b.created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+    def get_budget(self, budget_id: str) -> dict | None:
+        return self.fetchone(
+            """
+            SELECT b.*, p.code AS project_code, p.name AS project_name
+            FROM budgets b
+            JOIN projects p ON p.id = b.project_id
+            WHERE b.id = ?
+            """,
+            (budget_id,),
+        )
+
+    def list_budget_items(self, budget_id: str) -> list[dict]:
+        return self.fetchall(
+            """
+            SELECT * FROM budget_items
+            WHERE budget_id = ?
+            ORDER BY category, subcategory, code, created_at
+            """,
+            (budget_id,),
+        )
+
+    def delete_budget(self, budget_id: str):
+        budget = self.fetchone("SELECT project_id FROM budgets WHERE id = ?", (budget_id,))
+        if not budget:
+            return
+        self.delete_generation(budget["project_id"], budget_id)
+
+    def export_table(self, table_name: str) -> list[dict]:
+        allowed = {"projects", "budgets", "concepts", "price_history", "budget_items"}
+        if table_name not in allowed:
+            raise ValueError("Tabla no permitida.")
+        return self.fetchall(f"SELECT * FROM {table_name}")
+
+
 @st.cache_resource(show_spinner=False)
 def get_database(database_url: str | None):
-    try:
+    """Usa PostgreSQL si DATABASE_URL existe; SQLite solo para desarrollo sin URL."""
+    if database_url:
+        # En producción no se hace fallback silencioso: si Supabase falla,
+        # se detiene para evitar guardar datos en un SQLite efímero por accidente.
         return Database(database_url), None
-    except Exception as exc:
-        # Si falla una base remota, se conserva operatividad con SQLite local.
-        try:
-            return Database(None), str(exc)
-        except Exception:
-            raise exc
+    return Database(None), None
 
 
 # =========================================================
@@ -1282,75 +1642,611 @@ def dataframe_resumen(items: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
 # =========================================================
-# ESTADO DE APLICACIÓN
+# API DE GEMINI
 # =========================================================
 
 
-database_url = get_secret("DATABASE_URL")
-db, db_error = get_database(database_url)
+def get_api_key_runtime() -> str | None:
+    """La clave de empresa vive únicamente en Streamlit Secrets."""
+    value = get_secret("GEMINI_API_KEY")
+    return str(value).strip() if value else None
 
-with st.sidebar:
-    st.header("Parámetros")
 
-    model_name = st.text_input(
-        "Modelo",
-        value="gemini-3.6-flash",
-        help="Modelo principal. Se prueban alternativas si no está disponible.",
-        key="model_name",
-    )
+# =========================================================
+# PANEL DE ADMINISTRACIÓN DE BASE INTERNA
+# =========================================================
 
-    indirect_pct = st.number_input(
-        "Indirectos (%)",
-        min_value=0.0,
-        max_value=100.0,
-        value=12.0,
-        step=0.5,
-        key="indirect_pct",
-    )
-    profit_pct = st.number_input(
-        "Utilidad (%)",
-        min_value=0.0,
-        max_value=100.0,
-        value=10.0,
-        step=0.5,
-        key="profit_pct",
-    )
-    iva_pct = st.number_input(
-        "IVA (%)",
-        min_value=0.0,
-        max_value=100.0,
-        value=16.0,
-        step=1.0,
-        key="iva_pct",
-    )
-    waste_pct = st.number_input(
-        "Desperdicio de referencia (%)",
-        min_value=0.0,
-        max_value=50.0,
-        value=5.0,
-        step=0.5,
-        key="waste_pct",
-    )
-    st.caption("El desperdicio funciona como referencia para la estimación cuando aplique; no se suma de forma global.")
 
-    st.divider()
-    st.subheader("Base interna")
-    try:
-        stats = db.stats()
-        st.write(f"Proyectos: {stats['projects']}")
-        st.write(f"Presupuestos: {stats['budgets']}")
-        st.write(f"Conceptos: {stats['concepts']}")
-    except Exception:
-        st.write("Sin estadísticas disponibles.")
+def _df_or_empty(rows: list[dict], columns: list[str] | None = None) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=columns or [])
+    return pd.DataFrame(rows)
+
+
+def render_admin_database(db: Database):
+    st.header("Base interna")
+    st.caption("Consulta y administración del catálogo, historial de precios, proyectos y presupuestos.")
 
     if db.persistent:
-        st.caption("Almacenamiento persistente: PostgreSQL.")
-    else:
-        st.warning("Base local temporal. Para conservar el historial entre reinicios de Streamlit configure DATABASE_URL.")
+        st.success("Base persistente PostgreSQL activa.")
 
-    if db_error:
-        st.warning("No fue posible usar DATABASE_URL; se activó la base local temporal.")
+    if not db.persistent:
+        st.warning(
+            "La app está usando SQLite local. En Streamlit Community Cloud este archivo no debe considerarse "
+            "almacenamiento empresarial permanente. Para producción configure DATABASE_URL con PostgreSQL."
+        )
+
+    try:
+        stats = db.stats()
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Proyectos", stats["projects"])
+        m2.metric("Presupuestos", stats["budgets"])
+        m3.metric("Conceptos", stats["concepts"])
+    except Exception as exc:
+        st.error(f"No fue posible consultar la base: {exc}")
+        return
+
+    tab_concepts, tab_projects, tab_budgets, tab_export = st.tabs(
+        ["Conceptos y precios", "Proyectos", "Presupuestos", "Exportar datos"]
+    )
+
+    # -----------------------------------------------------
+    # Conceptos y precios
+    # -----------------------------------------------------
+    with tab_concepts:
+        st.subheader("Catálogo interno")
+        search = st.text_input(
+            "Buscar concepto",
+            placeholder="Descripción, código, partida o subpartida",
+            key="admin_concept_search",
+        )
+        concepts = db.list_concepts(search)
+
+        if concepts:
+            display_rows = []
+            for r in concepts:
+                display_rows.append({
+                    "Código": r.get("code"),
+                    "Partida": r.get("category"),
+                    "Subpartida": r.get("subcategory"),
+                    "Concepto": r.get("description"),
+                    "Unidad": r.get("unit"),
+                    "Último costo": r.get("latest_cost"),
+                    "Fuente": r.get("latest_source"),
+                    "Estado": r.get("latest_status"),
+                    "Usos": r.get("usage_count", 0),
+                })
+            st.dataframe(
+                pd.DataFrame(display_rows),
+                use_container_width=True,
+                hide_index=True,
+                column_config={"Último costo": st.column_config.NumberColumn(format="$ %.2f")},
+            )
+
+            concept_map = {
+                r["id"]: f"{r.get('code') or 'SIN-COD'} | {r.get('description') or ''}"
+                for r in concepts
+            }
+            selected_concept_id = st.selectbox(
+                "Seleccionar concepto",
+                options=list(concept_map.keys()),
+                format_func=lambda x: concept_map[x],
+                key="admin_selected_concept",
+            )
+            concept = db.get_concept(selected_concept_id)
+
+            if concept:
+                st.markdown("#### Editar concepto")
+                with st.form("admin_edit_concept"):
+                    e1, e2 = st.columns(2)
+                    with e1:
+                        c_code = st.text_input("Código", value=concept.get("code") or "")
+                        c_category = st.text_input("Partida", value=concept.get("category") or "")
+                        c_subcategory = st.text_input("Subpartida", value=concept.get("subcategory") or "")
+                    with e2:
+                        c_unit = st.text_input("Unidad", value=concept.get("unit") or "")
+                        c_description = st.text_area(
+                            "Descripción",
+                            value=concept.get("description") or "",
+                            height=130,
+                        )
+                    update_concept_btn = st.form_submit_button("Guardar cambios")
+
+                if update_concept_btn:
+                    if not c_description.strip() or not c_unit.strip():
+                        st.error("Descripción y unidad son obligatorias.")
+                    else:
+                        db.update_concept(
+                            selected_concept_id, c_code, c_category, c_subcategory,
+                            c_description, c_unit,
+                        )
+                        st.success("Concepto actualizado.")
+                        st.rerun()
+
+                st.markdown("#### Historial de precios")
+                prices = db.list_prices(selected_concept_id)
+                if prices:
+                    price_df = pd.DataFrame([
+                        {
+                            "ID": p["id"],
+                            "Costo": p["unit_cost"],
+                            "Fuente": p["source"],
+                            "Detalle": p.get("source_detail"),
+                            "Estado": p["status"],
+                            "Confianza": p.get("confidence"),
+                            "Fecha": p["created_at"],
+                        }
+                        for p in prices
+                    ])
+                    st.dataframe(
+                        price_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={"Costo": st.column_config.NumberColumn(format="$ %.2f")},
+                    )
+                else:
+                    st.caption("El concepto todavía no tiene historial de precios.")
+
+                with st.form("admin_add_price"):
+                    p1, p2, p3 = st.columns(3)
+                    with p1:
+                        new_cost = st.number_input("Nuevo costo unitario", min_value=0.0, step=100.0)
+                        new_source = st.selectbox(
+                            "Fuente",
+                            ["COTIZACION_PROVEEDOR", "COSTO_REAL", "REFERENCIA_EXTERNA", "IA_ESTIMADO", "MANUAL"],
+                        )
+                    with p2:
+                        new_status = st.selectbox(
+                            "Estado",
+                            ["VALIDADO", "COTIZADO_PROVEEDOR", "COSTO_REAL", "REFERENCIA_EXTERNA", "ESTIMADO_IA"],
+                        )
+                        new_confidence = st.selectbox("Confianza", ["Alta", "Media", "Baja"])
+                    with p3:
+                        new_detail = st.text_area("Detalle / proveedor / referencia", height=105)
+                    add_price_btn = st.form_submit_button("Agregar precio")
+
+                if add_price_btn:
+                    if new_cost <= 0:
+                        st.error("El costo debe ser mayor que cero.")
+                    else:
+                        db.add_price(
+                            selected_concept_id,
+                            new_cost,
+                            new_source,
+                            new_detail,
+                            new_status,
+                            new_confidence,
+                        )
+                        st.success("Precio agregado al historial.")
+                        st.rerun()
+
+                if prices:
+                    with st.expander("Eliminar un precio"):
+                        price_map = {
+                            p["id"]: f"{formato_moneda(float(p['unit_cost']))} | {p['source']} | {p['created_at']}"
+                            for p in prices
+                        }
+                        price_to_delete = st.selectbox(
+                            "Precio",
+                            options=list(price_map.keys()),
+                            format_func=lambda x: price_map[x],
+                            key="admin_price_delete_select",
+                        )
+                        confirm_price = st.text_input(
+                            "Escriba ELIMINAR PRECIO",
+                            key="admin_confirm_delete_price",
+                        )
+                        if st.button("Eliminar precio seleccionado", key="admin_delete_price_btn"):
+                            if confirm_price.strip().upper() != "ELIMINAR PRECIO":
+                                st.error("Confirmación incorrecta.")
+                            else:
+                                db.delete_price(price_to_delete)
+                                st.success("Precio eliminado.")
+                                st.rerun()
+
+                with st.expander("Eliminar concepto"):
+                    usage = db.concept_usage(selected_concept_id)
+                    st.write(
+                        f"Usos en presupuestos: {usage['budget_items']} | Registros de precio: {usage['prices']}"
+                    )
+                    if usage["budget_items"]:
+                        st.warning(
+                            "El concepto ya fue utilizado en presupuestos. Al eliminarlo, los presupuestos históricos "
+                            "conservarán sus datos, pero perderán el vínculo al concepto y se eliminará su historial de precios."
+                        )
+                    confirm_concept = st.text_input(
+                        "Escriba ELIMINAR CONCEPTO",
+                        key="admin_confirm_delete_concept",
+                    )
+                    if st.button("Eliminar concepto", key="admin_delete_concept_btn"):
+                        if confirm_concept.strip().upper() != "ELIMINAR CONCEPTO":
+                            st.error("Confirmación incorrecta.")
+                        else:
+                            db.delete_concept(selected_concept_id)
+                            st.success("Concepto eliminado.")
+                            st.rerun()
+        else:
+            st.info("No se encontraron conceptos.")
+
+        st.divider()
+        st.markdown("#### Alta manual de concepto")
+        with st.form("admin_create_concept"):
+            a1, a2 = st.columns(2)
+            with a1:
+                a_code = st.text_input("Código sugerido", value="MAN-001")
+                a_category = st.text_input("Partida", key="admin_new_category")
+                a_subcategory = st.text_input("Subpartida", key="admin_new_subcategory")
+            with a2:
+                a_unit = st.text_input("Unidad", value="LOTE", key="admin_new_unit")
+                a_description = st.text_area("Descripción", height=120, key="admin_new_description")
+            create_concept_btn = st.form_submit_button("Crear concepto")
+        if create_concept_btn:
+            if not a_description.strip() or not a_unit.strip():
+                st.error("Descripción y unidad son obligatorias.")
+            else:
+                new_id = db.create_concept(a_code, a_category, a_subcategory, a_description, a_unit)
+                st.success("Concepto creado. Puede seleccionarlo para agregar precios.")
+                st.rerun()
+
+    # -----------------------------------------------------
+    # Proyectos
+    # -----------------------------------------------------
+    with tab_projects:
+        st.subheader("Proyectos registrados")
+        projects = db.list_projects()
+        if not projects:
+            st.info("No hay proyectos registrados.")
+        else:
+            project_df = pd.DataFrame([
+                {
+                    "Código": p["code"],
+                    "Nombre": p["name"],
+                    "Tipo": p["project_type"],
+                    "Ubicación": p.get("location"),
+                    "Presupuestos": p.get("budget_count", 0),
+                    "Último total": p.get("latest_total"),
+                    "Fecha": p["created_at"],
+                }
+                for p in projects
+            ])
+            st.dataframe(
+                project_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={"Último total": st.column_config.NumberColumn(format="$ %.2f")},
+            )
+
+            project_map = {p["id"]: f"{p['code']} | {p['name']}" for p in projects}
+            selected_project_id = st.selectbox(
+                "Seleccionar proyecto",
+                options=list(project_map.keys()),
+                format_func=lambda x: project_map[x],
+                key="admin_selected_project",
+            )
+            project = db.get_project(selected_project_id)
+
+            if project:
+                with st.form("admin_edit_project"):
+                    p1, p2 = st.columns(2)
+                    with p1:
+                        pr_name = st.text_input("Nombre", value=project.get("name") or "")
+                        pr_type = st.text_input("Tipo", value=project.get("project_type") or "")
+                        pr_location = st.text_input("Ubicación", value=project.get("location") or "")
+                        pr_activity = st.text_input("Actividad principal", value=project.get("main_activity") or "")
+                    with p2:
+                        pr_dimensions = st.text_area("Dimensiones", value=project.get("dimensions_text") or "", height=90)
+                        pr_description = st.text_area("Descripción", value=project.get("description") or "", height=130)
+                        pr_guide = st.text_area("Texto guía", value=project.get("guide_text") or "", height=90)
+                    save_project_btn = st.form_submit_button("Guardar cambios")
+
+                if save_project_btn:
+                    if not pr_name.strip():
+                        st.error("El nombre es obligatorio.")
+                    else:
+                        db.update_project(
+                            selected_project_id,
+                            pr_name,
+                            pr_type,
+                            pr_location,
+                            pr_activity,
+                            pr_dimensions,
+                            pr_description,
+                            pr_guide,
+                        )
+                        st.success("Proyecto actualizado.")
+                        st.rerun()
+
+                project_budgets = db.list_budgets(selected_project_id)
+                if project_budgets:
+                    st.markdown("#### Presupuestos del proyecto")
+                    st.dataframe(
+                        pd.DataFrame([
+                            {
+                                "Versión": b["version"],
+                                "Estado": b["status"],
+                                "Costo directo": b["direct_cost"],
+                                "Venta sin IVA": b["sale_before_tax"],
+                                "Total": b["total"],
+                                "Fecha": b["created_at"],
+                            }
+                            for b in project_budgets
+                        ]),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Costo directo": st.column_config.NumberColumn(format="$ %.2f"),
+                            "Venta sin IVA": st.column_config.NumberColumn(format="$ %.2f"),
+                            "Total": st.column_config.NumberColumn(format="$ %.2f"),
+                        },
+                    )
+
+                with st.expander("Eliminar proyecto"):
+                    st.warning("Esta acción elimina también los presupuestos asociados al proyecto.")
+                    confirm_project = st.text_input(
+                        "Escriba ELIMINAR PROYECTO",
+                        key="admin_confirm_delete_project",
+                    )
+                    if st.button("Eliminar proyecto", key="admin_delete_project_btn"):
+                        if confirm_project.strip().upper() != "ELIMINAR PROYECTO":
+                            st.error("Confirmación incorrecta.")
+                        else:
+                            db.delete_project(selected_project_id)
+                            st.success("Proyecto eliminado.")
+                            st.rerun()
+
+    # -----------------------------------------------------
+    # Presupuestos
+    # -----------------------------------------------------
+    with tab_budgets:
+        st.subheader("Presupuestos registrados")
+        budgets = db.list_budgets()
+        if not budgets:
+            st.info("No hay presupuestos registrados.")
+        else:
+            budget_df = pd.DataFrame([
+                {
+                    "Proyecto": b["project_code"],
+                    "Nombre": b["project_name"],
+                    "Estado": b["status"],
+                    "Costo directo": b["direct_cost"],
+                    "Indirectos": b["indirect_cost"],
+                    "Utilidad": b["profit"],
+                    "Venta sin IVA": b["sale_before_tax"],
+                    "Total": b["total"],
+                    "Fecha": b["created_at"],
+                }
+                for b in budgets
+            ])
+            st.dataframe(
+                budget_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Costo directo": st.column_config.NumberColumn(format="$ %.2f"),
+                    "Indirectos": st.column_config.NumberColumn(format="$ %.2f"),
+                    "Utilidad": st.column_config.NumberColumn(format="$ %.2f"),
+                    "Venta sin IVA": st.column_config.NumberColumn(format="$ %.2f"),
+                    "Total": st.column_config.NumberColumn(format="$ %.2f"),
+                },
+            )
+
+            budget_map = {
+                b["id"]: f"{b['project_code']} | {b['project_name']} | {formato_moneda(float(b['total']))}"
+                for b in budgets
+            }
+            selected_budget_id = st.selectbox(
+                "Seleccionar presupuesto",
+                options=list(budget_map.keys()),
+                format_func=lambda x: budget_map[x],
+                key="admin_selected_budget",
+            )
+            budget = db.get_budget(selected_budget_id)
+            if budget:
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Costo directo", formato_moneda(float(budget["direct_cost"])))
+                m2.metric("Indirectos", formato_moneda(float(budget["indirect_cost"])))
+                m3.metric("Utilidad", formato_moneda(float(budget["profit"])))
+                m4.metric("Total", formato_moneda(float(budget["total"])))
+
+                budget_items = db.list_budget_items(selected_budget_id)
+                if budget_items:
+                    st.dataframe(
+                        pd.DataFrame([
+                            {
+                                "Partida": i["category"],
+                                "Subpartida": i["subcategory"],
+                                "Código": i["code"],
+                                "Concepto": i["description"],
+                                "Unidad": i["unit"],
+                                "Cantidad": i["quantity"],
+                                "Costo unitario": i["unit_cost"],
+                                "Venta unitaria": i["unit_sale"],
+                                "Venta": i["sale_amount"],
+                                "Fuente": i.get("price_source"),
+                            }
+                            for i in budget_items
+                        ]),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Costo unitario": st.column_config.NumberColumn(format="$ %.2f"),
+                            "Venta unitaria": st.column_config.NumberColumn(format="$ %.2f"),
+                            "Venta": st.column_config.NumberColumn(format="$ %.2f"),
+                        },
+                    )
+
+                with st.expander("Eliminar presupuesto"):
+                    st.warning(
+                        "Se eliminarán las partidas e historial vinculados a este presupuesto. "
+                        "Si es el único presupuesto del proyecto, también se eliminará el proyecto."
+                    )
+                    confirm_budget = st.text_input(
+                        "Escriba ELIMINAR PRESUPUESTO",
+                        key="admin_confirm_delete_budget",
+                    )
+                    if st.button("Eliminar presupuesto", key="admin_delete_budget_btn"):
+                        if confirm_budget.strip().upper() != "ELIMINAR PRESUPUESTO":
+                            st.error("Confirmación incorrecta.")
+                        else:
+                            db.delete_budget(selected_budget_id)
+                            st.success("Presupuesto eliminado.")
+                            st.rerun()
+
+    # -----------------------------------------------------
+    # Exportación de base
+    # -----------------------------------------------------
+    with tab_export:
+        st.subheader("Exportar base interna")
+        st.caption("Exportación administrativa en CSV. No modifica la base de datos.")
+        for table_name, label in [
+            ("concepts", "Conceptos"),
+            ("price_history", "Historial de precios"),
+            ("projects", "Proyectos"),
+            ("budgets", "Presupuestos"),
+            ("budget_items", "Partidas de presupuestos"),
+        ]:
+            rows = db.export_table(table_name)
+            csv_bytes = pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                f"Descargar {label} CSV",
+                data=csv_bytes,
+                file_name=f"{table_name}.csv",
+                mime="text/csv",
+                key=f"download_{table_name}",
+                use_container_width=True,
+            )
+
+
+# =========================================================
+# AUTENTICACIÓN Y ESTADO DE APLICACIÓN
+# =========================================================
+
+
+authenticator, user_roles = autenticar_usuario()
+is_admin = "admin" in user_roles
+
+st.caption("Generación inicial de presupuestos para remodelación e interiorismo.")
+
+database_url = get_secret("DATABASE_URL")
+try:
+    db, db_error = get_database(database_url)
+except Exception as exc:
+    st.error("No fue posible conectar con la base PostgreSQL configurada.")
+    st.caption(
+        "Revise DATABASE_URL en Streamlit Secrets y la cadena de conexión de Supabase. "
+        "La aplicación no usará SQLite como respaldo cuando exista una DATABASE_URL."
+    )
+    st.exception(exc)
+    st.stop()
+
+with st.sidebar:
+    st.header("Sesión")
+    display_name = st.session_state.get("name") or st.session_state.get("username") or "Usuario"
+    st.write(str(display_name))
+    role_label = "Administrador" if is_admin else "Usuario"
+    st.caption(role_label)
+    authenticator.logout(
+        button_name="Cerrar sesión",
+        location="sidebar",
+        key="logout_main",
+        use_container_width=True,
+    )
+
+    st.divider()
+    st.header("Navegación")
+    sections = ["Generar presupuesto"]
+    if is_admin:
+        sections.append("Base interna")
+
+    section = st.radio(
+        "Sección",
+        sections,
+        key="main_section",
+        label_visibility="collapsed",
+    )
+
+    if section == "Generar presupuesto":
+        st.divider()
+        st.header("Parámetros")
+
+        model_name = st.text_input(
+            "Modelo",
+            value="gemini-3.6-flash",
+            help="Modelo principal. Se prueban alternativas si no está disponible.",
+            key="model_name",
+        )
+
+        indirect_pct = st.number_input(
+            "Indirectos (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=12.0,
+            step=0.5,
+            key="indirect_pct",
+        )
+        profit_pct = st.number_input(
+            "Utilidad (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=10.0,
+            step=0.5,
+            key="profit_pct",
+        )
+        iva_pct = st.number_input(
+            "IVA (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=16.0,
+            step=1.0,
+            key="iva_pct",
+        )
+        waste_pct = st.number_input(
+            "Desperdicio de referencia (%)",
+            min_value=0.0,
+            max_value=50.0,
+            value=5.0,
+            step=0.5,
+            key="waste_pct",
+        )
+        st.caption(
+            "El desperdicio es una referencia para la estimación cuando aplique; "
+            "no se suma de forma global."
+        )
+
+        st.divider()
+        st.subheader("Estado de base interna")
+        try:
+            stats = db.stats()
+            st.write(f"Proyectos: {stats['projects']}")
+            st.write(f"Presupuestos: {stats['budgets']}")
+            st.write(f"Conceptos: {stats['concepts']}")
+        except Exception:
+            st.write("Sin estadísticas disponibles.")
+
+        if db.persistent:
+            st.success("PostgreSQL conectado.")
+        else:
+            st.warning(
+                "SQLite local activo. Úselo solo para desarrollo; en Streamlit Community Cloud "
+                "configure DATABASE_URL para persistencia."
+            )
+
+        if not get_api_key_runtime():
+            st.error("Falta GEMINI_API_KEY en Streamlit Secrets.")
+
+# =========================================================
+# BASE INTERNA
+# =========================================================
+
+
+if section == "Base interna":
+    if not is_admin:
+        st.error("No tiene permisos para administrar la base interna.")
+        st.stop()
+    render_admin_database(db)
+    st.stop()
 
 
 # =========================================================
@@ -1360,6 +2256,15 @@ with st.sidebar:
 
 if "generated" not in st.session_state:
     with st.form("form_proyecto"):
+        simulation_mode = st.toggle(
+            "Simulación",
+            value=False,
+            help="Genera Excel, TXT y resultados, pero no guarda proyectos, presupuestos, conceptos ni precios en la base interna.",
+            key="simulation_mode",
+        )
+        if simulation_mode:
+            st.info("Modo simulación activo: esta corrida no modificará la base interna.")
+
         c1, c2 = st.columns(2)
 
         with c1:
@@ -1440,9 +2345,9 @@ if "generated" not in st.session_state:
         )
 
     if generate:
-        api_key = get_api_key()
+        api_key = get_api_key_runtime()
         if not api_key:
-            st.error("No se encontró GEMINI_API_KEY en los Secrets de Streamlit.")
+            st.error("Falta GEMINI_API_KEY en Streamlit Secrets.")
             st.stop()
 
         if not name.strip():
@@ -1485,19 +2390,18 @@ if "generated" not in st.session_state:
                     params=params,
                 )
 
+                # La base interna puede consultarse en simulación, pero nunca se escribe.
                 items = resolver_items(db, result, project_data, params)
                 if not items:
                     raise RuntimeError("La IA no generó actividades utilizables.")
 
                 financials = calcular_financieros(items, params)
-                project_code = db.next_project_code(
+                base_code = db.next_project_code(
                     project_data["location"],
                     project_data["project_type"],
                 )
+                project_code = f"SIM-{base_code}" if simulation_mode else base_code
 
-                # Los archivos se construyen antes de registrar la generación.
-                # Así se evita dejar un presupuesto incompleto en la base si
-                # falla la creación de Excel o TXT.
                 excel_bytes = crear_excel(
                     project_code=project_code,
                     project_data=project_data,
@@ -1515,18 +2419,22 @@ if "generated" not in st.session_state:
                 )
                 zip_bytes = crear_paquete_zip(project_code, excel_bytes, txt_bytes)
 
-                project_id, budget_id = db.save_generation(
-                    project_code=project_code,
-                    project_data=project_data,
-                    result=result,
-                    items=items,
-                    params=params,
-                    financials=financials,
-                )
+                project_id = None
+                budget_id = None
+                if not simulation_mode:
+                    project_id, budget_id = db.save_generation(
+                        project_code=project_code,
+                        project_data=project_data,
+                        result=result,
+                        items=items,
+                        params=params,
+                        financials=financials,
+                    )
 
                 st.session_state["generated"] = {
                     "project_id": project_id,
                     "budget_id": budget_id,
+                    "simulation": bool(simulation_mode),
                     "project_code": project_code,
                     "project_data": project_data,
                     "params": params,
@@ -1553,6 +2461,9 @@ else:
     result = PresupuestoIA.model_validate(g["result"])
     items = g["items"]
     financials = g["financials"]
+
+    if g.get("simulation"):
+        st.warning("SIMULACIÓN: esta generación no fue guardada en la base interna.")
 
     st.subheader(g["project_code"])
     st.write(result.alcance_resumido)
@@ -1625,7 +2536,8 @@ else:
     st.divider()
     if st.button("Modificar datos iniciales", use_container_width=True):
         try:
-            db.delete_generation(g["project_id"], g["budget_id"])
+            if not g.get("simulation") and g.get("project_id") and g.get("budget_id"):
+                db.delete_generation(g["project_id"], g["budget_id"])
         finally:
             del st.session_state["generated"]
             st.rerun()

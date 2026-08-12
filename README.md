@@ -1,51 +1,36 @@
-# Presupuestador IA - Streamlit
+# Presupuestador V4 — Supabase/PostgreSQL + autenticación
 
-## Archivos
-- `app.py`
-- `requirements.txt`
+## Cambios principales
 
-## Secret requerido
+- Autenticación con `streamlit-authenticator`.
+- Cookie de reautenticación guardada en el navegador; duración configurable.
+- Roles: `admin` y `usuario`.
+- Solo `admin` puede abrir **Base interna**.
+- `GEMINI_API_KEY`, `DATABASE_URL`, cookie y usuarios viven en Streamlit Secrets.
+- PostgreSQL/Supabase es la base persistente.
+- SQLite queda únicamente como modo local cuando NO existe `DATABASE_URL`.
+- Si `DATABASE_URL` está configurada pero falla, la app se detiene en vez de guardar accidentalmente en SQLite.
+- Compatible con poolers de Supabase: se desactivan prepared statements de Psycopg.
+- Conserva modo simulación, Excel/TXT/ZIP y administración de conceptos, precios, proyectos y presupuestos.
 
-En Streamlit Community Cloud:
+## Supabase
 
-1. Abre tu aplicación.
-2. Ve a Settings / Secrets.
-3. Agrega:
+1. Cree una cuenta y un proyecto en Supabase.
+2. Pulse **Connect**.
+3. Copie preferentemente la cadena **Session pooler** (puerto 5432), especialmente para Streamlit Community Cloud.
+4. Sustituya `[YOUR-PASSWORD]` por la contraseña de la base.
+5. Pegue la cadena completa como `DATABASE_URL` en Streamlit Secrets.
+6. La app creará automáticamente sus tablas la primera vez que conecte.
 
-```toml
-GEMINI_API_KEY = "TU_CLAVE_AQUI"
-```
+## Streamlit Secrets
 
-No subas la API key directamente a GitHub.
+Copie el contenido de `secrets_ejemplo.toml` en:
 
-## Ejecución local
+Streamlit Community Cloud > su app > Settings > Secrets
 
-Instala dependencias:
+Cambie todos los valores de ejemplo antes de guardar.
 
-```bash
-pip install -r requirements.txt
-```
+## Seguridad
 
-Configura la variable `GEMINI_API_KEY` o crea `.streamlit/secrets.toml`.
-
-Después:
-
-```bash
-streamlit run app.py
-```
-
-## Qué hace esta versión
-
-1. Recibe dimensiones y descripción.
-2. Gemini genera un presupuesto preliminar estructurado.
-3. Muestra supuestos y datos faltantes.
-4. Permite editar cantidades y P.U.
-5. Calcula costo directo, indirectos, utilidad e IVA.
-6. Exporta un archivo Excel con:
-   - Presupuesto
-   - Resumen
-   - Datos_Proyecto
-   - Revision_IA
-
-Los precios producidos por IA son únicamente preliminares y deben sustituirse o
-validarse con un catálogo de precios/cotizaciones para uso profesional.
+La API key de Gemini ya no se guarda en `localStorage`. Se usa la clave empresarial de Streamlit Secrets.
+El navegador solo conserva la cookie de autenticación gestionada por `streamlit-authenticator`.
