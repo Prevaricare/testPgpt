@@ -11,8 +11,12 @@ from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Mapping
+from urllib.parse import urljoin
 
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from pypdf import PdfReader
 import streamlit as st
 import streamlit_authenticator as stauth
 from google import genai
@@ -233,6 +237,454 @@ def limpiar_codigo(codigo: str, fallback: str) -> str:
 
 
 # =========================================================
+# CATÁLOGOS EXTERNOS - CDMX
+# =========================================================
+
+
+CDMX_TABULADOR_PAGE = (
+    "https://www.obras.cdmx.gob.mx/normas-tabulador/"
+    "tabulador-general-de-precios-unitarios"
+)
+
+# Fallback oficial conocido al momento de construir esta versión. La app no
+# depende de este enlace para siempre: primero intenta descubrir dinámicamente
+# la edición más reciente publicada en la página oficial.
+CDMX_FALLBACK_CATALOG = {
+    "source": "CDMX",
+    "version_label": "Mayo 2026",
+    "year": 2026,
+    "month": 5,
+    "url": (
+        "https://obras.cdmx.gob.mx/storage/app/media/"
+        "Tabulador%20General%20de%20Precios%20Unitarios%20Mayo%202026/"
+        "tabulador-general-de-precios-unitarios-del-gobierno-de-la-ciudad-"
+        "de-mexico-actualizacion-de-mayo-2026.pdf"
+    ),
+}
+
+SPANISH_MONTHS = {
+    "ENERO": 1,
+    "FEBRERO": 2,
+    "MARZO": 3,
+    "ABRIL": 4,
+    "MAYO": 5,
+    "JUNIO": 6,
+    "JULIO": 7,
+    "AGOSTO": 8,
+    "SEPTIEMBRE": 9,
+    "SETIEMBRE": 9,
+    "OCTUBRE": 10,
+    "NOVIEMBRE": 11,
+    "DICIEMBRE": 12,
+}
+SPANISH_MONTH_NAMES = {
+    value: key.title() for key, value in SPANISH_MONTHS.items()
+    if key != "SETIEMBRE"
+}
+
+CDMX_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; PresupuestadorEmpresa/1.0; "
+        "+https://streamlit.io)"
+    ),
+    "Accept": "text/html,application/pdf,*/*",
+}
+
+
+def normalizar_unidad(unidad: str) -> str:
+    # Los superíndices deben convertirse antes de normalizar texto; de lo
+    # contrario "m²" podría quedar reducido a "m".
+    raw = str(unidad or "").strip()
+    raw = raw.replace("²", "2").replace("³", "3")
+    value = normalizar_texto(raw).upper()
+    value = (
+        value.replace("M²", "M2")
+        .replace("M³", "M3")
+        .replace("MTS2", "M2")
+        .replace("MTS3", "M3")
+        .replace("METROS CUADRADOS", "M2")
+        .replace("METRO CUADRADO", "M2")
+        .replace("METROS CUBICOS", "M3")
+        .replace("METRO CUBICO", "M3")
+        .replace("METROS LINEALES", "ML")
+        .replace("METRO LINEAL", "ML")
+        .replace("PIEZAS", "PZA")
+        .replace("PIEZA", "PZA")
+        .replace("PZAS", "PZA")
+        .replace("PZ", "PZA")
+        .replace("KILOGRAMOS", "KG")
+        .replace("KILOGRAMO", "KG")
+        .replace("TONELADAS", "TON")
+        .replace("TONELADA", "TON")
+        .replace("LITROS", "L")
+        .replace("LITRO", "L")
+    )
+    value = re.sub(r"[^A-Z0-9%]+", "", value)
+    aliases = {
+        "M2": "M2",
+        "M3": "M3",
+        "ML": "ML",
+        "M": "M",
+        "PZA": "PZA",
+        "PZA.": "PZA",
+        "KG": "KG",
+        "TON": "TON",
+        "L": "L",
+        "LT": "L",
+        "H": "H",
+        "HR": "H",
+        "HRA": "H",
+        "HORA": "H",
+        "DIA": "DIA",
+        "MES": "MES",
+        "LOTE": "LOTE",
+        "JGO": "JGO",
+        "JUEGO": "JGO",
+        "PTO": "PTO",
+        "PUNTO": "PTO",
+        "SERV": "SERV",
+        "SERVICIO": "SERV",
+        "%": "%",
+    }
+    return aliases.get(value, value[:16])
+
+
+def _mes_y_anio_desde_texto(texto: str) -> tuple[int | None, int | None]:
+    normalized = normalizar_texto(texto).upper()
+    year_match = re.search(r"\b(20\d{2})\b", normalized)
+    year = int(year_match.group(1)) if year_match else None
+    month = None
+    for name, number in SPANISH_MONTHS.items():
+        if re.search(rf"\b{name}\b", normalized):
+            month = number
+            break
+    return month, year
+
+
+def descubrir_ultimo_tabulador_cdmx(timeout: int = 30) -> dict:
+    """
+    Busca en la página oficial todos los enlaces PDF del Tabulador General y
+    selecciona el de año/mes más reciente. Si la página cambia o falla, utiliza
+    el último enlace oficial conocido como fallback.
+    """
+    try:
+        response = requests.get(
+            CDMX_TABULADOR_PAGE,
+            headers=CDMX_HTTP_HEADERS,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        candidates = []
+        for a in soup.find_all("a", href=True):
+            href = str(a.get("href") or "").strip()
+            label = " ".join(a.stripped_strings)
+            combined = f"{label} {href}"
+            normalized = normalizar_texto(combined).upper()
+
+            if "TABULADOR GENERAL DE PRECIOS UNITARIOS" not in normalized:
+                continue
+            if "NOTA" in normalized or "ANEXO" in normalized:
+                continue
+            if ".PDF" not in normalized:
+                continue
+
+            month, year = _mes_y_anio_desde_texto(combined)
+            if not year:
+                continue
+
+            # Una edición anual sin mes es anterior a sus actualizaciones
+            # mensuales del mismo año.
+            month_sort = month or 0
+            candidates.append(
+                {
+                    "source": "CDMX",
+                    "version_label": (
+                        f"{SPANISH_MONTH_NAMES.get(month, 'Edición')} {year}"
+                        if month
+                        else f"Edición {year}"
+                    ),
+                    "year": year,
+                    "month": month or 0,
+                    "url": urljoin(CDMX_TABULADOR_PAGE, href),
+                    "_sort": (year, month_sort),
+                }
+            )
+
+        if candidates:
+            latest = max(candidates, key=lambda x: x["_sort"])
+            latest.pop("_sort", None)
+            return latest
+    except Exception:
+        pass
+
+    return dict(CDMX_FALLBACK_CATALOG)
+
+
+def _parse_price(value: str) -> float | None:
+    raw = str(value or "").strip()
+    raw = raw.replace("$", "").replace(",", "").replace(" ", "")
+    raw = raw.replace("\u00a0", "")
+    if not re.fullmatch(r"\d+(?:\.\d+)?", raw):
+        return None
+    try:
+        number = float(raw)
+    except ValueError:
+        return None
+    if number <= 0 or number > 1_000_000_000:
+        return None
+    return number
+
+
+def _looks_like_source_code(value: str) -> bool:
+    value = str(value or "").strip().upper()
+    if not value or len(value) > 45:
+        return False
+    if value in {"CLAVE", "PAGINA", "PÁGINA"}:
+        return False
+    if " " in value:
+        return False
+    # Los códigos del tabulador pueden contener letras, números, punto,
+    # guion, diagonal y guion bajo.
+    return bool(re.fullmatch(r"[A-Z0-9][A-Z0-9._/\-]{1,44}", value))
+
+
+def _clean_pdf_cell(value) -> str:
+    text = str(value or "")
+    text = text.replace("\x00", " ").replace("\u00a0", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _concept_from_cells(
+    code: str,
+    description: str,
+    unit: str,
+    price,
+    chapter: str = "",
+) -> dict | None:
+    code = _clean_pdf_cell(code).upper()
+    description = _clean_pdf_cell(description)
+    unit = _clean_pdf_cell(unit).upper()
+    numeric_price = _parse_price(price)
+
+    if not _looks_like_source_code(code):
+        return None
+    if not description or len(description) < 8:
+        return None
+    normalized_desc = normalizar_texto(description)
+    if any(
+        bad in normalized_desc
+        for bad in [
+            "tabulador general de precios",
+            "concepto de obra",
+            "plaza de la constitucion",
+            "gobierno de la ciudad",
+        ]
+    ):
+        return None
+    normalized_unit = normalizar_unidad(unit)
+    if not normalized_unit or numeric_price is None:
+        return None
+
+    return {
+        "source_code": code,
+        "description": description,
+        "normalized_description": normalized_desc,
+        "unit": unit,
+        "normalized_unit": normalized_unit,
+        "unit_price": numeric_price,
+        "chapter": _clean_pdf_cell(chapter),
+    }
+
+
+def _parse_layout_line(line: str) -> dict | None:
+    """
+    Parser principal para texto extraído en modo layout.
+    El tabulador oficial utiliza cuatro columnas: Clave, Concepto, Unidad, P.U.
+    """
+    raw = line.rstrip()
+    if not raw.strip():
+        return None
+
+    # Primero se aprovechan los bloques de 2+ espacios producidos por layout.
+    parts = [p.strip() for p in re.split(r"\s{2,}", raw.strip()) if p.strip()]
+    if len(parts) >= 4:
+        code = parts[0]
+        price = parts[-1]
+        unit = parts[-2]
+        description = " ".join(parts[1:-2])
+        concept = _concept_from_cells(code, description, unit, price)
+        if concept:
+            return concept
+
+    # Fallback para PDFs donde las columnas colapsan a un solo espacio.
+    m = re.match(
+        r"^\s*(?P<code>\S+)\s+"
+        r"(?P<desc>.+?)\s+"
+        r"(?P<unit>[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9²³%./_-]{1,16})\s+"
+        r"\$?\s*(?P<price>\d[\d,]*(?:\.\d+)?)\s*$",
+        raw,
+    )
+    if not m:
+        return None
+    return _concept_from_cells(
+        m.group("code"),
+        m.group("desc"),
+        m.group("unit"),
+        m.group("price"),
+    )
+
+
+def parsear_tabulador_cdmx_pdf(pdf_bytes: bytes) -> list[dict]:
+    """
+    Convierte el PDF oficial en registros estructurados.
+
+    Se usa texto en modo layout para conservar las cuatro columnas. Como
+    protección adicional, se prueba una estrategia de líneas acumuladas para
+    descripciones que se hayan dividido entre renglones.
+    """
+    reader = PdfReader(BytesIO(pdf_bytes))
+    found: dict[str, dict] = {}
+
+    for page in reader.pages:
+        try:
+            text_layout = page.extract_text(extraction_mode="layout") or ""
+        except TypeError:
+            text_layout = page.extract_text() or ""
+        except Exception:
+            continue
+
+        lines = [line.rstrip() for line in text_layout.splitlines()]
+        pending = ""
+
+        for line in lines:
+            concept = _parse_layout_line(line)
+            if concept:
+                found[concept["source_code"]] = concept
+                pending = ""
+                continue
+
+            stripped = _clean_pdf_cell(line)
+            if not stripped:
+                pending = ""
+                continue
+
+            # Una fila puede partir la descripción en dos renglones. Solo se
+            # acumula cuando el primer token parece código.
+            first = stripped.split()[0] if stripped.split() else ""
+            if _looks_like_source_code(first):
+                pending = stripped
+                continue
+
+            if pending:
+                merged = f"{pending} {stripped}"
+                concept = _parse_layout_line(merged)
+                if concept:
+                    found[concept["source_code"]] = concept
+                    pending = ""
+                elif len(merged) < 1200:
+                    pending = merged
+                else:
+                    pending = ""
+
+    concepts = list(found.values())
+    concepts.sort(key=lambda x: x["source_code"])
+    return concepts
+
+
+def descargar_tabulador_cdmx(catalog_info: dict, timeout: int = 90) -> bytes:
+    response = requests.get(
+        catalog_info["url"],
+        headers=CDMX_HTTP_HEADERS,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    content_type = str(response.headers.get("content-type") or "").lower()
+    payload = response.content
+    if not payload.startswith(b"%PDF") and "pdf" not in content_type:
+        raise RuntimeError(
+            "La URL oficial encontrada no devolvió un archivo PDF válido."
+        )
+    return payload
+
+
+def actualizar_catalogo_cdmx(db) -> dict:
+    info = descubrir_ultimo_tabulador_cdmx()
+    current = db.get_active_external_catalog("CDMX")
+
+    if (
+        current
+        and int(current.get("year") or 0) == int(info.get("year") or 0)
+        and int(current.get("month") or 0) == int(info.get("month") or 0)
+        and int(current.get("concept_count") or 0) > 0
+    ):
+        return {
+            "status": "already_current",
+            "catalog": current,
+            "concept_count": int(current["concept_count"]),
+        }
+
+    pdf_bytes = descargar_tabulador_cdmx(info)
+    concepts = parsear_tabulador_cdmx_pdf(pdf_bytes)
+
+    # Una edición completa normalmente contiene miles de filas. Este umbral
+    # evita reemplazar un catálogo bueno por una extracción rota.
+    if len(concepts) < 500:
+        raise RuntimeError(
+            "La extracción del PDF produjo muy pocos conceptos "
+            f"({len(concepts)}). No se modificó el catálogo existente."
+        )
+
+    catalog = db.replace_external_catalog(
+        source="CDMX",
+        version_label=info["version_label"],
+        year=int(info["year"]),
+        month=int(info.get("month") or 0),
+        source_url=info["url"],
+        concepts=concepts,
+    )
+    return {
+        "status": "updated",
+        "catalog": catalog,
+        "concept_count": len(concepts),
+    }
+
+
+def _tokens_utiles(texto: str) -> set[str]:
+    stop = {
+        "PARA", "CON", "DEL", "LAS", "LOS", "UNA", "UNO", "UNAS", "UNOS",
+        "QUE", "POR", "COMO", "MAS", "INCLUYE", "INCLUYENDO", "SUMINISTRO",
+        "INSTALACION", "COLOCACION", "TRABAJO", "TRABAJOS", "SERVICIO",
+        "COMPLETO", "COMPLETA", "SEGUN", "MEDIANTE", "HASTA", "DESDE",
+    }
+    return {
+        token
+        for token in normalizar_texto(texto).upper().split()
+        if len(token) >= 4 and token not in stop
+    }
+
+
+def score_similitud_externa(a: str, b: str) -> float:
+    a_n = normalizar_texto(a).upper()
+    b_n = normalizar_texto(b).upper()
+    if not a_n or not b_n:
+        return 0.0
+
+    seq = SequenceMatcher(None, a_n, b_n).ratio()
+    ta = _tokens_utiles(a_n)
+    tb = _tokens_utiles(b_n)
+    union = ta | tb
+    intersection = ta & tb
+    jaccard = len(intersection) / len(union) if union else 0.0
+    coverage = len(intersection) / len(ta) if ta else 0.0
+
+    # La cobertura de palabras de la actividad tiene bastante peso para evitar
+    # coincidencias visualmente similares pero técnicamente distintas.
+    return 0.45 * seq + 0.25 * jaccard + 0.30 * coverage
+
+
+# =========================================================
 # BASE DE DATOS
 # =========================================================
 
@@ -418,7 +870,40 @@ class Database:
                 FOREIGN KEY(concept_id) REFERENCES concepts(id) ON DELETE SET NULL
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS external_catalogs (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                version_label TEXT NOT NULL,
+                year INTEGER NOT NULL,
+                month INTEGER NOT NULL DEFAULT 0,
+                source_url TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                concept_count INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS external_concepts (
+                id TEXT PRIMARY KEY,
+                catalog_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                source_code TEXT NOT NULL,
+                description TEXT NOT NULL,
+                normalized_description TEXT NOT NULL,
+                unit TEXT NOT NULL,
+                normalized_unit TEXT NOT NULL,
+                unit_price REAL NOT NULL,
+                chapter TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(catalog_id) REFERENCES external_catalogs(id) ON DELETE CASCADE
+            )
+            """,
             "CREATE INDEX IF NOT EXISTS idx_concepts_norm ON concepts(normalized_description)",
+            "CREATE INDEX IF NOT EXISTS idx_ext_catalog_source ON external_catalogs(source, active)",
+            "CREATE INDEX IF NOT EXISTS idx_ext_concept_catalog ON external_concepts(catalog_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ext_concept_unit ON external_concepts(source, normalized_unit)",
+            "CREATE INDEX IF NOT EXISTS idx_ext_concept_norm ON external_concepts(normalized_description)",
             "CREATE INDEX IF NOT EXISTS idx_price_concept ON price_history(concept_id)",
             "CREATE INDEX IF NOT EXISTS idx_items_budget ON budget_items(budget_id)",
         ]
@@ -452,6 +937,220 @@ class Database:
             """
         )
 
+    def get_active_external_catalog(self, source: str) -> dict | None:
+        return self.fetchone(
+            """
+            SELECT *
+            FROM external_catalogs
+            WHERE UPPER(source) = UPPER(?) AND active = 1
+            ORDER BY year DESC, month DESC, imported_at DESC
+            LIMIT 1
+            """,
+            (source,),
+        )
+
+    def list_external_catalogs(self, source: str | None = None) -> list[dict]:
+        if source:
+            return self.fetchall(
+                """
+                SELECT *
+                FROM external_catalogs
+                WHERE UPPER(source) = UPPER(?)
+                ORDER BY year DESC, month DESC, imported_at DESC
+                """,
+                (source,),
+            )
+        return self.fetchall(
+            """
+            SELECT *
+            FROM external_catalogs
+            ORDER BY source, year DESC, month DESC, imported_at DESC
+            """
+        )
+
+    def replace_external_catalog(
+        self,
+        source: str,
+        version_label: str,
+        year: int,
+        month: int,
+        source_url: str,
+        concepts: list[dict],
+    ) -> dict:
+        """
+        Importa una edición completa en una sola transacción. Las ediciones
+        anteriores se conservan como metadatos, pero solo la nueva queda activa.
+        """
+        source = source.strip().upper()
+        created = ahora_iso()
+        catalog_id = str(uuid.uuid4())
+
+        with self._connect() as conn:
+            cur = conn.cursor()
+
+            cur.execute(
+                self._adapt(
+                    "UPDATE external_catalogs SET active = 0 WHERE UPPER(source) = UPPER(?)"
+                ),
+                (source,),
+            )
+
+            # Si la misma edición fue importada parcialmente antes, se elimina
+            # para que el nuevo lote sea consistente.
+            cur.execute(
+                self._adapt(
+                    """
+                    SELECT id FROM external_catalogs
+                    WHERE UPPER(source) = UPPER(?) AND year = ? AND month = ?
+                    """
+                ),
+                (source, year, month),
+            )
+            duplicate_rows = cur.fetchall()
+            for dup in duplicate_rows:
+                dup_id = dup["id"] if isinstance(dup, dict) else dup[0]
+                cur.execute(
+                    self._adapt("DELETE FROM external_catalogs WHERE id = ?"),
+                    (dup_id,),
+                )
+
+            cur.execute(
+                self._adapt(
+                    """
+                    INSERT INTO external_catalogs (
+                        id, source, version_label, year, month, source_url,
+                        imported_at, concept_count, active
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """
+                ),
+                (
+                    catalog_id,
+                    source,
+                    version_label,
+                    year,
+                    month,
+                    source_url,
+                    created,
+                    len(concepts),
+                    1,
+                ),
+            )
+
+            insert_sql = self._adapt(
+                """
+                INSERT INTO external_concepts (
+                    id, catalog_id, source, source_code, description,
+                    normalized_description, unit, normalized_unit, unit_price,
+                    chapter, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+            )
+            rows = [
+                (
+                    str(uuid.uuid4()),
+                    catalog_id,
+                    source,
+                    c["source_code"],
+                    c["description"],
+                    c["normalized_description"],
+                    c["unit"],
+                    c["normalized_unit"],
+                    float(c["unit_price"]),
+                    c.get("chapter") or "",
+                    created,
+                )
+                for c in concepts
+            ]
+            cur.executemany(insert_sql, rows)
+            conn.commit()
+
+        return self.get_active_external_catalog(source)
+
+    def external_candidates(
+        self,
+        source: str,
+        unit: str,
+        description: str,
+        limit: int = 350,
+    ) -> list[dict]:
+        normalized_unit = normalizar_unidad(unit)
+        if not normalized_unit:
+            return []
+
+        keywords = sorted(
+            _tokens_utiles(description),
+            key=lambda x: (-len(x), x),
+        )[:5]
+
+        base_sql = """
+            SELECT ec.*, c.version_label, c.year, c.month, c.source_url
+            FROM external_concepts ec
+            JOIN external_catalogs c ON c.id = ec.catalog_id
+            WHERE c.active = 1
+              AND UPPER(ec.source) = UPPER(?)
+              AND ec.normalized_unit = ?
+        """
+        params: list = [source, normalized_unit]
+
+        if keywords:
+            clauses = []
+            for word in keywords:
+                clauses.append("UPPER(ec.normalized_description) LIKE ?")
+                params.append(f"%{word}%")
+            sql = base_sql + " AND (" + " OR ".join(clauses) + ") LIMIT ?"
+            params.append(limit)
+            rows = self.fetchall(sql, tuple(params))
+            if rows:
+                return rows
+
+        return self.fetchall(
+            base_sql + " LIMIT ?",
+            (source, normalized_unit, limit),
+        )
+
+    def search_external_concepts(
+        self,
+        source: str = "CDMX",
+        search: str = "",
+        limit: int = 250,
+    ) -> list[dict]:
+        q = normalizar_texto(search).upper()
+        if q:
+            return self.fetchall(
+                """
+                SELECT ec.*, c.version_label, c.source_url
+                FROM external_concepts ec
+                JOIN external_catalogs c ON c.id = ec.catalog_id
+                WHERE c.active = 1
+                  AND UPPER(ec.source) = UPPER(?)
+                  AND (
+                    UPPER(ec.source_code) LIKE ?
+                    OR UPPER(ec.normalized_description) LIKE ?
+                  )
+                ORDER BY ec.source_code
+                LIMIT ?
+                """,
+                (source, f"%{q}%", f"%{q}%", limit),
+            )
+        return self.fetchall(
+            """
+            SELECT ec.*, c.version_label, c.source_url
+            FROM external_concepts ec
+            JOIN external_catalogs c ON c.id = ec.catalog_id
+            WHERE c.active = 1 AND UPPER(ec.source) = UPPER(?)
+            ORDER BY ec.source_code
+            LIMIT ?
+            """,
+            (source, limit),
+        )
+
+    def delete_external_source(self, source: str):
+        # Cascada: borrar catálogo elimina sus conceptos.
+        self.execute(
+            "DELETE FROM external_catalogs WHERE UPPER(source) = UPPER(?)",
+            (source,),
+        )
+
     def clear_all_data(self):
         """
         Elimina todos los datos empresariales de las tablas de la aplicación.
@@ -459,6 +1158,8 @@ class Database:
         """
         # El orden evita conflictos de claves foráneas tanto en PostgreSQL como SQLite.
         for table in [
+            "external_concepts",
+            "external_catalogs",
             "budget_items",
             "price_history",
             "budgets",
@@ -1116,13 +1817,16 @@ class Database:
         self.delete_generation(budget["project_id"], budget_id)
 
     def export_table(self, table_name: str) -> list[dict]:
-        allowed = {"projects", "budgets", "concepts", "price_history", "budget_items"}
+        allowed = {
+            "projects", "budgets", "concepts", "price_history", "budget_items",
+            "external_catalogs", "external_concepts",
+        }
         if table_name not in allowed:
             raise ValueError("Tabla no permitida.")
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-08-12-v7.0"
+DATABASE_CACHE_VERSION = "2026-08-13-v8.0-cdmx"
 
 
 @st.cache_resource(show_spinner=False)
@@ -1484,6 +2188,12 @@ def buscar_precio_interno(db: Database, actividad: ActividadIA) -> dict | None:
     elif original_source == "IA_ESTIMADO" or original_status == "ESTIMADO_IA":
         source = "HISTORICO_IA"
         confidence = "Media" if best_score >= 0.9 else "Baja"
+    elif (
+        original_source in {"REFERENCIA_CDMX", "REFERENCIA_EXTERNA", "HISTORICO_EXTERNO"}
+        or original_status == "REFERENCIA_EXTERNA"
+    ):
+        source = "HISTORICO_EXTERNO"
+        confidence = "Media" if best_score >= 0.9 else "Baja"
     else:
         source = "BASE_INTERNA"
         confidence = best.get("confidence") or "Media"
@@ -1502,14 +2212,90 @@ def buscar_precio_interno(db: Database, actividad: ActividadIA) -> dict | None:
     }
 
 
-def buscar_precio_externo(actividad: ActividadIA, project_data: dict) -> dict | None:
+def buscar_precio_externo(
+    db: Database,
+    actividad: ActividadIA,
+    project_data: dict,
+    params: dict,
+) -> dict | None:
     """
-    Punto de integración para un catálogo externo estructurado.
+    Busca la actividad en el catálogo CDMX activo.
 
-    En una versión posterior puede conectarse aquí un catálogo de referencia
-    institucional, un export de OPUS u otra base aprobada por la empresa.
+    El P.U. oficial se trata como una referencia integrada de venta antes de IVA,
+    NO como costo directo de la empresa. Cuando la coincidencia es fuerte se
+    calcula un costo base equivalente que, después de aplicar los indirectos y la
+    utilidad configurados en la app, reproduce el P.U. de referencia CDMX.
     """
-    return None
+    unit = normalizar_unidad(actividad.unidad)
+
+    # Las partidas globales son demasiado ambiguas para cruzarlas
+    # automáticamente contra un catálogo de precios unitarios.
+    if unit in {"", "LOTE", "JGO", "PTO", "SERV", "%"}:
+        return None
+
+    candidates = db.external_candidates(
+        source="CDMX",
+        unit=actividad.unidad,
+        description=actividad.descripcion_tecnica,
+        limit=350,
+    )
+    if not candidates:
+        return None
+
+    scored = []
+    for row in candidates:
+        score = score_similitud_externa(
+            actividad.descripcion_tecnica,
+            row["description"],
+        )
+        scored.append((score, row))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best = scored[0]
+
+    # Por debajo de 72 % se considera que no existe una referencia útil.
+    if best_score < 0.72:
+        return None
+
+    reference_price = float(best["unit_price"])
+    use_automatically = best_score >= 0.86
+
+    # El flujo financiero interno define:
+    # venta = costo * (1 + indirectos) * (1 + utilidad)
+    # Por lo tanto se despeja el costo base para que la venta antes de IVA
+    # coincida con el P.U. CDMX cuando sí se decide utilizarlo.
+    factor = (
+        (1.0 + params["indirect_pct"] / 100.0)
+        * (1.0 + params["profit_pct"] / 100.0)
+    )
+    equivalent_cost = reference_price / factor if factor > 0 else reference_price
+
+    month = int(best.get("month") or 0)
+    year = int(best.get("year") or 0)
+    edition = best.get("version_label") or (
+        f"{SPANISH_MONTH_NAMES.get(month, '')} {year}".strip()
+    )
+
+    detail = (
+        f"CDMX {edition} | clave {best['source_code']} | "
+        f"P.U. oficial ${reference_price:,.2f}/{best['unit']} | "
+        f"coincidencia {best_score:.0%} | "
+        f"{best['description']}"
+    )
+
+    return {
+        "unit_cost": equivalent_cost,
+        "reference_unit_price": reference_price,
+        "source": "REFERENCIA_CDMX",
+        "source_detail": detail,
+        "status": "REFERENCIA_EXTERNA",
+        "confidence": "Alta" if best_score >= 0.92 else "Media",
+        "match_score": best_score,
+        "use_automatically": use_automatically,
+        "source_code": best["source_code"],
+        "catalog": edition,
+        "source_url": best.get("source_url") or "",
+    }
 
 
 def resolver_items(
@@ -1530,7 +2316,11 @@ def resolver_items(
         force_new_price = requested_code.upper() in force_new_price_codes
 
         internal = None if force_new_price else buscar_precio_interno(db, act)
-        external = None if internal or force_new_price else buscar_precio_externo(act, project_data)
+        external = (
+            None
+            if internal or force_new_price
+            else buscar_precio_externo(db, act, project_data, params)
+        )
 
         if internal:
             unit_cost = internal["unit_cost"]
@@ -1539,11 +2329,11 @@ def resolver_items(
             source_detail = internal["source_detail"]
             price_status = internal["status"]
             price_confidence = internal["confidence"]
-        elif external:
+        elif external and external.get("use_automatically"):
             unit_cost = float(external["unit_cost"])
             concept_id = None
-            source = "REFERENCIA_EXTERNA"
-            source_detail = external.get("source_detail", "Catálogo externo")
+            source = "REFERENCIA_CDMX"
+            source_detail = external["source_detail"]
             price_status = "REFERENCIA_EXTERNA"
             price_confidence = external.get("confidence", "Media")
         else:
@@ -1551,6 +2341,11 @@ def resolver_items(
             concept_id = None
             source = "IA_ESTIMADO"
             source_detail = "Estimación inicial de Gemini; requiere validación comercial."
+            if external:
+                source_detail += (
+                    " | Referencia CDMX encontrada pero no aplicada automáticamente: "
+                    + external["source_detail"]
+                )
             price_status = "ESTIMADO_IA"
             price_confidence = act.nivel_confianza_precio
 
@@ -2316,14 +3111,32 @@ def render_admin_database(db: Database):
 
     st.divider()
 
-    tab_concepts, tab_prices, tab_projects, tab_budgets, tab_maintenance, tab_export = st.tabs(
-        ["Conceptos", "Precios", "Proyectos", "Presupuestos", "Mantenimiento", "Exportar"]
+    (
+        tab_concepts,
+        tab_prices,
+        tab_projects,
+        tab_budgets,
+        tab_external,
+        tab_maintenance,
+        tab_export,
+    ) = st.tabs(
+        [
+            "Conceptos",
+            "Precios",
+            "Proyectos",
+            "Presupuestos",
+            "Fuentes externas",
+            "Mantenimiento",
+            "Exportar",
+        ]
     )
 
     source_labels = {
         "COTIZACION_PROVEEDOR": "Cotización de proveedor",
         "COSTO_REAL": "Costo real de obra",
         "REFERENCIA_EXTERNA": "Referencia externa",
+        "REFERENCIA_CDMX": "Referencia CDMX",
+        "HISTORICO_EXTERNO": "Histórico de referencia externa",
         "IA_ESTIMADO": "Estimación de IA",
         "MANUAL": "Registro manual",
         "BASE_INTERNA": "Base interna",
@@ -3175,6 +3988,139 @@ def render_admin_database(db: Database):
                             st.rerun()
 
     # =====================================================
+    # FUENTES EXTERNAS
+    # =====================================================
+    with tab_external:
+        st.subheader("Fuentes externas")
+        st.caption(
+            "Catálogos de referencia independientes de la base histórica de la empresa. "
+            "Por ahora esta versión integra únicamente el Tabulador General de Precios "
+            "Unitarios del Gobierno de la Ciudad de México."
+        )
+
+        active_cdmx = db.get_active_external_catalog("CDMX")
+
+        with st.container(border=True):
+            st.markdown("### Gobierno de la Ciudad de México")
+            if active_cdmx:
+                ec1, ec2, ec3 = st.columns(3)
+                ec1.metric("Edición activa", active_cdmx.get("version_label") or "—")
+                ec2.metric(
+                    "Conceptos",
+                    f"{int(active_cdmx.get('concept_count') or 0):,}",
+                )
+                ec3.metric(
+                    "Importado",
+                    str(active_cdmx.get("imported_at") or "")[:10] or "—",
+                )
+                st.caption(
+                    "La app consulta automáticamente esta edición cuando no encuentra "
+                    "un precio interno suficientemente confiable."
+                )
+            else:
+                st.warning(
+                    "Todavía no existe un catálogo CDMX importado. Hasta que se cargue, "
+                    "los presupuestos continuarán utilizando la base interna y Gemini."
+                )
+
+            st.info(
+                "El P.U. CDMX se trata como referencia integrada antes de IVA. "
+                "Cuando la coincidencia es suficientemente alta, la app calcula un "
+                "costo base equivalente para conservar los indirectos y utilidad "
+                "configurados en el presupuesto sin duplicarlos."
+            )
+
+            if st.button(
+                "Buscar e importar la edición más reciente",
+                type="primary",
+                use_container_width=True,
+                key="update_cdmx_catalog",
+            ):
+                with st.spinner(
+                    "Consultando la fuente oficial, descargando el PDF y construyendo el catálogo..."
+                ):
+                    try:
+                        update = actualizar_catalogo_cdmx(db)
+                        if update["status"] == "already_current":
+                            st.success(
+                                "El catálogo ya corresponde a la edición oficial más reciente "
+                                f"detectada: {update['catalog']['version_label']} "
+                                f"({update['concept_count']:,} conceptos)."
+                            )
+                        else:
+                            st.success(
+                                f"Catálogo CDMX actualizado a {update['catalog']['version_label']} "
+                                f"con {update['concept_count']:,} conceptos."
+                            )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(
+                            "No se modificó el catálogo existente porque la actualización falló."
+                        )
+                        st.exception(exc)
+
+        if active_cdmx:
+            st.markdown("#### Consultar catálogo importado")
+            ext_search = st.text_input(
+                "Buscar por clave o descripción",
+                placeholder="Ej. pintura, demolición, impermeabilización",
+                key="external_cdmx_search",
+            )
+            external_rows = db.search_external_concepts(
+                "CDMX",
+                ext_search,
+                limit=300,
+            )
+            if external_rows:
+                ext_df = pd.DataFrame(
+                    [
+                        {
+                            "Clave": r["source_code"],
+                            "Concepto": r["description"],
+                            "Unidad": r["unit"],
+                            "P.U. CDMX": r["unit_price"],
+                            "Edición": r["version_label"],
+                        }
+                        for r in external_rows
+                    ]
+                )
+                st.dataframe(
+                    ext_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "P.U. CDMX": st.column_config.NumberColumn(format="$ %.2f")
+                    },
+                )
+                if len(external_rows) >= 300:
+                    st.caption(
+                        "Se muestran como máximo 300 resultados. Use una búsqueda más específica."
+                    )
+            else:
+                st.info("No se encontraron conceptos con esa búsqueda.")
+
+            with st.expander("Eliminar catálogo CDMX importado"):
+                st.warning(
+                    "Esto no elimina presupuestos históricos. Solo elimina el catálogo externo "
+                    "que se utiliza para nuevas búsquedas."
+                )
+                ext_delete_key = st.text_input(
+                    "Clave de eliminación",
+                    type="password",
+                    key="delete_external_cdmx_key",
+                )
+                if st.button(
+                    "Eliminar catálogo CDMX",
+                    key="delete_external_cdmx",
+                ):
+                    if not validar_clave_borrado(ext_delete_key):
+                        st.error("Clave incorrecta o no configurada.")
+                    else:
+                        db.delete_external_source("CDMX")
+                        st.success("Catálogo CDMX eliminado.")
+                        st.rerun()
+
+    # =====================================================
     # MANTENIMIENTO
     # =====================================================
     with tab_maintenance:
@@ -3269,6 +4215,8 @@ def render_admin_database(db: Database):
             ("projects", "Proyectos", "proyectos.csv"),
             ("budgets", "Presupuestos", "presupuestos.csv"),
             ("budget_items", "Actividades de presupuestos", "actividades_presupuestos.csv"),
+            ("external_catalogs", "Catálogos externos", "catalogos_externos.csv"),
+            ("external_concepts", "Conceptos externos", "conceptos_externos.csv"),
         ]
 
         for table_name, label, filename in export_items:
@@ -3313,6 +4261,9 @@ try:
         "delete_generation",
         "save_generation",
         "save_revision",
+        "get_active_external_catalog",
+        "external_candidates",
+        "replace_external_catalog",
     )
     if any(not hasattr(db, method) for method in required_database_methods):
         st.cache_resource.clear()
@@ -3420,6 +4371,21 @@ with st.sidebar:
 
         if not get_api_key_runtime():
             st.error("Falta GEMINI_API_KEY en Streamlit Secrets.")
+
+        try:
+            sidebar_cdmx = db.get_active_external_catalog("CDMX")
+            if sidebar_cdmx:
+                st.caption(
+                    f"Referencia externa: CDMX {sidebar_cdmx['version_label']} "
+                    f"· {int(sidebar_cdmx['concept_count'] or 0):,} conceptos"
+                )
+            else:
+                st.caption(
+                    "Referencia CDMX: sin catálogo. Un administrador puede cargarlo "
+                    "desde Catálogo e historial → Fuentes externas."
+                )
+        except Exception:
+            pass
 
         st.divider()
         with st.expander("Corrección de última carga"):
