@@ -1,1269 +1,468 @@
-# Sistema de Presupuestación Asistida
-## Aplicación interna para presupuestos preliminares de remodelación e interiorismo
+# Presupuestador de Remodelaciones
 
-Esta aplicación fue diseñada para apoyar la generación inicial de presupuestos de una empresa de interiorismo y remodelación que trabaja principalmente mediante subcontratación.
+Esta aplicación ayuda a generar un primer presupuesto para proyectos de remodelación e interiorismo.
 
-El objetivo no es sustituir la revisión profesional ni convertirse en un sistema tradicional de análisis de precios unitarios. Su función es transformar una descripción general de obra en una propuesta inicial organizada, consistente y reutilizable, consultar antecedentes de costos de la empresa, generar una estimación económica y producir archivos que puedan continuar revisándose en Excel.
-
-La aplicación utiliza:
-
-- Streamlit para la interfaz.
-- Google Gemini para interpretar el alcance y proponer actividades.
-- Python para todos los cálculos económicos.
-- PostgreSQL/Supabase para la base de datos persistente en producción.
-- SQLite únicamente como respaldo para desarrollo local.
-- `streamlit-authenticator` para controlar el acceso.
-- OpenPyXL para generar el archivo Excel.
-- Pandas para manipular y exportar tablas.
+La app genera una propuesta inicial.  
+La revisión final de precios, cantidades y conceptos se realiza en el archivo Excel.
 
 ---
 
-# 1. Objetivo general
+# 1. Iniciar sesión
 
-El flujo de trabajo está pensado para una empresa que:
+Abra la aplicación e ingrese su usuario y contraseña.
 
-- recibe descripciones generales de trabajos de remodelación e interiorismo;
-- necesita generar presupuestos con rapidez;
-- subcontrata la mayor parte de las actividades;
-- no dispone todavía de una base histórica extensa;
-- requiere construir gradualmente su propio catálogo de conceptos y costos;
-- necesita conservar información de proyectos y presupuestos anteriores;
-- realiza la revisión y corrección final directamente en Excel.
+Los usuarios normales pueden generar presupuestos.
 
-La aplicación genera una primera propuesta. El Excel descargado continúa siendo el documento de trabajo final para revisión.
+Los administradores también pueden entrar a **Catálogo e historial** para revisar conceptos, precios y proyectos guardados.
 
 ---
 
-# 2. Flujo general
+# 2. Crear un presupuesto
 
-El flujo principal es:
+Entre a:
 
-1. El usuario inicia sesión.
-2. Selecciona **Generar presupuesto**.
-3. Define parámetros comerciales:
-   - indirectos;
-   - utilidad;
-   - IVA;
-   - desperdicio de referencia.
-4. Introduce datos del proyecto:
-   - nombre;
-   - tipo de obra;
-   - ubicación;
-   - dimensiones definidas o variables;
-   - descripción detallada;
-   - texto guía opcional.
-5. Gemini interpreta el alcance.
-6. Gemini propone partidas, subpartidas y actividades generales subcontratables.
-7. La aplicación intenta encontrar antecedentes de precio en la base interna.
-8. Si no encuentra una referencia interna suficientemente similar, utiliza la estimación propuesta por Gemini.
-9. Python calcula los importes.
-10. La aplicación muestra un resumen de consulta.
-11. Se generan:
-    - Excel;
-    - TXT auxiliar;
-    - ZIP con ambos archivos.
-12. Si no se activó el modo simulación, el proyecto, presupuesto, actividades, conceptos y precios correspondientes se guardan en la base.
-13. La revisión detallada y las correcciones finales se realizan en Excel.
+**Generar presupuesto**
 
----
+Primero defina los parámetros generales:
 
-# 3. Filosofía de los costos
+- Indirectos
+- Utilidad
+- IVA
+- Desperdicio de referencia
 
-La empresa subcontrata actividades completas.
+Después ingrese los datos del proyecto.
 
-Por esa razón, el sistema NO intenta obligatoriamente descomponer cada concepto en:
+## Nombre del cliente
 
-- material;
-- mano de obra;
-- herramienta;
-- cuadrilla;
-- rendimiento.
-
-En su lugar, una actividad puede representar un servicio integral del subcontratista.
+Escriba el nombre del cliente.
 
 Ejemplo:
 
 ```text
-Partida:
-HERRERÍA Y CANCELERÍA
-
-Subpartida:
-Cancelería
-
-Actividad:
-Suministro e instalación de cancel fijo en cristal templado,
-incluyendo fabricación, herrajes, sellos, transporte e instalación.
-
-Unidad:
-M2
-
-Cantidad:
-4.50
-
-Costo unitario:
-Costo integral estimado o histórico del subcontratista.
+Desarrollos de la Vega
 ```
 
-La aplicación puede utilizar `LOTE`, `PZA`, `JGO`, `M2`, `ML`, `M3` u otra unidad apropiada.
+## Ubicación
 
----
-
-# 4. Cálculo económico
-
-Gemini no calcula los totales económicos.
-
-Los cálculos se realizan en Python para mantener consistencia.
-
-La lógica es:
-
-```text
-Costo directo
-= suma de los costos directos de las actividades
-
-Indirectos
-= Costo directo × porcentaje de indirectos
-
-Base de utilidad
-= Costo directo + Indirectos
-
-Utilidad
-= Base de utilidad × porcentaje de utilidad
-
-Venta antes de IVA
-= Costo directo + Indirectos + Utilidad
-
-IVA
-= Venta antes de IVA × porcentaje de IVA
-
-Total
-= Venta antes de IVA + IVA
-```
-
-El desperdicio se utiliza únicamente como referencia cuando técnicamente corresponda.
-
-No se aplica automáticamente como porcentaje general a todas las actividades, porque muchos costos ya representan servicios integrales de subcontratistas.
-
----
-
-# 5. Modo simulación
-
-El formulario incluye un interruptor llamado **Simulación**.
-
-Cuando está activo:
-
-- Gemini genera normalmente el presupuesto;
-- se consulta la base interna existente;
-- se realizan todos los cálculos;
-- se genera Excel;
-- se genera TXT;
-- se genera ZIP;
-- se muestran resultados.
-
-Pero NO se guardan nuevos datos en:
-
-- proyectos;
-- presupuestos;
-- conceptos;
-- historial de precios;
-- actividades del presupuesto.
-
-Esto permite:
-
-- probar cambios de prompt;
-- capacitar usuarios;
-- realizar ejemplos;
-- probar proyectos hipotéticos;
-- evitar contaminar el historial empresarial.
-
-Una simulación puede LEER precios de la base existente, pero no escribir en ella.
-
----
-
-# 6. Archivos generados
-
-La aplicación produce un paquete asociado al proyecto.
-
-El código se genera a partir de la ubicación, el tipo de proyecto y un consecutivo.
+Escriba la ubicación principal del proyecto.
 
 Ejemplo:
 
 ```text
-COY-BAN-0004
+Farallón, Álvaro Obregón, CDMX
 ```
 
-Una salida típica contiene:
+La aplicación utiliza el cliente y la ubicación para generar un código.
+
+Ejemplo:
 
 ```text
-COY-BAN-0004/
-├── COY-BAN-0004_Presupuesto.xlsx
-└── COY-BAN-0004_Captura_Plataforma.txt
+DDV-FAR-0001
 ```
 
-El ZIP permite descargar ambos archivos juntos.
+## Tipo de obra
 
-## 6.1 Excel
+Seleccione la opción que más se acerque al proyecto.
 
-El Excel es el documento principal de revisión.
+Por ejemplo:
 
-Está diseñado para que la empresa pueda:
-
-- revisar descripciones;
-- ajustar cantidades;
-- corregir costos;
-- modificar alcances;
-- revisar parámetros;
-- continuar trabajando sin depender de Streamlit.
-
-Las fórmulas económicas importantes permanecen en el archivo.
-
-## 6.2 TXT auxiliar
-
-El TXT NO se carga automáticamente en la plataforma externa.
-
-Su objetivo es facilitar la captura manual.
-
-Contiene la información organizada para copiar:
-
-- partida;
-- subpartida;
-- actividad;
-- cantidad;
-- unidad;
-- margen;
-- beneficio;
-- costo;
-- venta.
+- Remodelación interior general
+- Baño
+- Cocina
+- Oficina
+- Local comercial
+- Caseta / acceso
 
 ---
 
-# 7. Base de datos
+# 3. Descripción general de trabajos
 
-La aplicación utiliza cinco tablas principales.
+Este es el campo más importante.
 
-## 7.1 `projects`
+Aquí debe escribir:
 
-Guarda información general del proyecto.
+- zonas del proyecto;
+- medidas conocidas;
+- trabajos solicitados;
+- elementos que se van a retirar;
+- elementos nuevos;
+- materiales o acabados importantes;
+- cualquier información necesaria para entender la obra.
 
-Campos principales:
+No es necesario escribirlo de forma muy técnica.
 
-- `id`
-- `code`
-- `name`
-- `project_type`
-- `location`
-- `dimension_mode`
-- `dimensions_text`
-- `description`
-- `guide_text`
-- `main_activity`
-- `created_at`
+Ejemplo:
 
-## 7.2 `budgets`
+```text
+Casa habitación.
 
-Guarda información económica de cada presupuesto.
+SEGUNDA PLANTA
 
-Campos principales:
+Recámara principal de aproximadamente 4.20 x 3.80 m.
 
-- proyecto asociado;
-- versión;
-- estado;
+- Retiro de piso laminado existente.
+- Colocación de piso nuevo.
+- Reparación y pintura de muros.
+- Cambio de luminarias.
+
+AZOTEA
+
+Área aproximada de 9 x 4 m.
+
+- Limpieza de superficie.
+- Reparación de fisuras.
+- Impermeabilización completa.
+- Revisión de bajadas pluviales.
+```
+
+Mientras más clara sea la descripción, mejor será el resultado.
+
+---
+
+# 4. Texto guía
+
+Este campo sirve para dar instrucciones generales que deben aplicarse a todo el presupuesto.
+
+No es para repetir los trabajos.
+
+Puede utilizarlo para indicar:
+
+- nivel de calidad;
+- tipo de acabados;
+- restricciones;
+- horarios;
+- protecciones;
+- trabajos que no deben incluirse;
+- criterios generales.
+
+Ejemplo:
+
+```text
+- Considerar acabados de gama media.
+- Incluir protección con plástico y cartón engomado en zonas de tránsito.
+- Considerar retiro de desperdicios y limpieza final.
+- Los trabajos solo pueden realizarse de lunes a viernes.
+- No considerar jardinería.
+- Si falta una especificación, utilizar una opción comercial de gama media.
+```
+
+Este campo es opcional.
+
+---
+
+# 5. Simulación
+
+Active **Simulación** cuando solo quiera hacer una prueba.
+
+En simulación la aplicación:
+
+- genera el presupuesto;
+- genera Excel;
+- genera TXT;
+- permite hacer revisiones;
+
+pero **no guarda el proyecto en la base de datos**.
+
+Úselo para:
+
+- pruebas;
+- capacitación;
+- ejemplos;
+- verificar cómo interpreta Gemini un proyecto.
+
+Si el resultado de una simulación le gusta, al final puede utilizar:
+
+**Guardar versión actual en la base de datos**
+
+No es necesario volver a generar el presupuesto.
+
+---
+
+# 6. Generar presupuesto
+
+Cuando termine de ingresar la información presione:
+
+**Generar presupuesto**
+
+La aplicación analizará el proyecto y generará:
+
+- partidas;
+- subpartidas;
+- actividades;
+- cantidades aproximadas;
+- costos;
 - indirectos;
 - utilidad;
 - IVA;
-- desperdicio;
+- total.
+
+También intenta utilizar precios existentes del catálogo interno cuando encuentra conceptos similares.
+
+---
+
+# 7. Revisar el resultado
+
+Después de generar, se muestran nuevamente los datos originales del proyecto.
+
+Estos datos aparecen bloqueados para evitar modificarlos accidentalmente.
+
+Después se muestra:
+
 - costo directo;
-- indirectos calculados;
-- utilidad calculada;
-- venta antes de IVA;
-- IVA;
+- indirectos;
+- utilidad;
 - total;
-- resumen de alcance;
-- fecha.
+- tabla de actividades;
+- origen de los precios;
+- consideraciones importantes.
 
-## 7.3 `concepts`
+Esta pantalla sirve principalmente para revisar que el presupuesto tenga sentido general.
 
-Es el catálogo interno de actividades.
+Los cambios pequeños deben hacerse directamente en Excel.
 
-Cada concepto puede incluir:
+---
 
-- código;
-- partida;
-- subpartida;
-- descripción;
-- unidad;
-- descripción normalizada;
-- presupuesto donde fue creado;
-- fecha.
+# 8. Descargar archivos
 
-Un concepto no representa necesariamente un APU tradicional.
-
-Representa una actividad reutilizable para futuros presupuestos.
-
-## 7.4 `price_history`
-
-Guarda múltiples precios para cada concepto.
-
-Nunca se pretende que un concepto tenga únicamente "un precio definitivo".
+La app genera un paquete ZIP.
 
 Ejemplo:
 
 ```text
-Cancel de cristal templado
-├── 2026-05-15  $4,400/m2  Estimación IA
-├── 2026-06-08  $4,650/m2  Referencia externa
-├── 2026-07-20  $4,850/m2  Cotización proveedor
-└── 2026-08-05  $5,050/m2  Costo real
+DDV-FAR-0001-V01.zip
 ```
 
-Esto permite que el catálogo gane valor con el tiempo.
+Dentro se encuentran:
 
-## 7.5 `budget_items`
+```text
+DDV-FAR-0001-V01_Presupuesto.xlsx
+DDV-FAR-0001-V01_Captura_Plataforma.txt
+```
 
-Guarda la fotografía exacta de las actividades utilizadas en cada presupuesto.
+## Excel
 
-Esto es importante porque un concepto del catálogo puede cambiar posteriormente, pero el presupuesto histórico debe conservar:
+Es el archivo principal de trabajo.
 
-- descripción utilizada;
-- cantidad;
-- unidad;
-- costo usado;
-- venta;
-- fuente;
-- criterios;
-- consideraciones.
+Aquí puede:
+
+- cambiar precios;
+- cambiar cantidades;
+- corregir descripciones;
+- agregar notas;
+- hacer ajustes finales.
+
+## TXT
+
+Es un archivo auxiliar.
+
+Sirve para facilitar la captura manual de información en la plataforma de presupuestos de la empresa.
 
 ---
 
-# 8. Fuentes y estados de precios
+# 9. Revisiones importantes del presupuesto
 
-Los precios pueden tener distintos orígenes.
+Si después de generar descubre que falta una parte importante del proyecto, use:
+
+**Revisión estructural del presupuesto**
+
+Esta función es para cambios grandes.
 
 Ejemplos:
 
-- `COTIZACION_PROVEEDOR`
-- `COSTO_REAL`
-- `REFERENCIA_EXTERNA`
-- `IA_ESTIMADO`
-- `MANUAL`
-- `BASE_INTERNA`
+```text
+Se olvidó contemplar toda la impermeabilización de la azotea.
+Agregar preparación de superficie, reparación de fisuras e
+impermeabilización para el área de 9 x 4 m.
+```
 
-La interfaz administrativa traduce estos códigos a nombres más legibles.
+Otro ejemplo:
 
-También existe un estado, por ejemplo:
+```text
+La cancelería debe cambiar completamente.
 
-- Validado.
-- Cotizado por proveedor.
-- Costo real.
-- Referencia externa.
-- Estimado por IA.
+Ya no será aluminio ligero. Se requiere aluminio línea pesada
+con cristal templado de 10 mm.
+```
 
-Y un nivel de confianza:
+La aplicación genera una nueva versión:
 
-- Alta.
-- Media.
-- Baja.
+```text
+V01
+V02
+V03
+```
 
-La intención es evitar que una estimación inicial de IA se confunda con un costo real confirmado.
+No elimina automáticamente las versiones anteriores.
 
 ---
 
-# 9. Catálogo e historial
+# 10. Cuándo NO usar una revisión
 
-Los administradores tienen una sección llamada:
+No use la revisión estructural para cambios pequeños.
+
+Por ejemplo:
+
+```text
+Cambiar $4,500 por $4,800
+```
+
+o:
+
+```text
+Cambiar cantidad de 3 a 4 piezas
+```
+
+o:
+
+```text
+Corregir una palabra
+```
+
+Para esos cambios use directamente el Excel.
+
+La revisión con Gemini debe reservarse para cambios importantes de alcance.
+
+---
+
+# 11. Catálogo e historial
+
+Los administradores pueden entrar a:
 
 **Catálogo e historial**
 
-Esta reemplaza la antigua interfaz que se parecía demasiado a un editor de base de datos.
+Ahí pueden consultar:
 
-La interfaz está dividida en:
+- Conceptos
+- Precios
+- Proyectos
+- Presupuestos
+- Mantenimiento
+- Exportación
 
-1. Conceptos.
-2. Precios.
-3. Proyectos.
-4. Presupuestos.
-5. Exportar.
+## Conceptos
 
----
+Permite revisar las actividades que la empresa ha ido acumulando.
 
-# 10. Conceptos
+## Precios
 
-La pestaña **Conceptos** funciona como un catálogo.
-
-Permite:
-
-- buscar por descripción;
-- buscar por código;
-- buscar por partida;
-- buscar por subpartida;
-- filtrar por partida;
-- abrir la ficha de un concepto;
-- consultar su último costo;
-- consultar cuántas veces se utilizó;
-- ver precios recientes;
-- editar sus datos descriptivos;
-- crear conceptos manualmente;
-- eliminar un concepto con confirmación.
-
-La edición no se realiza directamente sobre una tabla.
-
-Primero se abre una ficha y después se presiona:
-
-```text
-Editar concepto
-```
-
-Modificar un concepto NO modifica automáticamente:
-
-- presupuestos históricos;
-- precios históricos.
-
-Esto permite corregir nombres o clasificaciones sin destruir la trazabilidad.
-
----
-
-# 11. Precios
-
-La pestaña **Precios** está separada de Conceptos deliberadamente.
-
-El procedimiento es:
-
-1. Buscar un concepto.
-2. Seleccionarlo.
-3. Revisar su historial.
-4. Agregar una nueva referencia.
-5. Indicar:
-   - costo unitario;
-   - origen;
-   - estado;
-   - confianza;
-   - proveedor o nota.
-6. Guardar.
-
-Agregar un precio nuevo NO borra los anteriores.
-
-Los precios antiguos deben conservarse normalmente.
-
-La opción de eliminar existe únicamente para corregir registros erróneos y exige una confirmación explícita.
-
----
-
-# 12. Proyectos
-
-La pestaña **Proyectos** funciona como archivo histórico.
-
-Permite:
-
-- buscar por código;
-- nombre;
-- ubicación;
-- tipo de proyecto.
-
-Al abrir un proyecto se muestra:
-
-- código;
-- nombre;
-- tipo;
-- ubicación;
-- actividad principal;
-- dimensiones;
-- descripción inicial;
-- presupuestos asociados.
-
-Un administrador puede corregir datos descriptivos.
-
-Editar estos datos NO recalcula presupuestos existentes.
-
-La eliminación de un proyecto es una acción avanzada porque elimina también sus presupuestos asociados.
-
----
-
-# 13. Presupuestos
-
-La pestaña **Presupuestos** permite consultar lo que ya se guardó.
-
-Muestra:
-
-- proyecto;
-- nombre;
-- costo directo;
-- indirectos;
-- utilidad;
-- venta antes de IVA;
-- total;
-- fecha;
-- estado.
-
-Al abrir uno se muestran también sus actividades.
-
-Esta sección es principalmente de consulta.
-
-La corrección detallada de un presupuesto continúa realizándose en Excel.
-
----
-
-# 14. Exportación administrativa
-
-La pestaña **Exportar** permite descargar CSV de:
-
-- conceptos;
-- historial de precios;
-- proyectos;
-- presupuestos;
-- actividades de presupuestos.
-
-Estas descargas son útiles para:
-
-- respaldo;
-- auditoría;
-- revisión;
-- análisis externo;
-- migración;
-- depuración.
-
-Descargar un CSV no modifica la base.
-
----
-
-# 15. Autenticación
-
-Toda la aplicación está protegida con `streamlit-authenticator`.
-
-Las credenciales no están en GitHub.
-
-Se cargan desde Streamlit Secrets.
-
-Existen dos roles principales.
-
-## Usuario
-
-Puede:
-
-- generar presupuestos;
-- usar simulación;
-- consultar resultados de la generación actual;
-- descargar Excel;
-- descargar TXT;
-- descargar ZIP.
-
-## Administrador
-
-Puede hacer todo lo anterior y además:
-
-- abrir Catálogo e historial;
-- editar conceptos;
-- agregar precios;
-- eliminar registros;
-- consultar proyectos;
-- consultar presupuestos;
-- exportar la base.
-
----
-
-# 16. Cookie de sesión
-
-`streamlit-authenticator` utiliza una cookie para mantener la sesión.
-
-La duración se controla con:
-
-```toml
-[auth_cookie]
-expiry_days = 30
-```
-
-Esto evita pedir usuario y contraseña en cada visita durante el periodo de validez de la sesión.
-
-La cookie no sustituye a las credenciales del servidor.
-
----
-
-# 17. Configuración de Secrets
-
-En Streamlit Community Cloud:
-
-1. Abra la aplicación.
-2. Entre a **Settings**.
-3. Abra **Secrets**.
-4. Pegue una configuración TOML.
-
-Ejemplo:
-
-```toml
-GEMINI_API_KEY = "TU_API_KEY"
-DATABASE_URL = "postgresql://..."
-DELETE_KEY = "TU_CLAVE_PRIVADA"
-
-[auth_cookie]
-name = "presupuestador_empresa_auth"
-key = "UNA_CLAVE_PRIVADA_LARGA_Y_ALEATORIA"
-expiry_days = 30
-
-[credenciales_app.usernames.admin]
-email = "admin@empresa.com"
-first_name = "Administrador"
-last_name = "Empresa"
-password = "CONTRASENA_ADMIN"
-roles = ["admin"]
-
-[credenciales_app.usernames.usuario1]
-email = "usuario@empresa.com"
-first_name = "Usuario"
-last_name = "Empresa"
-password = "CONTRASENA_USUARIO"
-roles = ["usuario"]
-```
-
-El archivo `secrets_ejemplo.toml` incluido en este proyecto contiene una plantilla.
-
-NO suba un archivo real de secrets a GitHub.
-
----
-
-# 18. Gemini API
-
-La API key de Gemini se lee desde:
-
-```toml
-GEMINI_API_KEY = "..."
-```
-
-en Streamlit Secrets.
-
-La clave no se solicita al usuario final.
-
-Esto permite que la empresa controle una única credencial desde el servidor.
-
-La aplicación utiliza respuestas estructuradas mediante Pydantic.
-
-Gemini devuelve datos como:
-
-- partida;
-- subpartida;
-- código sugerido;
-- descripción;
-- unidad;
-- cantidad;
-- estimación de costo;
-- criterio de cantidad;
-- fundamento de inclusión;
-- confianza;
-- consideraciones.
-
-Posteriormente Python procesa esos datos.
-
----
-
-# 19. Búsqueda de precios internos
-
-Después de recibir actividades de Gemini, la aplicación compara cada actividad con el catálogo existente.
-
-La búsqueda considera:
-
-- descripción normalizada;
-- coincidencia de palabras;
-- similitud textual;
-- unidad.
-
-Cuando encuentra un concepto interno suficientemente parecido puede utilizar su precio histórico más reciente como referencia.
-
-La idea es que, a medida que la empresa acumule proyectos reales, la dependencia de las estimaciones de IA disminuya.
-
----
-
-# 20. ¿Qué ocurre cuando no existe un concepto?
-
-Cuando no hay coincidencia interna suficiente:
-
-1. se utiliza inicialmente la actividad propuesta por Gemini;
-2. se utiliza el costo estimado disponible;
-3. se identifica su procedencia;
-4. si el presupuesto es real, el concepto puede incorporarse al catálogo;
-5. el precio se conserva con su fuente y nivel de confianza.
-
-Esto permite comenzar con una base vacía.
-
----
-
-# 21. Supabase / PostgreSQL
-
-Para producción se recomienda PostgreSQL.
-
-Supabase se utiliza como proveedor sencillo de PostgreSQL administrado.
-
-Procedimiento general:
-
-1. Crear una cuenta en Supabase.
-2. Crear un proyecto.
-3. Abrir las opciones de conexión.
-4. Copiar la cadena PostgreSQL correspondiente.
-5. Guardarla en Streamlit Secrets:
-
-```toml
-DATABASE_URL = "postgresql://..."
-```
-
-La aplicación crea automáticamente las tablas necesarias si no existen.
-
-No es necesario crear manualmente:
-
-- `projects`;
-- `budgets`;
-- `concepts`;
-- `price_history`;
-- `budget_items`.
-
----
-
-# 22. SQLite
-
-Si `DATABASE_URL` no existe, la aplicación utiliza:
-
-```text
-presupuestador_empresa.db
-```
-
-junto al archivo `app.py`.
-
-Esto es útil para:
-
-- pruebas locales;
-- desarrollo;
-- demostraciones.
-
-NO debe tratarse como almacenamiento empresarial persistente dentro de Streamlit Community Cloud.
-
-Cuando existe `DATABASE_URL` y PostgreSQL falla, la aplicación se detiene.
-
-No cambia silenciosamente a SQLite.
-
-Esto evita que un usuario crea que un presupuesto fue guardado en Supabase cuando realmente quedó en un archivo temporal.
-
----
-
-# 23. Instalación local
-
-Se recomienda Python moderno compatible con las dependencias.
-
-Crear un entorno virtual:
-
-```bash
-python -m venv .venv
-```
-
-Activarlo.
-
-Windows:
-
-```bash
-.venv\Scripts\activate
-```
-
-Linux/macOS:
-
-```bash
-source .venv/bin/activate
-```
-
-Instalar:
-
-```bash
-pip install -r requirements.txt
-```
-
-Ejecutar:
-
-```bash
-streamlit run app.py
-```
-
----
-
-# 24. Secrets locales
-
-Para ejecutar localmente puede crear:
-
-```text
-.streamlit/
-└── secrets.toml
-```
-
-Utilice el mismo formato de `secrets_ejemplo.toml`.
-
-Nunca suba `.streamlit/secrets.toml` con información real a un repositorio público.
-
-Conviene agregarlo a `.gitignore`.
-
-Ejemplo:
-
-```gitignore
-.streamlit/secrets.toml
-presupuestador_empresa.db
-__pycache__/
-.venv/
-```
-
----
-
-# 25. Despliegue en Streamlit Community Cloud
-
-Estructura mínima del repositorio:
-
-```text
-repositorio/
-├── app.py
-├── requirements.txt
-└── README.md
-```
-
-Después:
-
-1. subir el repositorio a GitHub;
-2. crear una app en Streamlit Community Cloud;
-3. seleccionar `app.py`;
-4. configurar Secrets;
-5. desplegar.
-
-El repositorio puede ser público siempre que NO contenga:
-
-- API keys;
-- DATABASE_URL;
-- contraseñas;
-- claves de cookies;
-- secrets reales.
-
----
-
-# 26. Seguridad
-
-Principios aplicados:
-
-## 26.1 Secrets del lado servidor
-
-Se mantienen en Streamlit Secrets:
-
-- Gemini API key;
-- conexión PostgreSQL;
-- usuarios;
-- contraseñas;
-- clave de cookie.
-
-## 26.2 Roles
-
-La administración de datos solo aparece para usuarios con rol:
-
-```text
-admin
-```
-
-## 26.3 Confirmaciones de eliminación
-
-Las operaciones destructivas requieren escribir frases como:
-
-```text
-ELIMINAR CONCEPTO
-ELIMINAR PRECIO
-ELIMINAR PROYECTO
-ELIMINAR PRESUPUESTO
-```
-
-## 26.4 Historial en lugar de sobrescritura
-
-Los precios se agregan al historial en vez de reemplazar automáticamente el anterior.
-
-## 26.5 PostgreSQL persistente
-
-La información empresarial no depende del almacenamiento temporal de Streamlit.
-
----
-
-# 27. Modificar datos iniciales
-
-Después de generar un presupuesto existe una opción para volver al formulario inicial.
-
-Su finalidad es corregir errores importantes del alcance.
-
-El comportamiento esperado es:
-
-1. descartar la generación actual;
-2. volver al formulario;
-3. conservar los datos iniciales para facilitar la corrección;
-4. modificar la descripción o parámetros;
-5. generar nuevamente desde cero.
-
-La aplicación no intenta "parchar" parcialmente una generación anterior.
-
-Esto reduce inconsistencias.
-
----
-
-# 28. Diferencia entre editar en Streamlit y editar en Excel
-
-Streamlit sirve para:
-
-- capturar datos iniciales;
-- generar;
-- consultar;
-- administrar catálogo e históricos.
-
-Excel sirve para:
-
-- revisión final;
-- correcciones específicas;
-- negociación;
-- ajustes comerciales;
-- entrega interna o al cliente.
-
-No se pretende duplicar en Streamlit todas las funciones de edición de Excel.
-
----
-
-# 29. Recomendaciones de operación
-
-## Al comenzar
-
-La base puede estar prácticamente vacía.
-
-Es normal que la IA tenga mayor participación.
-
-## Conforme se reciban cotizaciones
-
-Agregar al historial:
-
-- costo;
-- proveedor;
-- fecha;
-- confianza;
-- estado.
-
-## Cuando termine una obra
-
-Cuando sea posible, registrar costos reales.
-
-Los costos reales son más valiosos que las estimaciones iniciales.
-
-## No borrar precios antiguos por estar desactualizados
-
-Es preferible conservarlos y agregar un registro nuevo.
-
-El histórico tiene valor para comparar evolución de costos.
-
-## Usar simulación para pruebas
-
-Evita llenar la base con conceptos ficticios.
-
----
-
-# 30. Respaldo
-
-Aunque Supabase almacene la base de manera persistente, es recomendable descargar periódicamente los CSV desde:
-
-**Catálogo e historial → Exportar**
-
-Se recomienda conservar respaldos fechados.
+Permite agregar nuevas referencias.
 
 Ejemplo:
 
 ```text
-backup_2026-08-31/
-├── conceptos.csv
-├── historial_precios.csv
-├── proyectos.csv
-├── presupuestos.csv
-└── actividades_presupuestos.csv
+Concepto:
+Suministro e instalación de cancelería
+
+Costo:
+$5,200 / m2
+
+Fuente:
+Cotización de proveedor
+
+Estado:
+Validado
 ```
+
+No es necesario borrar un precio viejo cuando llega uno nuevo.
+
+Es mejor agregar el nuevo y conservar el historial.
+
+## Proyectos
+
+Permite consultar proyectos anteriores.
+
+## Presupuestos
+
+Permite revisar las versiones guardadas de los presupuestos.
 
 ---
 
-# 31. Limitaciones actuales
+# 12. Borrar una prueba guardada por error
 
-La aplicación sigue siendo un sistema de apoyo.
+En la sección de generación existe:
 
-Actualmente:
+**Corrección de última carga**
 
-- Gemini puede proponer actividades incorrectas;
-- una estimación de IA no equivale a una cotización;
-- la similitud textual puede asociar conceptos parecidos que no sean equivalentes;
-- los precios deben validarse cuando el riesgo económico sea importante;
-- la revisión final sigue siendo responsabilidad de la empresa;
-- no existe todavía una integración automática completa con catálogos externos;
-- el TXT es auxiliar y la captura en la plataforma externa continúa siendo manual.
+Sirve para eliminar el último proyecto guardado si se subió por error.
 
----
+Por ejemplo:
 
-# 32. Evolución recomendada
+- una prueba que debía ser simulación;
+- un proyecto con datos incorrectos;
+- una generación que no debía guardarse.
 
-Posibles mejoras futuras:
-
-1. integración de catálogos externos;
-2. importación masiva de conceptos desde CSV/XLSX;
-3. proveedores vinculados a conceptos;
-4. panel de evolución histórica de precios;
-5. comparación entre costo presupuestado y costo real;
-6. versiones formales de un mismo presupuesto;
-7. bitácora de cambios;
-8. permisos más detallados;
-9. auditoría por usuario;
-10. integración con almacenamiento documental;
-11. búsqueda semántica más avanzada;
-12. generación de solicitudes de cotización a proveedores.
+La función pide una clave de eliminación.
 
 ---
 
-# 33. Archivos del proyecto
+# 13. Recomendaciones
 
-## `app.py`
+Para obtener mejores resultados:
 
-Contiene:
-
-- autenticación;
-- interfaz;
-- Gemini;
-- cálculos;
-- base de datos;
-- catálogo;
-- historial;
-- generación de archivos.
-
-## `requirements.txt`
-
-Lista las dependencias de Python necesarias.
-
-## `secrets_ejemplo.toml`
-
-Plantilla de configuración.
-
-No contiene secretos reales.
-
-## `README.md`
-
-Este documento.
+1. Describa claramente cada zona.
+2. Incluya las medidas que conozca.
+3. Separe las actividades por planta, espacio o área.
+4. Indique materiales importantes cuando ya estén definidos.
+5. Utilice Texto guía para criterios generales.
+6. Use Simulación cuando esté haciendo pruebas.
+7. Corrija precios y detalles menores directamente en Excel.
+8. Use Revisiones solo cuando cambie una parte importante del proyecto.
+9. Cuando exista una cotización real de proveedor, agréguela al historial de precios.
 
 ---
 
-# 34. Dependencias principales
+# 14. Ejemplo completo de captura
 
-La versión actual utiliza:
-
-```text
-streamlit
-streamlit-authenticator
-pandas
-openpyxl
-google-genai
-pydantic
-psycopg
-```
-
-Las versiones y restricciones concretas se encuentran en `requirements.txt`.
-
----
-
-# 35. Resumen operativo
-
-Para un usuario normal:
+## Cliente
 
 ```text
-Iniciar sesión
-→ Generar presupuesto
-→ Ingresar alcance
-→ Generar
-→ Revisar resumen
-→ Descargar Excel/TXT/ZIP
-→ Corregir en Excel
+Corporativo Cocoteros
 ```
 
-Para un administrador:
+## Ubicación
 
 ```text
-Iniciar sesión
-→ Catálogo e historial
-→ Conceptos / Precios / Proyectos / Presupuestos
-→ Consultar o administrar
-→ Exportar respaldos cuando sea necesario
+Coyoacán, CDMX
 ```
 
-Para una prueba:
+## Tipo
 
 ```text
-Activar Simulación
-→ Generar normalmente
-→ Descargar archivos
-→ No se escribe nada nuevo en la base
+Caseta / acceso
 ```
 
----
-
-# 36. Principio central del sistema
-
-La intención es que el sistema evolucione de:
+## Descripción general
 
 ```text
-IA estima casi todo
+Caseta de vigilancia.
+
+Medidas aproximadas 1.29 x 1.48 m.
+
+- Sellar puertas louver para evitar entrada de frío.
+- Colar una losa para cerrar la parte superior.
+- Hacer apertura en muro de piedra volcánica.
+- Colocar cancel de seguridad.
+- Abrir ranura para recepción de correo.
+- Fabricar escritorio en escuadra con cajones.
+- Colocar silla para personal.
+- Colocar frigobar.
+- Agregar contactos eléctricos.
+- Instalar iluminación.
+- Considerar sistema de CCTV.
 ```
 
-hacia:
+## Texto guía
 
 ```text
-IA interpreta el proyecto
-+
-la base histórica aporta experiencia real
-+
-Python calcula
-+
-la empresa revisa
+- Considerar materiales de gama media.
+- Incluir instalación completa.
+- Considerar protección y limpieza.
+- Cuando un elemento requiera proveedor especializado,
+  marcarlo como referencia aproximada.
 ```
 
-Cuantos más costos reales, cotizaciones y proyectos se registren correctamente, mayor será el valor de la base interna y menor la dependencia de estimaciones puramente generadas por IA.
+Después presione:
 
----
+**Generar presupuesto**
 
-# 37. Clave de eliminación y herramientas de pruebas
-
-Durante la etapa inicial existe una clave adicional para operaciones destructivas.
-
-Debe configurarse en Streamlit Secrets:
-
-```toml
-DELETE_KEY = "TU_CLAVE_PRIVADA"
-```
-
-Para la configuración actual de pruebas, el valor definido por la empresa debe cargarse únicamente en Streamlit Secrets.
-
-**No se recomienda escribir esta clave directamente dentro de `app.py` ni incluirla en un repositorio público.**
-
-La clave se utiliza para:
-
-- eliminar el último proyecto guardado y toda su trazabilidad;
-- eliminar una generación real desde su pantalla de resultados;
-- modificar los datos iniciales de una generación ya guardada, porque la versión anterior se elimina primero;
-- eliminar un proyecto completo desde la administración;
-- vaciar todos los datos de la aplicación.
-
----
-
-# 38. Borrar el último proyecto guardado
-
-En la sección **Generar presupuesto**, dentro de la barra lateral, existe:
-
-```text
-Corrección de última carga
-```
-
-Esta herramienta está disponible para usuarios normales y administradores.
-
-Su finalidad es corregir rápidamente casos como:
-
-- una prueba que debía haberse ejecutado como simulación;
-- un proyecto guardado accidentalmente;
-- un error grave en los datos iniciales;
-- una corrida inválida que contaminó el catálogo.
-
-La aplicación muestra cuál es el último proyecto guardado antes de borrarlo.
-
-Al confirmar con la clave, se elimina:
-
-- proyecto;
-- presupuestos;
-- actividades del presupuesto;
-- precios generados por ese presupuesto;
-- conceptos creados exclusivamente por esa generación.
-
-Los conceptos y precios históricos previos que solo fueron reutilizados por el proyecto no se eliminan.
-
----
-
-# 39. Guardar una simulación como proyecto real
-
-Una simulación puede convertirse posteriormente en una generación real.
-
-En la pantalla de resultados aparece:
-
-```text
-Guardar simulación en la base de datos
-```
-
-Al utilizarlo:
-
-1. NO se vuelve a llamar a Gemini;
-2. se conserva exactamente el resultado de la simulación;
-3. se calcula un código real de proyecto;
-4. se guarda proyecto, presupuesto, partidas y nuevos conceptos/precios;
-5. se regeneran Excel, TXT y ZIP con el código definitivo;
-6. la corrida deja de mostrarse como simulación.
-
-Esto permite utilizar una prueba satisfactoria sin repetir el consumo de API.
-
----
-
-# 40. Eliminar una generación desde sus resultados
-
-Cuando una generación NO es simulada, la pantalla final muestra:
-
-```text
-Eliminar esta generación de la base
-```
-
-La acción requiere la clave de eliminación.
-
-Su propósito es retirar inmediatamente una generación incorrecta.
-
-También existe:
-
-```text
-Modificar datos iniciales
-```
-
-Para una generación real, esta opción requiere la misma clave porque primero elimina la versión guardada y después regresa al formulario.
-
-En una simulación no se requiere clave para modificar los datos iniciales porque todavía no existe información persistida.
-
----
-
-# 41. Mantenimiento administrativo
-
-Los administradores disponen de una pestaña adicional:
-
-```text
-Catálogo e historial
-→ Mantenimiento
-```
-
-Desde ella pueden revisar el estado general de la base y vaciar todos los datos de la aplicación.
-
-La opción:
-
-```text
-Eliminar todos los datos
-```
-
-borra el contenido de:
-
-- `budget_items`;
-- `price_history`;
-- `budgets`;
-- `concepts`;
-- `projects`.
-
-Las tablas NO se destruyen.
-
-El esquema permanece disponible y la aplicación puede continuar utilizándose inmediatamente después.
-
-Esta decisión evita tener que volver a crear manualmente la estructura PostgreSQL/Supabase.
-
----
-
-# 42. Eliminación de conceptos
-
-Ya no es necesario escribir la frase:
-
-```text
-ELIMINAR CONCEPTO
-```
-
-Para un concepto individual, el administrador:
-
-1. abre **Opciones avanzadas**;
-2. marca una casilla de confirmación;
-3. presiona **Eliminar concepto**.
-
-Las operaciones de mayor impacto continúan protegidas por `DELETE_KEY`.
-
+Revise el resultado general y descargue el Excel para realizar los ajustes finales.
