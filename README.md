@@ -1,11 +1,5 @@
 # Guía de Uso: Generación de Presupuestos
 
-Esta sección explica cómo utilizar el módulo principal de la aplicación para generar presupuestos de obra asistidos por Inteligencia Artificial (Gemini).
-
-## Parámetros Comerciales
-
-Antes de iniciar, dirígete a la barra lateral izquierda y ajusta los porcentajes financieros que aplicarán a tu presupuesto: Indirectos (%), Utilidad (%), IVA (%) y Desperdicio de referencia (%).
-
 ## Nombre del cliente
 
 Escriba el nombre del cliente o de la empresa que solicita el proyecto.
