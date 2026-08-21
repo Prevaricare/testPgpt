@@ -2100,7 +2100,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-08-21-v11.1-orden-excel"
+DATABASE_CACHE_VERSION = "2026-08-21-v11.2-importe-editable"
 
 
 @st.cache_resource(show_spinner=False)
@@ -3058,6 +3058,9 @@ def crear_excel(
       Partida | Subpartida | Descripción Técnica | Unidad | Cant. |
       Precio Unitario | Importe Total
 
+      El Importe Total es el valor comercial editable. El Precio Unitario se
+      obtiene automáticamente como Importe Total / Cantidad.
+
     02 Control Interno:
       costos, indirectos, utilidad y comparación de precios.
 
@@ -3078,6 +3081,8 @@ def crear_excel(
     brown_light = "EDE7E3"
     gray = "E7E7E7"
     gray_light = "F5F5F5"
+    editable_fill = "FFF8E7"
+    formula_fill = "F2F2F2"
     dark_gray = "555555"
     white = "FFFFFF"
     internal_blue = "1F4E78"
@@ -3203,8 +3208,14 @@ def crear_excel(
         ws.cell(row, 3, descripcion_excel_item(item))
         ws.cell(row, 4, item["unit"])
         ws.cell(row, 5, float(item["quantity"]))
-        ws.cell(row, 6, float(item["unit_sale"]))
-        ws.cell(row, 7, f"=E{row}*F{row}")
+
+        # El importe total es el dato comercial que se puede editar libremente
+        # para subir, bajar o redondear el precio final del concepto.
+        ws.cell(row, 7, float(item["sale_amount"]))
+
+        # El precio unitario se deriva siempre del importe comercial / cantidad.
+        # Si cambia el importe o la cantidad, el P.U. se actualiza automáticamente.
+        ws.cell(row, 6, f"=IF(E{row}=0,0,G{row}/E{row})")
 
         ws.cell(row, 5).number_format = "0.00"
         ws.cell(row, 6).number_format = '$#,##0.00'
@@ -3221,6 +3232,12 @@ def crear_excel(
 
         ws.cell(row, 7).alignment = Alignment(horizontal="right")
         ws.cell(row, 6).alignment = Alignment(horizontal="right")
+
+        # Diferencia visual discreta:
+        # G es editable; F es un valor derivado.
+        ws.cell(row, 7).fill = PatternFill("solid", fgColor=editable_fill)
+        ws.cell(row, 6).fill = PatternFill("solid", fgColor=formula_fill)
+
         ws.row_dimensions[row].height = max(
             34,
             min(
@@ -3354,7 +3371,7 @@ def crear_excel(
         "Utilidad unit.",
         "P.U. venta calculado",
         "P.U. comercial",
-        "Importe venta",
+        "Importe comercial",
         "Beneficio",
         "Margen venta",
         "Dif. P.U. vs calculado",
@@ -3379,7 +3396,10 @@ def crear_excel(
         for col, val in enumerate(values, 1):
             wc.cell(idx, col, val)
 
-        # Hoja principal: E=Cantidad, F=Precio Unitario, G=Importe.
+        # Hoja principal:
+        # E = Cantidad editable
+        # G = Importe Total comercial editable
+        # F = Precio Unitario calculado automáticamente como G / E
         if commercial_row:
             wc.cell(idx, 7, f"='01 Presupuesto'!E{commercial_row}")
         else:
@@ -3406,6 +3426,9 @@ def crear_excel(
 
         wc.cell(idx, 20, f"=S{idx}-N{idx}")
         wc.cell(idx, 21, f'=IF(S{idx}=0,0,T{idx}/S{idx})')
+
+        # Diferencia entre el P.U. comercial vigente en 01 Presupuesto
+        # y el P.U. original calculado internamente.
         wc.cell(idx, 22, f"=R{idx}-Q{idx}")
 
         wc.cell(idx, 7).number_format = "0.00"
