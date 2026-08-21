@@ -227,6 +227,95 @@ def ordenar_items_comercialmente(items: list[dict]) -> list[dict]:
     return ordered
 
 
+def nombre_partida_excel(section: str) -> str:
+    """Convierte una sección interna en un nombre breve de partida para el Excel."""
+    section = normalizar_seccion_comercial(section)
+    preferred_names = {
+        "PROYECTO Y TRÁMITES": "Trámites",
+        "DESMONTAJES Y DEMOLICIONES": "Desmontajes y Demoliciones",
+        "ALBAÑILERÍA Y ESTRUCTURA": "Albañilería y Estructura",
+        "INSTALACIONES ELÉCTRICAS": "Instalaciones Eléctricas",
+        "INSTALACIONES HIDROSANITARIAS": "Instalaciones Hidrosanitarias",
+        "ACABADOS Y RECUBRIMIENTOS": "Acabados",
+        "CARPINTERÍA": "Carpintería",
+        "CANCELERÍA Y HERRERÍA": "Cancelería y Herrería",
+        "EXTERIORES Y AMENIDADES": "Exteriores y Amenidades",
+        "LIMPIEZA Y ENTREGA": "Prelim. y Limpieza",
+    }
+    if section in preferred_names:
+        return preferred_names[section]
+    # Mantener nombres adicionales creados por Gemini, pero en formato legible.
+    return section.title()
+
+
+def nombre_subpartida_excel(item: dict) -> str:
+    """
+    La subpartida del Excel debe ser corta: Pisos, Muros, Frentes, Barra, etc.
+    Para datos históricos se usa título comercial como respaldo.
+    """
+    value = str(item.get("subcategory") or "").strip()
+    if value:
+        return value
+    return titulo_comercial_item(item)
+
+
+def estructura_partidas_excel(items: list[dict]) -> list[dict]:
+    """
+    Asigna numeración jerárquica estable según el orden comercial:
+      1. Trámites       / 1.1 Licencias
+      2. Acabados       / 2.1 Pisos
+      3. Carpintería    / 3.1 Frentes
+    La numeración se genera en Python y no se deja a criterio de Gemini.
+    """
+    ordered = ordenar_items_comercialmente(items)
+    section_numbers = {}
+    section_counts = {}
+    output = []
+
+    for item in ordered:
+        section = normalizar_seccion_comercial(item.get("category"))
+
+        if section not in section_numbers:
+            section_numbers[section] = len(section_numbers) + 1
+            section_counts[section] = 0
+
+        part_num = section_numbers[section]
+        section_counts[section] += 1
+        sub_num = section_counts[section]
+
+        enriched = dict(item)
+        enriched["part_number"] = part_num
+        enriched["subpart_number"] = sub_num
+        enriched["partida_excel"] = f"{part_num}. {nombre_partida_excel(section)}"
+        enriched["subpartida_excel"] = (
+            f"{part_num}.{sub_num} {nombre_subpartida_excel(item)}"
+        )
+        output.append(enriched)
+
+    return output
+
+
+def descripcion_excel_item(item: dict) -> str:
+    """
+    El ejemplo de la empresa coloca una descripción técnica amplia en una sola
+    celda. Anteponemos el título comercial cuando aporta contexto y no está ya
+    incluido al inicio de la descripción.
+    """
+    title = titulo_comercial_item(item).strip()
+    description = str(item.get("description") or "").strip()
+
+    if not title:
+        return description
+    if not description:
+        return title
+
+    norm_title = normalizar_texto(title).upper()
+    norm_desc = normalizar_texto(description).upper()
+    if norm_desc.startswith(norm_title):
+        return description
+    return f"{title}. {description}"
+
+
 # =========================================================
 # CATÁLOGOS EXTERNOS - CDMX
 # =========================================================
@@ -1871,7 +1960,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-08-20-v10-formato-empresa"
+DATABASE_CACHE_VERSION = "2026-08-21-v10.1-partidas-subpartidas"
 
 
 @st.cache_resource(show_spinner=False)
@@ -1901,7 +1990,11 @@ class ActividadIA(BaseModel):
         description="Sección comercial amplia del presupuesto, por ejemplo ACABADOS Y RECUBRIMIENTOS"
     )
     subpartida: str = Field(
-        description="Clasificación interna breve para catálogo; no necesariamente se muestra al cliente"
+        description=(
+            "Subpartida breve que sí se mostrará en el Excel, sin numeración. "
+            "Debe ser concreta y normalmente de 1 a 5 palabras, por ejemplo "
+            "Licencias, Pisos, Muros, Frentes, Módulo Refri, Barra o Retiros."
+        )
     )
     codigo_sugerido: str = Field(description="Código interno breve como PRE-01 o CAR-03")
     titulo_comercial: str = Field(
@@ -2051,22 +2144,30 @@ REGLAS DE GENERACIÓN
    de forma concreta qué se hará, dónde se hará, la especificación principal y
    qué elementos importantes incluye. Evita convertirla en un APU o en una lista
    excesivamente larga de insumos.
-11. subpartida y codigo_sugerido son campos INTERNOS. No intentes convertirlos en
-   títulos visibles para el cliente.
-12. Incluye trámites o licencias únicamente cuando el alcance realmente los haga
+11. subpartida es una parte IMPORTANTE del Excel. Debe ser corta, legible y
+   específica dentro de su partida. No incluyas números porque Python agregará
+   automáticamente la jerarquía 1.1, 1.2, 2.1, etc. Ejemplos:
+   - Partida TRÁMITES → subpartida "Licencias"
+   - Partida ACABADOS → subpartidas "Pisos", "Muros"
+   - Partida CARPINTERÍA → "Frentes", "Módulo Refri", "Barra", "Área Lavado"
+   - Partida PRELIMINARES/LIMPIEZA → "Retiros"
+   codigo_sugerido continúa siendo un dato interno.
+12. Dentro de una misma partida procura que las subpartidas sean suficientemente
+   distintas para identificar rápidamente cada renglón del presupuesto.
+13. Incluye trámites o licencias únicamente cuando el alcance realmente los haga
    previsibles o el usuario los solicite.
-13. No dupliques actividades. No agregues trabajos que no se desprendan del
+14. No dupliques actividades. No agregues trabajos que no se desprendan del
     alcance salvo complementos técnicos indispensables, y en ese caso indícalo
     claramente en consideraciones.
-14. Para cada actividad explica de forma breve el criterio de cantidad y el
+15. Para cada actividad explica de forma breve el criterio de cantidad y el
     fundamento de inclusión. No expongas cadenas de pensamiento ni razonamiento
     interno.
-15. Los datos faltantes deben concentrarse en datos_faltantes, pero no deben
+16. Los datos faltantes deben concentrarse en datos_faltantes, pero no deben
     impedir generar un presupuesto inicial cuando sea posible trabajar con LOTE
     o con una estimación razonable.
-16. La descripción técnica debe ser suficientemente completa para poder copiarse
+17. La descripción técnica debe ser suficientemente completa para poder copiarse
     a una plataforma de presupuestación o solicitar una cotización a proveedor.
-17. No calcules indirectos, utilidad, venta, beneficio, margen ni IVA. Python los
+18. No calcules indirectos, utilidad, venta, beneficio, margen ni IVA. Python los
     calculará de forma determinista.
 """
 
@@ -2192,9 +2293,9 @@ INSTRUCCIONES
 11. No modifiques precios no mencionados ni hagas ajustes generales por iniciativa propia.
 12. Mantén actividades generales subcontratables; no desarrolles APU de materiales y mano de
     obra salvo que la petición lo requiera expresamente.
-13. Conserva la estructura comercial: sección amplia, titulo_comercial corto y una descripción
-    clara debajo. Si el usuario solo pide revisar precio o cantidad, conserva el título y la
-    sección salvo que también sea necesario cambiarlos.
+13. Conserva la estructura comercial: partida amplia, subpartida corta,
+    titulo_comercial y descripción. Si el usuario solo pide revisar precio o
+    cantidad, conserva partida y subpartida salvo que el cambio realmente las afecte.
 14. No calcules indirectos, utilidad, venta ni IVA; Python hará esos cálculos.
 15. Devuelve el alcance, consideraciones y datos faltantes completos y actualizados.
 16. En motivo escribe solo una explicación breve del cambio, sin razonamiento interno.
@@ -2732,22 +2833,23 @@ def crear_excel(
     version: int = 1,
 ) -> bytes:
     """
-    Genera un libro con tres capas claramente separadas:
+    Libro de presupuesto con estructura de Partida/Subpartida como la utilizada
+    por la empresa.
 
-    01 Presupuesto      → salida comercial limpia, similar a la lógica usada
-                          por la empresa para presentar presupuestos.
-    02 Control Interno  → costos, indirectos, utilidad y comparación contra
-                          el P.U. comercial.
-    03 Trazabilidad     → origen de precios y criterios técnicos.
+    01 Presupuesto:
+      Partida | Subpartida | Descripción Técnica | Unidad | Cant. |
+      Precio Unitario | Importe Total
 
-    La hoja comercial es editable: al cambiar Cantidad o P.U. Venta se
-    recalculan importes, subtotales, IVA y total.
+    02 Control Interno:
+      costos, indirectos, utilidad y comparación de precios.
+
+    03 Trazabilidad:
+      fuentes, criterios y consideraciones.
     """
     wb = Workbook()
     ws = wb.active
     ws.title = "01 Presupuesto"
 
-    # Paleta neutra y profesional.
     brown = "4A342B"
     brown_light = "EDE7E3"
     gray = "E7E7E7"
@@ -2758,266 +2860,227 @@ def crear_excel(
     trace_orange = "FCE4D6"
 
     thin_gray = Side(style="thin", color="D4D4D4")
-    bottom_brown = Border(bottom=Side(style="thin", color=brown))
 
-    ordered_items = ordenar_items_comercialmente(items)
-    grouped = {}
-    for item in ordered_items:
-        section = normalizar_seccion_comercial(item.get("category"))
-        grouped.setdefault(section, []).append(item)
+    structured_items = estructura_partidas_excel(items)
+    ordered_items = [dict(x) for x in structured_items]
+    commercial_row_map = {}
 
     # -----------------------------------------------------
-    # 01 PRESUPUESTO - CABECERA
+    # 01 PRESUPUESTO - DATOS DEL PROYECTO
     # -----------------------------------------------------
     ws.sheet_view.showGridLines = False
-    ws.merge_cells("A2:E2")
-    ws["A2"] = "PRESUPUESTO"
-    ws["A2"].font = Font(size=22, bold=True, color=brown)
-    ws["A2"].alignment = Alignment(vertical="center")
 
-    ws.merge_cells("A3:E3")
+    ws.merge_cells("A2:G2")
+    ws["A2"] = "PRESUPUESTO"
+    ws["A2"].font = Font(size=20, bold=True, color=brown)
+
+    ws.merge_cells("A3:G3")
     ws["A3"] = project_data["name"]
     ws["A3"].font = Font(size=12, bold=True, color=brown)
 
-    ws.merge_cells("A4:E4")
-    ws["A4"] = project_data["project_type"]
-    ws["A4"].font = Font(size=10, color=dark_gray)
-
-    ws.merge_cells("A5:E5")
-    ws["A5"] = project_data["location"]
-    ws["A5"].font = Font(size=10, color=dark_gray)
-
-    ws.merge_cells("A6:E6")
-    ws["A6"] = f"{project_code} · V{version:02d}"
-    ws["A6"].font = Font(size=9, italic=True, color="777777")
-
-    # -----------------------------------------------------
-    # RESERVAR RESUMEN ECONÓMICO
-    # -----------------------------------------------------
-    summary_title_row = 8
-    ws.merge_cells(
-        start_row=summary_title_row,
-        start_column=1,
-        end_row=summary_title_row,
-        end_column=5,
+    ws.merge_cells("A4:G4")
+    ws["A4"] = (
+        f"{project_data['project_type']} · {project_data['location']} · "
+        f"{project_code} · V{version:02d}"
     )
-    ws.cell(summary_title_row, 1, "PROPUESTA ECONÓMICA")
-    ws.cell(summary_title_row, 1).font = Font(size=15, bold=True, color=brown)
-    ws.cell(summary_title_row, 1).alignment = Alignment(horizontal="center")
-
-    summary_start = 10
-    summary_section_rows = {}
-    row = summary_start
-
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
-    ws.cell(row, 1, "Presupuesto de obra")
-    ws.cell(row, 1).font = Font(bold=True)
-    ws.cell(row, 1).fill = PatternFill("solid", fgColor=gray)
-    ws.cell(row, 5).fill = PatternFill("solid", fgColor=gray)
-    budget_summary_row = row
-    row += 1
-
-    for section in grouped:
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
-        ws.cell(row, 1, section)
-        ws.cell(row, 1).font = Font(size=10)
-        ws.cell(row, 1).fill = PatternFill("solid", fgColor=gray_light)
-        ws.cell(row, 5).fill = PatternFill("solid", fgColor=gray_light)
-        summary_section_rows[section] = row
-        row += 1
-
-    iva_summary_row = row
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
-    ws.cell(row, 1, f"IVA {params['iva_pct']:.0f}%")
-    ws.cell(row, 1).font = Font(bold=True)
-    ws.cell(row, 1).fill = PatternFill("solid", fgColor=gray)
-    ws.cell(row, 5).fill = PatternFill("solid", fgColor=gray)
-    row += 1
-
-    total_summary_row = row
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
-    ws.cell(row, 1, "TOTAL")
-    ws.cell(row, 1).font = Font(size=12, bold=True, color=brown)
-    ws.cell(row, 5).font = Font(size=12, bold=True, color=brown)
-    ws.cell(row, 1).border = bottom_brown
-    ws.cell(row, 5).border = bottom_brown
+    ws["A4"].font = Font(size=9, color=dark_gray)
 
     # -----------------------------------------------------
-    # DETALLE COMERCIAL
+    # RESUMEN POR PARTIDAS
     # -----------------------------------------------------
-    row += 3
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
-    ws.cell(row, 1, "PRESUPUESTO DE OBRA DETALLADO")
-    ws.cell(row, 1).font = Font(size=15, bold=True, color=brown)
-    ws.cell(row, 1).alignment = Alignment(horizontal="center")
-    row += 2
+    ws.merge_cells("A6:G6")
+    ws["A6"] = "RESUMEN"
+    ws["A6"].font = Font(size=13, bold=True, color=brown)
 
-    section_subtotal_cells = {}
-    commercial_row_map = {}
-    section_number = 1
+    summary_row = 7
+    summary_map = {}
+    sections = []
 
-    for section, section_items in grouped.items():
-        section_header_row = row
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
-        ws.cell(row, 1, f"{section_number:02d}  {section}")
-        ws.cell(row, 1).font = Font(size=13, bold=True, color=brown)
-        ws.cell(row, 1).border = bottom_brown
-        row += 1
+    for item in structured_items:
+        section = normalizar_seccion_comercial(item.get("category"))
+        if section not in sections:
+            sections.append(section)
 
-        item_amount_rows = []
-
-        for item in section_items:
-            item_row = row
-            commercial_row_map[item["code"]] = item_row
-
-            # Fila equivalente al encabezado compacto del concepto del PDF.
-            ws.cell(item_row, 1, titulo_comercial_item(item))
-            ws.cell(item_row, 1).font = Font(size=11, bold=True, color=brown)
-            ws.cell(item_row, 1).fill = PatternFill("solid", fgColor=gray_light)
-
-            ws.cell(item_row, 2, float(item["quantity"]))
-            ws.cell(item_row, 2).number_format = '0.00'
-            ws.cell(item_row, 2).alignment = Alignment(horizontal="right")
-            ws.cell(item_row, 2).fill = PatternFill("solid", fgColor=gray_light)
-
-            ws.cell(item_row, 3, item["unit"])
-            ws.cell(item_row, 3).alignment = Alignment(horizontal="center")
-            ws.cell(item_row, 3).fill = PatternFill("solid", fgColor=gray_light)
-
-            ws.cell(item_row, 4, float(item["unit_sale"]))
-            ws.cell(item_row, 4).number_format = '$#,##0.00'
-            ws.cell(item_row, 4).alignment = Alignment(horizontal="right")
-            ws.cell(item_row, 4).fill = PatternFill("solid", fgColor=gray_light)
-
-            ws.cell(item_row, 5, f"=B{item_row}*D{item_row}")
-            ws.cell(item_row, 5).number_format = '$#,##0.00'
-            ws.cell(item_row, 5).font = Font(bold=True)
-            ws.cell(item_row, 5).alignment = Alignment(horizontal="right")
-            ws.cell(item_row, 5).fill = PatternFill("solid", fgColor=gray_light)
-
-            item_amount_rows.append(item_row)
-
-            # Descripción debajo del título, sin columnas técnicas visibles.
-            desc_row = item_row + 1
-            ws.merge_cells(
-                start_row=desc_row,
-                start_column=1,
-                end_row=desc_row,
-                end_column=5,
-            )
-            ws.cell(desc_row, 1, item["description"])
-            ws.cell(desc_row, 1).alignment = Alignment(
-                wrap_text=True,
-                vertical="top",
-            )
-            ws.cell(desc_row, 1).font = Font(size=9, color=dark_gray)
-            # Altura aproximada según extensión.
-            desc_len = max(len(str(item["description"])), 1)
-            ws.row_dimensions[desc_row].height = max(28, min(72, 16 + (desc_len // 90) * 14))
-
-            row += 3
-
-        subtotal_row = row
+    for section_idx, section in enumerate(sections, start=1):
+        part_name = nombre_partida_excel(section)
         ws.merge_cells(
-            start_row=subtotal_row,
+            start_row=summary_row,
             start_column=1,
-            end_row=subtotal_row,
-            end_column=4,
+            end_row=summary_row,
+            end_column=6,
         )
-        ws.cell(subtotal_row, 1, f"Total {section}")
-        ws.cell(subtotal_row, 1).font = Font(size=11, bold=True, color=brown)
-        ws.cell(subtotal_row, 1).fill = PatternFill("solid", fgColor=gray)
+        ws.cell(summary_row, 1, f"{section_idx}. {part_name}")
+        ws.cell(summary_row, 1).fill = PatternFill("solid", fgColor=gray_light)
+        ws.cell(summary_row, 7).fill = PatternFill("solid", fgColor=gray_light)
+        summary_map[section] = summary_row
+        summary_row += 1
 
-        amount_formula = (
-            "+".join(f"E{r}" for r in item_amount_rows)
-            if item_amount_rows
-            else "0"
+    subtotal_summary_row = summary_row
+    ws.merge_cells(
+        start_row=summary_row, start_column=1, end_row=summary_row, end_column=6
+    )
+    ws.cell(summary_row, 1, "Subtotal Ejecución")
+    ws.cell(summary_row, 1).font = Font(bold=True)
+    ws.cell(summary_row, 1).fill = PatternFill("solid", fgColor=gray)
+    ws.cell(summary_row, 7).fill = PatternFill("solid", fgColor=gray)
+    summary_row += 1
+
+    iva_summary_row = summary_row
+    ws.merge_cells(
+        start_row=summary_row, start_column=1, end_row=summary_row, end_column=6
+    )
+    ws.cell(summary_row, 1, f"IVA {params['iva_pct']:.0f}%")
+    ws.cell(summary_row, 1).font = Font(bold=True)
+    summary_row += 1
+
+    total_summary_row = summary_row
+    ws.merge_cells(
+        start_row=summary_row, start_column=1, end_row=summary_row, end_column=6
+    )
+    ws.cell(summary_row, 1, "Gran Total (MXN)")
+    ws.cell(summary_row, 1).font = Font(size=11, bold=True, color=brown)
+    ws.cell(summary_row, 7).font = Font(size=11, bold=True, color=brown)
+    ws.cell(summary_row, 1).fill = PatternFill("solid", fgColor=brown_light)
+    ws.cell(summary_row, 7).fill = PatternFill("solid", fgColor=brown_light)
+
+    # -----------------------------------------------------
+    # TABLA DE PARTIDAS Y SUBPARTIDAS
+    # -----------------------------------------------------
+    table_header_row = summary_row + 3
+    headers = [
+        "Partida",
+        "Subpartida",
+        "Descripción Técnica",
+        "Unidad",
+        "Cant.",
+        "Precio Unitario (MXN)",
+        "Importe Total (MXN)",
+    ]
+
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(table_header_row, col, header)
+        cell.font = Font(bold=True, color=white)
+        cell.fill = PatternFill("solid", fgColor=brown)
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True,
         )
-        ws.cell(subtotal_row, 5, f"={amount_formula}")
-        ws.cell(subtotal_row, 5).number_format = '$#,##0.00'
-        ws.cell(subtotal_row, 5).font = Font(size=11, bold=True, color=brown)
-        ws.cell(subtotal_row, 5).fill = PatternFill("solid", fgColor=gray)
 
-        section_subtotal_cells[section] = subtotal_row
-        row += 3
-        section_number += 1
+    row = table_header_row + 1
+    section_amount_rows = {section: [] for section in sections}
 
-    # Resumen superior enlazado a los subtotales.
-    for section, summary_row in summary_section_rows.items():
-        subtotal_row = section_subtotal_cells[section]
-        ws.cell(summary_row, 5, f"=E{subtotal_row}")
-        ws.cell(summary_row, 5).number_format = '$#,##0.00'
-        ws.cell(summary_row, 5).alignment = Alignment(horizontal="right")
+    for item in structured_items:
+        commercial_row_map[item["code"]] = row
+        section = normalizar_seccion_comercial(item.get("category"))
 
-    summary_formula = (
-        "+".join(f"E{section_subtotal_cells[s]}" for s in grouped)
-        if grouped
-        else "0"
-    )
-    ws.cell(budget_summary_row, 5, f"={summary_formula}")
-    ws.cell(budget_summary_row, 5).number_format = '$#,##0.00'
-    ws.cell(budget_summary_row, 5).font = Font(bold=True)
+        ws.cell(row, 1, item["partida_excel"])
+        ws.cell(row, 2, item["subpartida_excel"])
+        ws.cell(row, 3, descripcion_excel_item(item))
+        ws.cell(row, 4, item["unit"])
+        ws.cell(row, 5, float(item["quantity"]))
+        ws.cell(row, 6, float(item["unit_sale"]))
+        ws.cell(row, 7, f"=E{row}*F{row}")
 
-    ws.cell(
-        iva_summary_row,
-        5,
-        f"=E{budget_summary_row}*'02 Control Interno'!$B$6",
-    )
-    ws.cell(iva_summary_row, 5).number_format = '$#,##0.00'
-    ws.cell(iva_summary_row, 5).font = Font(bold=True)
+        ws.cell(row, 5).number_format = "0.00"
+        ws.cell(row, 6).number_format = '$#,##0.00'
+        ws.cell(row, 7).number_format = '$#,##0.00'
 
-    ws.cell(
-        total_summary_row,
-        5,
-        f"=E{budget_summary_row}+E{iva_summary_row}",
-    )
-    ws.cell(total_summary_row, 5).number_format = '$#,##0.00'
-    ws.cell(total_summary_row, 5).font = Font(size=12, bold=True, color=brown)
+        for col in range(1, 8):
+            cell = ws.cell(row, col)
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=col in {1, 2, 3},
+                horizontal="center" if col in {4, 5} else "left",
+            )
+            cell.border = Border(bottom=thin_gray)
 
-    # Resumen final también al cierre del detalle.
-    bottom_start = row
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
-    ws.cell(row, 1, "Presupuesto de obra")
-    ws.cell(row, 5, f"=E{budget_summary_row}")
+        ws.cell(row, 7).alignment = Alignment(horizontal="right")
+        ws.cell(row, 6).alignment = Alignment(horizontal="right")
+        ws.row_dimensions[row].height = max(
+            34,
+            min(
+                78,
+                22 + (len(descripcion_excel_item(item)) // 95) * 14,
+            ),
+        )
+
+        section_amount_rows[section].append(row)
+        row += 1
+
+    # -----------------------------------------------------
+    # TOTALES AL FINAL DE LA TABLA
+    # -----------------------------------------------------
     row += 1
+    subtotal_detail_row = row
+    ws.merge_cells(
+        start_row=row, start_column=1, end_row=row, end_column=6
+    )
+    ws.cell(row, 1, "Subtotal Ejecución")
+    ws.cell(row, 1).font = Font(bold=True)
+    ws.cell(row, 7, f"=SUM(G{table_header_row + 1}:G{row - 2})")
+    ws.cell(row, 7).number_format = '$#,##0.00'
+    ws.cell(row, 7).font = Font(bold=True)
 
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+    row += 1
+    iva_detail_row = row
+    ws.merge_cells(
+        start_row=row, start_column=1, end_row=row, end_column=6
+    )
     ws.cell(row, 1, f"IVA {params['iva_pct']:.0f}%")
-    ws.cell(row, 5, f"=E{iva_summary_row}")
+    ws.cell(row, 7, f"=G{subtotal_detail_row}*'02 Control Interno'!$B$6")
+    ws.cell(row, 7).number_format = '$#,##0.00'
+
     row += 1
+    total_detail_row = row
+    ws.merge_cells(
+        start_row=row, start_column=1, end_row=row, end_column=6
+    )
+    ws.cell(row, 1, "Gran Total (MXN)")
+    ws.cell(row, 1).font = Font(size=11, bold=True, color=brown)
+    ws.cell(row, 7, f"=G{subtotal_detail_row}+G{iva_detail_row}")
+    ws.cell(row, 7).number_format = '$#,##0.00'
+    ws.cell(row, 7).font = Font(size=11, bold=True, color=brown)
 
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
-    ws.cell(row, 1, "TOTAL")
-    ws.cell(row, 5, f"=E{total_summary_row}")
+    for rr in (subtotal_detail_row, total_detail_row):
+        ws.cell(rr, 1).fill = PatternFill("solid", fgColor=gray)
+        ws.cell(rr, 7).fill = PatternFill("solid", fgColor=gray)
 
-    for rr in range(bottom_start, row + 1):
-        ws.cell(rr, 1).font = Font(
-            bold=True,
-            color=brown if rr == row else "000000",
-        )
-        ws.cell(rr, 5).font = Font(
-            bold=True,
-            color=brown if rr == row else "000000",
-        )
-        ws.cell(rr, 5).number_format = '$#,##0.00'
-        fill = gray if rr < row else brown_light
-        ws.cell(rr, 1).fill = PatternFill("solid", fgColor=fill)
-        ws.cell(rr, 5).fill = PatternFill("solid", fgColor=fill)
+    # Resumen superior enlazado al detalle.
+    for section in sections:
+        amount_rows = section_amount_rows.get(section) or []
+        formula = "+".join(f"G{r}" for r in amount_rows) if amount_rows else "0"
+        sr = summary_map[section]
+        ws.cell(sr, 7, f"={formula}")
+        ws.cell(sr, 7).number_format = '$#,##0.00'
+        ws.cell(sr, 7).alignment = Alignment(horizontal="right")
 
-    ws.column_dimensions["A"].width = 52
-    ws.column_dimensions["B"].width = 12
-    ws.column_dimensions["C"].width = 11
-    ws.column_dimensions["D"].width = 18
-    ws.column_dimensions["E"].width = 20
+    ws.cell(subtotal_summary_row, 7, f"=G{subtotal_detail_row}")
+    ws.cell(subtotal_summary_row, 7).number_format = '$#,##0.00'
+    ws.cell(iva_summary_row, 7, f"=G{iva_detail_row}")
+    ws.cell(iva_summary_row, 7).number_format = '$#,##0.00'
+    ws.cell(total_summary_row, 7, f"=G{total_detail_row}")
+    ws.cell(total_summary_row, 7).number_format = '$#,##0.00'
 
-    ws.freeze_panes = "A8"
+    # Medidas similares a una hoja de trabajo tradicional.
+    widths = [23, 25, 70, 11, 11, 21, 21]
+    for col, width in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    ws.row_dimensions[table_header_row].height = 30
+    ws.freeze_panes = f"A{table_header_row + 1}"
+    ws.auto_filter.ref = (
+        f"A{table_header_row}:G{table_header_row + len(structured_items)}"
+    )
+
     ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
-    ws.page_margins.left = 0.35
-    ws.page_margins.right = 0.35
-    ws.page_margins.top = 0.5
-    ws.page_margins.bottom = 0.5
+    ws.page_margins.left = 0.25
+    ws.page_margins.right = 0.25
+    ws.page_margins.top = 0.45
+    ws.page_margins.bottom = 0.45
 
     # -----------------------------------------------------
     # 02 CONTROL INTERNO
@@ -3048,7 +3111,7 @@ def crear_excel(
         wc.cell(rr, 2).number_format = "0.00%"
 
     headers = [
-        "Sección",
+        "Partida",
         "Subpartida",
         "Código",
         "Título comercial",
@@ -3076,8 +3139,8 @@ def crear_excel(
     for idx, item in enumerate(ordered_items, start=header_row + 1):
         commercial_row = commercial_row_map.get(item["code"])
         values = [
-            normalizar_seccion_comercial(item.get("category")),
-            item.get("subcategory") or "",
+            item.get("partida_excel") or nombre_partida_excel(item.get("category")),
+            item.get("subpartida_excel") or nombre_subpartida_excel(item),
             item["code"],
             titulo_comercial_item(item),
             item["description"],
@@ -3133,13 +3196,14 @@ def crear_excel(
     # -----------------------------------------------------
     wt = wb.create_sheet("03 Trazabilidad")
     wt.sheet_view.showGridLines = False
-    wt.merge_cells("A1:L1")
+    wt.merge_cells("A1:M1")
     wt["A1"] = "TRAZABILIDAD DE CONCEPTOS Y PRECIOS"
     wt["A1"].font = Font(size=15, bold=True, color=white)
     wt["A1"].fill = PatternFill("solid", fgColor=internal_blue)
 
     trace_headers = [
-        "Sección",
+        "Partida",
+        "Subpartida",
         "Título comercial",
         "Código",
         "Descripción",
@@ -3160,7 +3224,8 @@ def crear_excel(
 
     for idx, item in enumerate(ordered_items, start=4):
         values = [
-            normalizar_seccion_comercial(item.get("category")),
+            item.get("partida_excel") or nombre_partida_excel(item.get("category")),
+            item.get("subpartida_excel") or nombre_subpartida_excel(item),
             titulo_comercial_item(item),
             item["code"],
             item["description"],
@@ -3178,16 +3243,16 @@ def crear_excel(
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             cell.border = Border(bottom=thin_gray)
 
-        wt.cell(idx, 6).number_format = "0.00"
+        wt.cell(idx, 7).number_format = "0.00"
         if item["price_source"] in {
             "IA_ESTIMADO",
             "HISTORICO_IA",
             "HISTORICO_EXTERNO",
         }:
-            wt.cell(idx, 7).fill = PatternFill("solid", fgColor=trace_orange)
             wt.cell(idx, 8).fill = PatternFill("solid", fgColor=trace_orange)
+            wt.cell(idx, 9).fill = PatternFill("solid", fgColor=trace_orange)
 
-    trace_widths = [29, 30, 14, 62, 10, 11, 22, 70, 14, 48, 48, 52]
+    trace_widths = [23, 25, 28, 14, 62, 10, 11, 22, 70, 14, 48, 48, 52]
     for col, width in enumerate(trace_widths, 1):
         wt.column_dimensions[get_column_letter(col)].width = width
     wt.freeze_panes = "A4"
@@ -3205,16 +3270,16 @@ def crear_excel(
 
 def dataframe_resumen(items: list[dict]) -> pd.DataFrame:
     rows = []
-    for x in ordenar_items_comercialmente(items):
+    for x in estructura_partidas_excel(items):
         rows.append(
             {
-                "Sección": normalizar_seccion_comercial(x["category"]),
-                "Concepto": titulo_comercial_item(x),
-                "Descripción": x["description"],
-                "Cantidad": x["quantity"],
+                "Partida": x["partida_excel"],
+                "Subpartida": x["subpartida_excel"],
+                "Descripción Técnica": descripcion_excel_item(x),
                 "Unidad": x["unit"],
-                "P.U. Venta": x["unit_sale"],
-                "Importe": x["sale_amount"],
+                "Cant.": x["quantity"],
+                "Precio Unitario": x["unit_sale"],
+                "Importe Total": x["sale_amount"],
             }
         )
     return pd.DataFrame(rows)
@@ -4725,9 +4790,9 @@ else:
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Cantidad": st.column_config.NumberColumn(format="%.2f"),
-            "P.U. Venta": st.column_config.NumberColumn(format="$ %.2f"),
-            "Importe": st.column_config.NumberColumn(format="$ %.2f"),
+            "Cant.": st.column_config.NumberColumn(format="%.2f"),
+            "Precio Unitario": st.column_config.NumberColumn(format="$ %.2f"),
+            "Importe Total": st.column_config.NumberColumn(format="$ %.2f"),
         },
     )
 
