@@ -1,6 +1,5 @@
 import os
 import re
-import hmac
 import json
 import sqlite3
 import unicodedata
@@ -18,7 +17,6 @@ import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 import streamlit as st
-import streamlit_authenticator as stauth
 from google import genai
 from google.genai import types
 from openpyxl import Workbook
@@ -61,100 +59,6 @@ def get_secret(nombre: str, default=None):
     except Exception:
         pass
     return os.getenv(nombre, default)
-
-
-def get_delete_key() -> str | None:
-    """Clave privada para operaciones destructivas, almacenada en Secrets."""
-    value = get_secret("DELETE_KEY")
-    if value is None:
-        return None
-    return str(value).strip()
-
-
-def validar_clave_borrado(valor: str) -> bool:
-    esperada = get_delete_key()
-    if not esperada:
-        return False
-    return hmac.compare_digest(str(valor or "").strip(), esperada)
-
-
-def _secrets_to_dict(value):
-    """Convierte estructuras de st.secrets a dict/list normales."""
-    if isinstance(value, Mapping):
-        return {k: _secrets_to_dict(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_secrets_to_dict(v) for v in value]
-    return value
-
-
-def crear_autenticador():
-    """Crea Streamlit-Authenticator usando exclusivamente Streamlit Secrets."""
-    try:
-        credentials = _secrets_to_dict(st.secrets["credenciales_app"])
-        cookie_cfg = _secrets_to_dict(st.secrets["auth_cookie"])
-    except Exception as exc:
-        st.error(
-            "Falta la configuración de acceso. Configure [credenciales_app] "
-            "y [auth_cookie] en Streamlit Secrets."
-        )
-        st.caption(f"Detalle técnico: {exc}")
-        st.stop()
-
-    if not isinstance(credentials, dict) or "usernames" not in credentials:
-        st.error("[credenciales_app] debe contener la sección 'usernames'.")
-        st.stop()
-
-    required_cookie = {"name", "key", "expiry_days"}
-    missing = required_cookie - set(cookie_cfg or {})
-    if missing:
-        st.error(f"Faltan valores en [auth_cookie]: {', '.join(sorted(missing))}")
-        st.stop()
-
-    return stauth.Authenticate(
-        credentials,
-        str(cookie_cfg["name"]),
-        str(cookie_cfg["key"]),
-        float(cookie_cfg["expiry_days"]),
-        auto_hash=True,
-    )
-
-
-def autenticar_usuario():
-    """Bloquea toda la aplicación hasta que exista una sesión válida."""
-    authenticator = crear_autenticador()
-
-    st.title("Sistema de Presupuestación Asistida")
-    if st.session_state.get("authentication_status") is not True:
-        st.caption("Acceso interno")
-
-    try:
-        authenticator.login(
-            location="main",
-            max_login_attempts=5,
-            fields={
-                "Form name": "Acceso",
-                "Username": "Usuario",
-                "Password": "Contraseña",
-                "Login": "Ingresar",
-            },
-        )
-    except Exception as exc:
-        st.error(f"No fue posible iniciar el módulo de autenticación: {exc}")
-        st.stop()
-
-    status = st.session_state.get("authentication_status")
-    if status is False:
-        st.error("Usuario o contraseña incorrectos.")
-        st.stop()
-    if status is None:
-        st.stop()
-
-    roles = st.session_state.get("roles") or []
-    if isinstance(roles, str):
-        roles = [roles]
-    roles = [str(r).strip().lower() for r in roles]
-
-    return authenticator, roles
 
 
 def normalizar_texto(texto: str) -> str:
@@ -234,6 +138,93 @@ def score_similitud(a: str, b: str) -> float:
 def limpiar_codigo(codigo: str, fallback: str) -> str:
     codigo = re.sub(r"[^A-Za-z0-9\-]", "", (codigo or "").upper())
     return codigo[:24] if codigo else fallback
+
+
+SECCIONES_COMERCIALES_PREFERENTES = [
+    "PROYECTO Y TRÁMITES",
+    "DESMONTAJES Y DEMOLICIONES",
+    "ALBAÑILERÍA Y ESTRUCTURA",
+    "INSTALACIONES ELÉCTRICAS",
+    "INSTALACIONES HIDROSANITARIAS",
+    "ACABADOS Y RECUBRIMIENTOS",
+    "CARPINTERÍA",
+    "CANCELERÍA Y HERRERÍA",
+    "EXTERIORES Y AMENIDADES",
+    "LIMPIEZA Y ENTREGA",
+]
+
+SECCION_ALIASES = {
+    "PROYECTO Y TRAMITES": "PROYECTO Y TRÁMITES",
+    "PROYECTO": "PROYECTO Y TRÁMITES",
+    "TRAMITES": "PROYECTO Y TRÁMITES",
+    "PREPARACION Y DEMOLICIONES": "DESMONTAJES Y DEMOLICIONES",
+    "PRELIMINARES Y DEMOLICIONES": "DESMONTAJES Y DEMOLICIONES",
+    "DEMOLICIONES": "DESMONTAJES Y DEMOLICIONES",
+    "DESMONTAJES": "DESMONTAJES Y DEMOLICIONES",
+    "ALBANILERIA": "ALBAÑILERÍA Y ESTRUCTURA",
+    "ESTRUCTURA": "ALBAÑILERÍA Y ESTRUCTURA",
+    "ALBANILERIA Y ESTRUCTURA": "ALBAÑILERÍA Y ESTRUCTURA",
+    "ELECTRICA": "INSTALACIONES ELÉCTRICAS",
+    "INSTALACION ELECTRICA": "INSTALACIONES ELÉCTRICAS",
+    "INSTALACIONES ELECTRICAS": "INSTALACIONES ELÉCTRICAS",
+    "HIDROSANITARIA": "INSTALACIONES HIDROSANITARIAS",
+    "INSTALACIONES HIDROSANITARIAS": "INSTALACIONES HIDROSANITARIAS",
+    "PLOMERIA": "INSTALACIONES HIDROSANITARIAS",
+    "ACABADOS": "ACABADOS Y RECUBRIMIENTOS",
+    "ACABADOS Y RECUBRIMIENTOS": "ACABADOS Y RECUBRIMIENTOS",
+    "CARPINTERIA": "CARPINTERÍA",
+    "HERRERIA Y CANCELERIA": "CANCELERÍA Y HERRERÍA",
+    "CANCELERIA Y HERRERIA": "CANCELERÍA Y HERRERÍA",
+    "EXTERIORES": "EXTERIORES Y AMENIDADES",
+    "EXTERIORES Y AMENIDADES": "EXTERIORES Y AMENIDADES",
+    "LIMPIEZA": "LIMPIEZA Y ENTREGA",
+    "LIMPIEZA Y ENTREGA": "LIMPIEZA Y ENTREGA",
+}
+
+
+def normalizar_seccion_comercial(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "OTROS TRABAJOS"
+    key = normalizar_texto(raw).upper()
+    return SECCION_ALIASES.get(key, raw.upper())
+
+
+def titulo_comercial_item(item: dict) -> str:
+    value = str(item.get("commercial_title") or "").strip()
+    if value:
+        return value
+    fallback = str(item.get("subcategory") or "").strip()
+    if fallback:
+        return fallback
+    description = str(item.get("description") or "").strip()
+    if not description:
+        return "Concepto"
+    # Fallback corto para datos históricos creados antes de V10.
+    first = re.split(r"[.;:]", description, maxsplit=1)[0].strip()
+    return first[:80] or description[:80]
+
+
+def ordenar_items_comercialmente(items: list[dict]) -> list[dict]:
+    preferred = {
+        name: index for index, name in enumerate(SECCIONES_COMERCIALES_PREFERENTES)
+    }
+    first_seen = {}
+    for idx, item in enumerate(items):
+        section = normalizar_seccion_comercial(item.get("category"))
+        first_seen.setdefault(section, idx)
+
+    def key(pair):
+        idx, item = pair
+        section = normalizar_seccion_comercial(item.get("category"))
+        if section in preferred:
+            return (0, preferred[section], idx)
+        return (1, first_seen.get(section, idx), idx)
+
+    ordered = [dict(item) for _, item in sorted(enumerate(items), key=key)]
+    for item in ordered:
+        item["category"] = normalizar_seccion_comercial(item.get("category"))
+    return ordered
 
 
 # =========================================================
@@ -724,7 +715,11 @@ class Database:
     def _ensure_column(self, table: str, column: str, sql_type: str):
         """Agrega una columna a una base existente sin destruir información."""
         allowed_tables = {"projects", "budgets", "concepts", "price_history", "budget_items"}
-        allowed_columns = {"parent_budget_id", "revision_instruction"}
+        allowed_columns = {
+            "parent_budget_id",
+            "revision_instruction",
+            "commercial_title",
+        }
         if table not in allowed_tables or column not in allowed_columns:
             raise ValueError("Migración de columna no permitida.")
 
@@ -848,6 +843,7 @@ class Database:
                 category TEXT,
                 subcategory TEXT,
                 code TEXT,
+                commercial_title TEXT,
                 description TEXT NOT NULL,
                 unit TEXT NOT NULL,
                 quantity REAL NOT NULL,
@@ -914,6 +910,7 @@ class Database:
         # anteriores de la app.
         self._ensure_column("budgets", "parent_budget_id", "TEXT")
         self._ensure_column("budgets", "revision_instruction", "TEXT")
+        self._ensure_column("budget_items", "commercial_title", "TEXT")
 
     def stats(self) -> dict:
         return {
@@ -1284,6 +1281,7 @@ class Database:
 
         for item in items:
             concept_id = item.get("concept_id")
+            concept_was_existing = bool(concept_id)
 
             if not concept_id:
                 concept_id = str(uuid.uuid4())
@@ -1333,16 +1331,38 @@ class Database:
                         ),
                     )
 
+            if concept_was_existing and item.get("record_new_price"):
+                self.execute(
+                    """
+                    INSERT INTO price_history (
+                        id, concept_id, unit_cost, source, source_detail,
+                        status, confidence, project_id, budget_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        concept_id,
+                        item["unit_cost"],
+                        item["price_source"],
+                        item["price_source_detail"],
+                        item["price_status"],
+                        item["price_confidence"],
+                        project_id,
+                        budget_id,
+                        created,
+                    ),
+                )
+
             self.execute(
                 """
                 INSERT INTO budget_items (
                     id, budget_id, concept_id, category, subcategory, code,
-                    description, unit, quantity, unit_cost, direct_amount,
+                    commercial_title, description, unit, quantity, unit_cost, direct_amount,
                     unit_indirect, unit_profit, unit_sale, sale_amount,
                     sale_margin_pct, benefit_amount, price_source,
                     price_source_detail, price_confidence, quantity_criterion,
                     inclusion_basis, considerations, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -1351,6 +1371,7 @@ class Database:
                     item["category"],
                     item["subcategory"],
                     item["code"],
+                    titulo_comercial_item(item),
                     item["description"],
                     item["unit"],
                     item["quantity"],
@@ -1429,6 +1450,7 @@ class Database:
 
         for item in items:
             concept_id = item.get("concept_id")
+            concept_was_existing = bool(concept_id)
 
             if not concept_id:
                 concept_id = str(uuid.uuid4())
@@ -1475,16 +1497,38 @@ class Database:
                         ),
                     )
 
+            if concept_was_existing and item.get("record_new_price"):
+                self.execute(
+                    """
+                    INSERT INTO price_history (
+                        id, concept_id, unit_cost, source, source_detail,
+                        status, confidence, project_id, budget_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        concept_id,
+                        item["unit_cost"],
+                        item["price_source"],
+                        item["price_source_detail"],
+                        item["price_status"],
+                        item["price_confidence"],
+                        project_id,
+                        budget_id,
+                        created,
+                    ),
+                )
+
             self.execute(
                 """
                 INSERT INTO budget_items (
                     id, budget_id, concept_id, category, subcategory, code,
-                    description, unit, quantity, unit_cost, direct_amount,
+                    commercial_title, description, unit, quantity, unit_cost, direct_amount,
                     unit_indirect, unit_profit, unit_sale, sale_amount,
                     sale_margin_pct, benefit_amount, price_source,
                     price_source_detail, price_confidence, quantity_criterion,
                     inclusion_basis, considerations, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -1493,6 +1537,7 @@ class Database:
                     item["category"],
                     item["subcategory"],
                     item["code"],
+                    titulo_comercial_item(item),
                     item["description"],
                     item["unit"],
                     item["quantity"],
@@ -1826,7 +1871,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-08-13-v8.0-cdmx"
+DATABASE_CACHE_VERSION = "2026-08-20-v10-formato-empresa"
 
 
 @st.cache_resource(show_spinner=False)
@@ -1852,10 +1897,19 @@ def get_database(database_url: str | None, cache_version: str):
 
 
 class ActividadIA(BaseModel):
-    partida: str = Field(description="Partida general, por ejemplo PREPARACIÓN Y DEMOLICIONES")
-    subpartida: str = Field(description="Subpartida breve, por ejemplo Preliminares")
-    codigo_sugerido: str = Field(description="Código breve como PRE-01 o CAR-03")
-    descripcion_tecnica: str = Field(description="Descripción técnica completa orientada a presupuesto")
+    partida: str = Field(
+        description="Sección comercial amplia del presupuesto, por ejemplo ACABADOS Y RECUBRIMIENTOS"
+    )
+    subpartida: str = Field(
+        description="Clasificación interna breve para catálogo; no necesariamente se muestra al cliente"
+    )
+    codigo_sugerido: str = Field(description="Código interno breve como PRE-01 o CAR-03")
+    titulo_comercial: str = Field(
+        description="Título corto y legible para el cliente, por ejemplo Pintura general o Demolición de muros"
+    )
+    descripcion_tecnica: str = Field(
+        description="Descripción clara del alcance que aparecerá debajo del título comercial"
+    )
     unidad: str = Field(description="Unidad: LOTE, PZA, M2, M3, ML, PTO, JGO, etc.")
     cantidad: float = Field(ge=0, description="Cantidad justificable con la información disponible")
     costo_unitario_estimado: float = Field(
@@ -1931,9 +1985,12 @@ materiales y mano de obra, sino generar actividades contratables, claras y
 útiles para solicitar o comparar cotizaciones.
 
 OBJETIVO
-Genera un presupuesto inicial consistente, estructurado por PARTIDA,
-SUBPARTIDA y ACTIVIDAD. Debe servir como base para un archivo Excel que después
-será revisado y corregido por la empresa.
+Genera un presupuesto inicial consistente con una estructura comercial similar
+a la utilizada por una empresa de remodelación para presentar propuestas:
+SECCIÓN COMERCIAL → TÍTULO CORTO DEL CONCEPTO → DESCRIPCIÓN → CANTIDAD/UNIDAD.
+
+El archivo Excel tendrá una hoja principal de presupuesto comercial y hojas
+separadas para control interno y trazabilidad.
 
 DATOS DEL PROYECTO
 Cliente: {project_data['name']}
@@ -1973,23 +2030,43 @@ REGLAS DE GENERACIÓN
 7. El desperdicio es una referencia técnica. En un costo integrado de
    subcontratista se considera dentro de la estimación cuando aplique; NO lo
    devuelvas como una partida separada ni agregues un porcentaje global.
-8. Agrupa las actividades en partidas y subpartidas coherentes. Ejemplos de
-   partidas: PREPARACIÓN Y DEMOLICIONES, ALBAÑILERÍA, ACABADOS, CARPINTERÍA,
-   HERRERÍA Y CANCELERÍA, INSTALACIONES, MOBILIARIO, LIMPIEZA Y ENTREGA.
-9. Incluye trámites o licencias únicamente cuando el alcance realmente los haga
+8. Usa como SECCIONES COMERCIALES preferentes, cuando correspondan:
+   - PROYECTO Y TRÁMITES
+   - DESMONTAJES Y DEMOLICIONES
+   - ALBAÑILERÍA Y ESTRUCTURA
+   - ACABADOS Y RECUBRIMIENTOS
+   - CARPINTERÍA
+   - CANCELERÍA Y HERRERÍA
+   - EXTERIORES Y AMENIDADES
+   Puedes crear otras secciones necesarias, especialmente INSTALACIONES
+   ELÉCTRICAS, INSTALACIONES HIDROSANITARIAS, CLIMATIZACIÓN, EQUIPAMIENTO,
+   LIMPIEZA Y ENTREGA u otras que el proyecto realmente requiera. No fuerces un
+   trabajo dentro de una sección incorrecta solo para utilizar la lista anterior.
+9. Cada actividad debe tener titulo_comercial. Debe ser corto, claro y apto para
+   mostrar al cliente, normalmente de 2 a 8 palabras. Ejemplos: "Pintura general",
+   "Pisos en recámaras", "Demolición de muros", "Ventanal de escalera".
+   Los títulos pueden repetirse cuando el mismo tipo de trabajo se realice en
+   zonas distintas.
+10. descripcion_tecnica debe aparecer debajo del título comercial. Debe explicar
+   de forma concreta qué se hará, dónde se hará, la especificación principal y
+   qué elementos importantes incluye. Evita convertirla en un APU o en una lista
+   excesivamente larga de insumos.
+11. subpartida y codigo_sugerido son campos INTERNOS. No intentes convertirlos en
+   títulos visibles para el cliente.
+12. Incluye trámites o licencias únicamente cuando el alcance realmente los haga
    previsibles o el usuario los solicite.
-10. No dupliques actividades. No agregues trabajos que no se desprendan del
+13. No dupliques actividades. No agregues trabajos que no se desprendan del
     alcance salvo complementos técnicos indispensables, y en ese caso indícalo
     claramente en consideraciones.
-11. Para cada actividad explica de forma breve el criterio de cantidad y el
+14. Para cada actividad explica de forma breve el criterio de cantidad y el
     fundamento de inclusión. No expongas cadenas de pensamiento ni razonamiento
     interno.
-12. Los datos faltantes deben concentrarse en datos_faltantes, pero no deben
+15. Los datos faltantes deben concentrarse en datos_faltantes, pero no deben
     impedir generar un presupuesto inicial cuando sea posible trabajar con LOTE
     o con una estimación razonable.
-13. La descripción técnica debe ser suficientemente completa para poder copiarse
+16. La descripción técnica debe ser suficientemente completa para poder copiarse
     a una plataforma de presupuestación o solicitar una cotización a proveedor.
-14. No calcules indirectos, utilidad, venta, beneficio, margen ni IVA. Python los
+17. No calcules indirectos, utilidad, venta, beneficio, margen ni IVA. Python los
     calculará de forma determinista.
 """
 
@@ -2042,9 +2119,8 @@ def revisar_presupuesto_ia(
     revision_request: str,
 ) -> RevisionPresupuestoIA:
     """
-    Segundo modo de uso de Gemini.
-    No vuelve a generar el presupuesto completo: devuelve exclusivamente
-    operaciones estructuradas sobre las actividades existentes.
+    Ajusta el presupuesto vigente sin regenerarlo por completo.
+    La solicitud puede referirse a alcance, cantidades, descripciones o precios.
     """
     client = genai.Client(api_key=api_key)
 
@@ -2053,11 +2129,13 @@ def revisar_presupuesto_ia(
             "codigo": x["code"],
             "partida": x["category"],
             "subpartida": x["subcategory"],
+            "titulo_comercial": titulo_comercial_item(x),
             "descripcion": x["description"],
             "unidad": x["unit"],
             "cantidad": x["quantity"],
             "costo_unitario_actual": x["unit_cost"],
             "fuente_precio": x["price_source"],
+            "detalle_fuente": x.get("price_source_detail") or "",
             "criterio_cantidad": x["quantity_criterion"],
             "consideraciones": x["considerations"],
         }
@@ -2065,58 +2143,61 @@ def revisar_presupuesto_ia(
     ]
 
     prompt = f"""
-Actúa como revisor técnico de un presupuesto de remodelación e interiorismo.
-NO debes volver a generar el presupuesto desde cero.
+Actúa como revisor técnico y de costos de un presupuesto de remodelación e interiorismo.
+NO vuelvas a generar el presupuesto desde cero. Trabaja únicamente sobre las actividades
+que necesiten cambiar.
 
-Tu trabajo consiste en interpretar UNA SOLICITUD DE CAMBIO ESTRUCTURAL y
-devolver solamente las operaciones necesarias para transformar el presupuesto
-actual en una nueva versión.
-
-DATOS ORIGINALES DEL PROYECTO — SON INMUTABLES
+DATOS DEL PROYECTO
 Cliente: {project_data['name']}
 Ubicación: {project_data['location']}
 Tipo de obra: {project_data['project_type']}
 
-DESCRIPCIÓN GENERAL ORIGINAL
+DESCRIPCIÓN ORIGINAL
 {project_data['description']}
 
-TEXTO GUÍA / CONSIDERACIONES ORIGINALES
+TEXTO GUÍA
 {project_data['guide_text'] or 'Sin texto guía adicional.'}
 
 PRESUPUESTO ACTUAL
 {json.dumps(presupuesto_actual, ensure_ascii=False, separators=(',', ':'))}
 
-ALCANCE RESUMIDO ACTUAL
+ALCANCE ACTUAL
 {current_result.alcance_resumido}
 
-SOLICITUD DE CAMBIO
+PETICIÓN DEL USUARIO
 {revision_request}
 
-REGLAS OBLIGATORIAS
-1. Modifica EXCLUSIVAMENTE lo que sea necesario para cumplir la solicitud.
-2. Todo concepto que no esté relacionado con la solicitud debe permanecer
-   exactamente sin cambios; Python conservará esas actividades sin regenerarlas.
-3. Utiliza únicamente las acciones AGREGAR, MODIFICAR y ELIMINAR.
-4. Para MODIFICAR o ELIMINAR debes indicar codigo_objetivo usando exactamente
-   uno de los códigos existentes en PRESUPUESTO ACTUAL.
-5. Para AGREGAR y MODIFICAR devuelve actividad completa.
-6. Para ELIMINAR, actividad debe ser null.
-7. Si una modificación solo mejora redacción o detalle y no cambia la base del
-   costo unitario, usa recalcular_precio=False.
-8. Si cambia materialmente alcance, especificación, unidad, calidad, dimensiones
-   relevantes o naturaleza del servicio, usa recalcular_precio=True.
-9. Para actividades nuevas usa recalcular_precio=True.
-10. No hagas correcciones menores de precios por iniciativa propia.
-11. Conserva la lógica de actividades generales subcontratables; no desarrolles
-    APUs de material/mano de obra salvo que sea indispensable.
-12. No calcules indirectos, utilidad, venta ni IVA.
-13. Devuelve un alcance_resumido_actualizado que refleje la nueva versión.
-14. Devuelve las listas completas y actualizadas de consideraciones y datos
-    faltantes, no únicamente lo nuevo.
-15. No expongas razonamiento interno. En motivo escribe solo la justificación
-    técnica breve y verificable de cada operación.
-16. Si la solicitud no requiere cambiar una actividad, no generes una operación
-    para ella.
+INSTRUCCIONES
+1. Cambia solamente lo necesario para atender la petición. Todo lo demás debe conservarse.
+2. Puedes AGREGAR, MODIFICAR o ELIMINAR actividades.
+3. Para MODIFICAR o ELIMINAR usa exactamente el codigo_objetivo existente.
+4. Para AGREGAR y MODIFICAR devuelve la actividad completa; para ELIMINAR usa actividad=null.
+5. La petición puede ser sencilla. Ejemplos válidos:
+   - "falta considerar limpieza fina";
+   - "el precio de pintura está muy bajo, revísalo";
+   - "esta cantidad debería ser mayor";
+   - "cambia el tipo de cancelería";
+   - "elimina este trabajo".
+6. Si el usuario indica que un precio está alto, bajo o pide revisarlo, modifica únicamente
+   el costo_unitario_estimado de la actividad afectada salvo que también solicite otro cambio.
+   En ese caso usa recalcular_precio=True y propón un nuevo costo razonable con base en la
+   descripción, especificación, unidad, ubicación y contexto del proyecto.
+7. Si el usuario proporciona un precio concreto, úsalo como costo_unitario_estimado y marca
+   recalcular_precio=True.
+8. Si cambia cantidad, descripción o detalle pero el costo unitario puede mantenerse, usa
+   recalcular_precio=False.
+9. Si cambia materialmente especificación, unidad, calidad o naturaleza del servicio, usa
+   recalcular_precio=True.
+10. Para actividades nuevas usa recalcular_precio=True.
+11. No modifiques precios no mencionados ni hagas ajustes generales por iniciativa propia.
+12. Mantén actividades generales subcontratables; no desarrolles APU de materiales y mano de
+    obra salvo que la petición lo requiera expresamente.
+13. Conserva la estructura comercial: sección amplia, titulo_comercial corto y una descripción
+    clara debajo. Si el usuario solo pide revisar precio o cantidad, conserva el título y la
+    sección salvo que también sea necesario cambiarlos.
+14. No calcules indirectos, utilidad, venta ni IVA; Python hará esos cálculos.
+15. Devuelve el alcance, consideraciones y datos faltantes completos y actualizados.
+16. En motivo escribe solo una explicación breve del cambio, sin razonamiento interno.
 """
 
     modelos = []
@@ -2367,9 +2448,10 @@ def resolver_items(
         items.append(
             {
                 "concept_id": concept_id,
-                "category": act.partida.strip().upper(),
+                "category": normalizar_seccion_comercial(act.partida),
                 "subcategory": act.subpartida.strip(),
                 "code": code,
+                "commercial_title": act.titulo_comercial.strip(),
                 "description": act.descripcion_tecnica.strip(),
                 "unit": act.unidad.strip().upper(),
                 "quantity": quantity,
@@ -2430,6 +2512,7 @@ def item_a_actividad(item: dict) -> ActividadIA:
         partida=item["category"],
         subpartida=item["subcategory"],
         codigo_sugerido=item["code"],
+        titulo_comercial=titulo_comercial_item(item),
         descripcion_tecnica=item["description"],
         unidad=item["unit"],
         cantidad=float(item["quantity"]),
@@ -2520,7 +2603,9 @@ def aplicar_revision_estructural(
         if action == "ELIMINAR":
             idx = find_index(op.codigo_objetivo)
             removed = items.pop(idx)
-            change_log.append(f"ELIMINADO {removed['code']}: {removed['description']}")
+            change_log.append(
+                f"ELIMINADO {removed['code']}: {titulo_comercial_item(removed)}"
+            )
             continue
 
         new_item = dict(resolved_changes[resolved_index])
@@ -2530,10 +2615,18 @@ def aplicar_revision_estructural(
             idx = find_index(op.codigo_objetivo)
             old_item = items[idx]
 
-            # Si Gemini declara que el cambio no altera la base de costo, se
-            # conserva exactamente el precio histórico utilizado y solo se
-            # recalculan importes con la nueva cantidad.
-            if not op.recalcular_precio:
+            same_unit = (
+                str(new_item.get("unit") or "").strip().upper()
+                == str(old_item.get("unit") or "").strip().upper()
+            )
+            desc_similarity = SequenceMatcher(
+                None,
+                normalizar_texto(str(old_item.get("description") or "")),
+                normalizar_texto(str(new_item.get("description") or "")),
+            ).ratio()
+
+            preserve_old_price = not op.recalcular_precio and same_unit
+            if preserve_old_price:
                 for key in [
                     "concept_id",
                     "unit_cost",
@@ -2544,6 +2637,12 @@ def aplicar_revision_estructural(
                 ]:
                     new_item[key] = old_item.get(key)
                 new_item = recalcular_item_financiero(new_item, params)
+            elif same_unit and desc_similarity >= 0.72:
+                # Es el mismo concepto con una nueva valoración (por ejemplo,
+                # "este precio está muy bajo"). Conservamos su identidad para
+                # registrar un nuevo precio histórico en lugar de duplicarlo.
+                new_item["concept_id"] = old_item.get("concept_id")
+                new_item["record_new_price"] = True
 
             # Evita que una modificación cambie el código a uno que ya pertenece
             # a otra actividad.
@@ -2586,7 +2685,7 @@ def aplicar_revision_estructural(
             insert_at = max(same_category) + 1
         items.insert(insert_at, new_item)
         change_log.append(
-            f"AGREGADO {new_item['code']}: {new_item['description']}"
+            f"AGREGADO {new_item['code']}: {titulo_comercial_item(new_item)}"
         )
 
     revised_result = PresupuestoIA(
@@ -2632,405 +2731,469 @@ def crear_excel(
     params: dict,
     version: int = 1,
 ) -> bytes:
+    """
+    Genera un libro con tres capas claramente separadas:
+
+    01 Presupuesto      → salida comercial limpia, similar a la lógica usada
+                          por la empresa para presentar presupuestos.
+    02 Control Interno  → costos, indirectos, utilidad y comparación contra
+                          el P.U. comercial.
+    03 Trazabilidad     → origen de precios y criterios técnicos.
+
+    La hoja comercial es editable: al cambiar Cantidad o P.U. Venta se
+    recalculan importes, subtotales, IVA y total.
+    """
     wb = Workbook()
-    wb.remove(wb.active)
+    ws = wb.active
+    ws.title = "01 Presupuesto"
 
-    navy = "1F4E78"
-    dark = "203864"
-    gray = "D9E1F2"
-    light = "EEF3F8"
-    green = "E2F0D9"
-    orange = "FCE4D6"
+    # Paleta neutra y profesional.
+    brown = "4A342B"
+    brown_light = "EDE7E3"
+    gray = "E7E7E7"
+    gray_light = "F5F5F5"
+    dark_gray = "555555"
     white = "FFFFFF"
-    border_side = Side(style="thin", color="D9E0E7")
-    border = Border(left=border_side, right=border_side, top=border_side, bottom=border_side)
+    internal_blue = "1F4E78"
+    trace_orange = "FCE4D6"
+
+    thin_gray = Side(style="thin", color="D4D4D4")
+    bottom_brown = Border(bottom=Side(style="thin", color=brown))
+
+    ordered_items = ordenar_items_comercialmente(items)
+    grouped = {}
+    for item in ordered_items:
+        section = normalizar_seccion_comercial(item.get("category"))
+        grouped.setdefault(section, []).append(item)
 
     # -----------------------------------------------------
-    # FACTORES Y PARÁMETROS
+    # 01 PRESUPUESTO - CABECERA
     # -----------------------------------------------------
-    wp = wb.create_sheet("Factores y Parámetros")
-    wp.merge_cells("A2:C2")
-    wp["A2"] = "Factores de Sobrecosto Corporativos"
-    wp["A2"].font = Font(bold=True, size=14, color=white)
-    wp["A2"].fill = PatternFill("solid", fgColor=dark)
-    wp["A2"].alignment = Alignment(horizontal="center")
+    ws.sheet_view.showGridLines = False
+    ws.merge_cells("A2:E2")
+    ws["A2"] = "PRESUPUESTO"
+    ws["A2"].font = Font(size=22, bold=True, color=brown)
+    ws["A2"].alignment = Alignment(vertical="center")
 
-    wp["A4"] = "Concepto de Factor"
-    wp["B4"] = "Nomenclatura"
-    wp["C4"] = "Porcentaje"
-    for cell in wp[4]:
-        cell.font = Font(bold=True, color=white)
-        cell.fill = PatternFill("solid", fgColor=navy)
-        cell.border = border
+    ws.merge_cells("A3:E3")
+    ws["A3"] = project_data["name"]
+    ws["A3"].font = Font(size=12, bold=True, color=brown)
 
-    factors = [
-        ("Costos Indirectos", "IND", params["indirect_pct"] / 100),
-        ("Utilidad de la Empresa", "UTIL", params["profit_pct"] / 100),
-        ("I.V.A.", "IVA", params["iva_pct"] / 100),
-        ("Desperdicio de referencia", "DESP", params["waste_pct"] / 100),
-    ]
-    for r, row in enumerate(factors, start=5):
-        for c, val in enumerate(row, start=1):
-            wp.cell(r, c, val).border = border
-        wp.cell(r, 3).number_format = "0.00%"
+    ws.merge_cells("A4:E4")
+    ws["A4"] = project_data["project_type"]
+    ws["A4"].font = Font(size=10, color=dark_gray)
 
-    wp.column_dimensions["A"].width = 42
-    wp.column_dimensions["B"].width = 18
-    wp.column_dimensions["C"].width = 18
+    ws.merge_cells("A5:E5")
+    ws["A5"] = project_data["location"]
+    ws["A5"].font = Font(size=10, color=dark_gray)
+
+    ws.merge_cells("A6:E6")
+    ws["A6"] = f"{project_code} · V{version:02d}"
+    ws["A6"].font = Font(size=9, italic=True, color="777777")
 
     # -----------------------------------------------------
-    # DESGLOSE DETALLADO
+    # RESERVAR RESUMEN ECONÓMICO
     # -----------------------------------------------------
-    wd = wb.create_sheet("Desglose Detallado")
-    wd.merge_cells("A2:L2")
-    wd["A2"] = f"PRESUPUESTO BASE DE OBRA - {project_data['name'].upper()}"
-    wd["A2"].font = Font(bold=True, size=15, color=white)
-    wd["A2"].fill = PatternFill("solid", fgColor=dark)
-    wd["A2"].alignment = Alignment(horizontal="center")
-
-    wd.merge_cells("A3:L3")
-    wd["A3"] = (
-        f"Código: {project_code} | Versión: V{version:02d} | "
-        f"Ubicación: {project_data['location'] or 'No indicada'} | Tipo: {project_data['project_type']}"
+    summary_title_row = 8
+    ws.merge_cells(
+        start_row=summary_title_row,
+        start_column=1,
+        end_row=summary_title_row,
+        end_column=5,
     )
-    wd["A3"].font = Font(italic=True, color="4F5B66")
+    ws.cell(summary_title_row, 1, "PROPUESTA ECONÓMICA")
+    ws.cell(summary_title_row, 1).font = Font(size=15, bold=True, color=brown)
+    ws.cell(summary_title_row, 1).alignment = Alignment(horizontal="center")
+
+    summary_start = 10
+    summary_section_rows = {}
+    row = summary_start
+
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+    ws.cell(row, 1, "Presupuesto de obra")
+    ws.cell(row, 1).font = Font(bold=True)
+    ws.cell(row, 1).fill = PatternFill("solid", fgColor=gray)
+    ws.cell(row, 5).fill = PatternFill("solid", fgColor=gray)
+    budget_summary_row = row
+    row += 1
+
+    for section in grouped:
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+        ws.cell(row, 1, section)
+        ws.cell(row, 1).font = Font(size=10)
+        ws.cell(row, 1).fill = PatternFill("solid", fgColor=gray_light)
+        ws.cell(row, 5).fill = PatternFill("solid", fgColor=gray_light)
+        summary_section_rows[section] = row
+        row += 1
+
+    iva_summary_row = row
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+    ws.cell(row, 1, f"IVA {params['iva_pct']:.0f}%")
+    ws.cell(row, 1).font = Font(bold=True)
+    ws.cell(row, 1).fill = PatternFill("solid", fgColor=gray)
+    ws.cell(row, 5).fill = PatternFill("solid", fgColor=gray)
+    row += 1
+
+    total_summary_row = row
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+    ws.cell(row, 1, "TOTAL")
+    ws.cell(row, 1).font = Font(size=12, bold=True, color=brown)
+    ws.cell(row, 5).font = Font(size=12, bold=True, color=brown)
+    ws.cell(row, 1).border = bottom_brown
+    ws.cell(row, 5).border = bottom_brown
+
+    # -----------------------------------------------------
+    # DETALLE COMERCIAL
+    # -----------------------------------------------------
+    row += 3
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+    ws.cell(row, 1, "PRESUPUESTO DE OBRA DETALLADO")
+    ws.cell(row, 1).font = Font(size=15, bold=True, color=brown)
+    ws.cell(row, 1).alignment = Alignment(horizontal="center")
+    row += 2
+
+    section_subtotal_cells = {}
+    commercial_row_map = {}
+    section_number = 1
+
+    for section, section_items in grouped.items():
+        section_header_row = row
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+        ws.cell(row, 1, f"{section_number:02d}  {section}")
+        ws.cell(row, 1).font = Font(size=13, bold=True, color=brown)
+        ws.cell(row, 1).border = bottom_brown
+        row += 1
+
+        item_amount_rows = []
+
+        for item in section_items:
+            item_row = row
+            commercial_row_map[item["code"]] = item_row
+
+            # Fila equivalente al encabezado compacto del concepto del PDF.
+            ws.cell(item_row, 1, titulo_comercial_item(item))
+            ws.cell(item_row, 1).font = Font(size=11, bold=True, color=brown)
+            ws.cell(item_row, 1).fill = PatternFill("solid", fgColor=gray_light)
+
+            ws.cell(item_row, 2, float(item["quantity"]))
+            ws.cell(item_row, 2).number_format = '0.00'
+            ws.cell(item_row, 2).alignment = Alignment(horizontal="right")
+            ws.cell(item_row, 2).fill = PatternFill("solid", fgColor=gray_light)
+
+            ws.cell(item_row, 3, item["unit"])
+            ws.cell(item_row, 3).alignment = Alignment(horizontal="center")
+            ws.cell(item_row, 3).fill = PatternFill("solid", fgColor=gray_light)
+
+            ws.cell(item_row, 4, float(item["unit_sale"]))
+            ws.cell(item_row, 4).number_format = '$#,##0.00'
+            ws.cell(item_row, 4).alignment = Alignment(horizontal="right")
+            ws.cell(item_row, 4).fill = PatternFill("solid", fgColor=gray_light)
+
+            ws.cell(item_row, 5, f"=B{item_row}*D{item_row}")
+            ws.cell(item_row, 5).number_format = '$#,##0.00'
+            ws.cell(item_row, 5).font = Font(bold=True)
+            ws.cell(item_row, 5).alignment = Alignment(horizontal="right")
+            ws.cell(item_row, 5).fill = PatternFill("solid", fgColor=gray_light)
+
+            item_amount_rows.append(item_row)
+
+            # Descripción debajo del título, sin columnas técnicas visibles.
+            desc_row = item_row + 1
+            ws.merge_cells(
+                start_row=desc_row,
+                start_column=1,
+                end_row=desc_row,
+                end_column=5,
+            )
+            ws.cell(desc_row, 1, item["description"])
+            ws.cell(desc_row, 1).alignment = Alignment(
+                wrap_text=True,
+                vertical="top",
+            )
+            ws.cell(desc_row, 1).font = Font(size=9, color=dark_gray)
+            # Altura aproximada según extensión.
+            desc_len = max(len(str(item["description"])), 1)
+            ws.row_dimensions[desc_row].height = max(28, min(72, 16 + (desc_len // 90) * 14))
+
+            row += 3
+
+        subtotal_row = row
+        ws.merge_cells(
+            start_row=subtotal_row,
+            start_column=1,
+            end_row=subtotal_row,
+            end_column=4,
+        )
+        ws.cell(subtotal_row, 1, f"Total {section}")
+        ws.cell(subtotal_row, 1).font = Font(size=11, bold=True, color=brown)
+        ws.cell(subtotal_row, 1).fill = PatternFill("solid", fgColor=gray)
+
+        amount_formula = (
+            "+".join(f"E{r}" for r in item_amount_rows)
+            if item_amount_rows
+            else "0"
+        )
+        ws.cell(subtotal_row, 5, f"={amount_formula}")
+        ws.cell(subtotal_row, 5).number_format = '$#,##0.00'
+        ws.cell(subtotal_row, 5).font = Font(size=11, bold=True, color=brown)
+        ws.cell(subtotal_row, 5).fill = PatternFill("solid", fgColor=gray)
+
+        section_subtotal_cells[section] = subtotal_row
+        row += 3
+        section_number += 1
+
+    # Resumen superior enlazado a los subtotales.
+    for section, summary_row in summary_section_rows.items():
+        subtotal_row = section_subtotal_cells[section]
+        ws.cell(summary_row, 5, f"=E{subtotal_row}")
+        ws.cell(summary_row, 5).number_format = '$#,##0.00'
+        ws.cell(summary_row, 5).alignment = Alignment(horizontal="right")
+
+    summary_formula = (
+        "+".join(f"E{section_subtotal_cells[s]}" for s in grouped)
+        if grouped
+        else "0"
+    )
+    ws.cell(budget_summary_row, 5, f"={summary_formula}")
+    ws.cell(budget_summary_row, 5).number_format = '$#,##0.00'
+    ws.cell(budget_summary_row, 5).font = Font(bold=True)
+
+    ws.cell(
+        iva_summary_row,
+        5,
+        f"=E{budget_summary_row}*'02 Control Interno'!$B$6",
+    )
+    ws.cell(iva_summary_row, 5).number_format = '$#,##0.00'
+    ws.cell(iva_summary_row, 5).font = Font(bold=True)
+
+    ws.cell(
+        total_summary_row,
+        5,
+        f"=E{budget_summary_row}+E{iva_summary_row}",
+    )
+    ws.cell(total_summary_row, 5).number_format = '$#,##0.00'
+    ws.cell(total_summary_row, 5).font = Font(size=12, bold=True, color=brown)
+
+    # Resumen final también al cierre del detalle.
+    bottom_start = row
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+    ws.cell(row, 1, "Presupuesto de obra")
+    ws.cell(row, 5, f"=E{budget_summary_row}")
+    row += 1
+
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+    ws.cell(row, 1, f"IVA {params['iva_pct']:.0f}%")
+    ws.cell(row, 5, f"=E{iva_summary_row}")
+    row += 1
+
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+    ws.cell(row, 1, "TOTAL")
+    ws.cell(row, 5, f"=E{total_summary_row}")
+
+    for rr in range(bottom_start, row + 1):
+        ws.cell(rr, 1).font = Font(
+            bold=True,
+            color=brown if rr == row else "000000",
+        )
+        ws.cell(rr, 5).font = Font(
+            bold=True,
+            color=brown if rr == row else "000000",
+        )
+        ws.cell(rr, 5).number_format = '$#,##0.00'
+        fill = gray if rr < row else brown_light
+        ws.cell(rr, 1).fill = PatternFill("solid", fgColor=fill)
+        ws.cell(rr, 5).fill = PatternFill("solid", fgColor=fill)
+
+    ws.column_dimensions["A"].width = 52
+    ws.column_dimensions["B"].width = 12
+    ws.column_dimensions["C"].width = 11
+    ws.column_dimensions["D"].width = 18
+    ws.column_dimensions["E"].width = 20
+
+    ws.freeze_panes = "A8"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.page_margins.left = 0.35
+    ws.page_margins.right = 0.35
+    ws.page_margins.top = 0.5
+    ws.page_margins.bottom = 0.5
+
+    # -----------------------------------------------------
+    # 02 CONTROL INTERNO
+    # -----------------------------------------------------
+    wc = wb.create_sheet("02 Control Interno")
+    wc.sheet_view.showGridLines = False
+
+    wc.merge_cells("A1:Q1")
+    wc["A1"] = "CONTROL INTERNO DEL PRESUPUESTO"
+    wc["A1"].font = Font(size=15, bold=True, color=white)
+    wc["A1"].fill = PatternFill("solid", fgColor=internal_blue)
+
+    wc["A3"] = "Parámetro"
+    wc["B3"] = "Valor"
+    for cell in ("A3", "B3"):
+        wc[cell].font = Font(bold=True, color=white)
+        wc[cell].fill = PatternFill("solid", fgColor=internal_blue)
+
+    wc["A4"] = "Indirectos"
+    wc["B4"] = params["indirect_pct"] / 100.0
+    wc["A5"] = "Utilidad"
+    wc["B5"] = params["profit_pct"] / 100.0
+    wc["A6"] = "IVA"
+    wc["B6"] = params["iva_pct"] / 100.0
+    wc["A7"] = "Desperdicio de referencia"
+    wc["B7"] = params["waste_pct"] / 100.0
+    for rr in range(4, 8):
+        wc.cell(rr, 2).number_format = "0.00%"
 
     headers = [
-        "Partida",
+        "Sección",
         "Subpartida",
         "Código",
-        "Descripción Técnica del Concepto",
+        "Título comercial",
+        "Descripción",
         "Unidad",
         "Cantidad",
-        "Costo Unitario ($)",
-        "Costo Directo ($)",
-        "Indirecto Unit. ($)",
-        "Utilidad Unit. ($)",
-        "P.U. Venta ($)",
-        "Importe Venta ($)",
+        "Costo base unit.",
+        "Costo directo",
+        "Indirecto unit.",
+        "Utilidad unit.",
+        "P.U. venta calculado",
+        "P.U. comercial",
+        "Importe venta",
+        "Beneficio",
+        "Margen venta",
+        "Dif. P.U. vs calculado",
     ]
-    header_row = 5
-    for c, h in enumerate(headers, start=1):
-        cell = wd.cell(header_row, c, h)
-        cell.font = Font(bold=True, color=white)
-        cell.fill = PatternFill("solid", fgColor=navy)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = border
+    header_row = 9
+    for col, header in enumerate(headers, 1):
+        c = wc.cell(header_row, col, header)
+        c.font = Font(bold=True, color=white)
+        c.fill = PatternFill("solid", fgColor=internal_blue)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    data_rows = []
-    category_subtotals = {}
-    row = 6
-    last_category = None
-
-    for item in items:
-        category = item["category"]
-        if category != last_category:
-            if last_category is not None:
-                row += 1
-            wd.merge_cells(start_row=row, start_column=1, end_row=row, end_column=12)
-            c = wd.cell(row, 1, category)
-            c.font = Font(bold=True, color=white)
-            c.fill = PatternFill("solid", fgColor=dark)
-            c.alignment = Alignment(vertical="center")
-            category_subtotals[category] = []
-            row += 1
-            last_category = category
-
-        r = row
-        data_rows.append(r)
-        category_subtotals[category].append(r)
-
+    for idx, item in enumerate(ordered_items, start=header_row + 1):
+        commercial_row = commercial_row_map.get(item["code"])
         values = [
-            category,
-            item["subcategory"],
+            normalizar_seccion_comercial(item.get("category")),
+            item.get("subcategory") or "",
             item["code"],
+            titulo_comercial_item(item),
             item["description"],
             item["unit"],
-            item["quantity"],
-            item["unit_cost"],
         ]
-        for c, val in enumerate(values, start=1):
-            cell = wd.cell(r, c, val)
-            cell.border = border
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        for col, val in enumerate(values, 1):
+            wc.cell(idx, col, val)
 
-        # Fórmulas editables: al corregir cantidad o costo en Excel, el resto se actualiza.
-        wd.cell(r, 8, f"=F{r}*G{r}")
-        wd.cell(r, 9, f"=G{r}*'Factores y Parámetros'!$C$5")
-        wd.cell(r, 10, f"=(G{r}+I{r})*'Factores y Parámetros'!$C$6")
-        wd.cell(r, 11, f"=G{r}+I{r}+J{r}")
-        wd.cell(r, 12, f"=F{r}*K{r}")
-        for c in range(8, 13):
-            wd.cell(r, c).border = border
-            wd.cell(r, c).alignment = Alignment(vertical="top")
+        if commercial_row:
+            wc.cell(idx, 7, f"='01 Presupuesto'!B{commercial_row}")
+        else:
+            wc.cell(idx, 7, float(item["quantity"]))
 
-        wd.cell(r, 6).number_format = "0.000"
-        for c in range(7, 13):
-            wd.cell(r, c).number_format = '$#,##0.00'
+        wc.cell(idx, 8, float(item["unit_cost"]))
+        wc.cell(idx, 9, f"=G{idx}*H{idx}")
+        wc.cell(idx, 10, f"=H{idx}*$B$4")
+        wc.cell(idx, 11, f"=(H{idx}+J{idx})*$B$5")
+        wc.cell(idx, 12, f"=H{idx}+J{idx}+K{idx}")
 
-        row += 1
+        if commercial_row:
+            wc.cell(idx, 13, f"='01 Presupuesto'!D{commercial_row}")
+            wc.cell(idx, 14, f"='01 Presupuesto'!E{commercial_row}")
+        else:
+            wc.cell(idx, 13, float(item["unit_sale"]))
+            wc.cell(idx, 14, float(item["sale_amount"]))
 
-    # Subtotales por partida.
-    subtotal_cells = {}
-    for category, rows in category_subtotals.items():
-        subtotal_row = row
-        wd.merge_cells(start_row=subtotal_row, start_column=1, end_row=subtotal_row, end_column=10)
-        wd.cell(subtotal_row, 1, f"SUBTOTAL {category}")
-        wd.cell(subtotal_row, 1).font = Font(bold=True)
-        wd.cell(subtotal_row, 1).fill = PatternFill("solid", fgColor=gray)
-        wd.cell(subtotal_row, 11, "Venta")
-        wd.cell(subtotal_row, 11).font = Font(bold=True)
-        wd.cell(subtotal_row, 11).fill = PatternFill("solid", fgColor=gray)
-        formula = "+".join(f"L{x}" for x in rows) if rows else "0"
-        wd.cell(subtotal_row, 12, f"={formula}")
-        wd.cell(subtotal_row, 12).number_format = '$#,##0.00'
-        wd.cell(subtotal_row, 12).font = Font(bold=True)
-        wd.cell(subtotal_row, 12).fill = PatternFill("solid", fgColor=gray)
-        subtotal_cells[category] = subtotal_row
-        row += 1
+        wc.cell(idx, 15, f"=N{idx}-I{idx}")
+        wc.cell(idx, 16, f'=IF(N{idx}=0,0,O{idx}/N{idx})')
+        wc.cell(idx, 17, f"=M{idx}-L{idx}")
 
-    row += 1
-    direct_formula = "+".join(f"H{x}" for x in data_rows) if data_rows else "0"
-    sale_formula = "+".join(f"L{x}" for x in data_rows) if data_rows else "0"
+        wc.cell(idx, 7).number_format = "0.00"
+        for col in range(8, 16):
+            wc.cell(idx, col).number_format = '$#,##0.00'
+        wc.cell(idx, 16).number_format = "0.00%"
+        wc.cell(idx, 17).number_format = '$#,##0.00'
 
-    summary_rows = [
-        ("Costo directo", f"={direct_formula}"),
-        ("Indirectos", f"=L{row}*'Factores y Parámetros'!$C$5"),
-        ("Utilidad", f"=(L{row}+L{row+1})*'Factores y Parámetros'!$C$6"),
-        ("Venta antes de IVA", f"={sale_formula}"),
-        ("IVA", f"=L{row+3}*'Factores y Parámetros'!$C$7"),
-        ("TOTAL GENERAL", f"=L{row+3}+L{row+4}"),
+        for col in range(1, 18):
+            wc.cell(idx, col).alignment = Alignment(
+                vertical="top",
+                wrap_text=col in {1, 2, 4, 5},
+            )
+            wc.cell(idx, col).border = Border(bottom=thin_gray)
+
+    widths = [
+        29, 20, 14, 30, 58, 10, 11, 17, 17, 17, 17, 19, 18, 18, 18, 15, 19
     ]
-
-    financial_summary_rows = {}
-    for idx, (label, formula) in enumerate(summary_rows):
-        rr = row + idx
-        financial_summary_rows[label] = rr
-        wd.cell(rr, 10, label)
-        wd.cell(rr, 10).font = Font(bold=True)
-        wd.cell(rr, 11, "")
-        wd.cell(rr, 12, formula)
-        wd.cell(rr, 12).number_format = '$#,##0.00'
-        wd.cell(rr, 10).fill = PatternFill("solid", fgColor=green if label == "TOTAL GENERAL" else light)
-        wd.cell(rr, 11).fill = PatternFill("solid", fgColor=green if label == "TOTAL GENERAL" else light)
-        wd.cell(rr, 12).fill = PatternFill("solid", fgColor=green if label == "TOTAL GENERAL" else light)
-        if label == "TOTAL GENERAL":
-            wd.cell(rr, 12).font = Font(bold=True, size=12)
-
-    widths = {
-        "A": 24,
-        "B": 20,
-        "C": 14,
-        "D": 72,
-        "E": 10,
-        "F": 11,
-        "G": 17,
-        "H": 17,
-        "I": 17,
-        "J": 17,
-        "K": 17,
-        "L": 18,
-    }
-    for col, width in widths.items():
-        wd.column_dimensions[col].width = width
-    wd.freeze_panes = "A6"
+    for col, width in enumerate(widths, 1):
+        wc.column_dimensions[get_column_letter(col)].width = width
+    wc.freeze_panes = "A10"
 
     # -----------------------------------------------------
-    # RESUMEN EJECUTIVO
+    # 03 TRAZABILIDAD
     # -----------------------------------------------------
-    wr = wb.create_sheet("Resumen Ejecutivo", 0)
-    wr.merge_cells("B2:H2")
-    wr["B2"] = f"RESUMEN DE PRESUPUESTO - {project_data['name'].upper()}"
-    wr["B2"].font = Font(bold=True, size=16, color=white)
-    wr["B2"].fill = PatternFill("solid", fgColor=dark)
-    wr["B2"].alignment = Alignment(horizontal="center")
-
-    wr.merge_cells("B3:H3")
-    wr["B3"] = (
-        f"{project_code} | V{version:02d} | "
-        f"{project_data['location'] or 'Ubicación no indicada'} | {project_data['project_type']}"
-    )
-    wr["B3"].font = Font(italic=True, color="4F5B66")
-    wr["B3"].alignment = Alignment(horizontal="center")
-
-    wr["B5"] = "Partida"
-    wr["C5"] = "Descripción"
-    wr["D5"] = "Monto de Venta (MXN)"
-    for cell in wr[5][1:4]:
-        cell.font = Font(bold=True, color=white)
-        cell.fill = PatternFill("solid", fgColor=navy)
-        cell.border = border
-
-    rr = 6
-    for n, (category, subtotal_row) in enumerate(subtotal_cells.items(), start=1):
-        wr.cell(rr, 2, f"{n}.0")
-        wr.cell(rr, 3, category)
-        wr.cell(rr, 4, f"='Desglose Detallado'!L{subtotal_row}")
-        wr.cell(rr, 4).number_format = '$#,##0.00'
-        for c in range(2, 5):
-            wr.cell(rr, c).border = border
-        rr += 1
-
-    rr += 1
-    wr.cell(rr, 3, "VENTA ANTES DE IVA")
-    wr.cell(rr, 4, f"='Desglose Detallado'!L{financial_summary_rows['Venta antes de IVA']}")
-    rr += 1
-    wr.cell(rr, 3, "IVA")
-    wr.cell(rr, 4, f"='Desglose Detallado'!L{financial_summary_rows['IVA']}")
-    rr += 1
-    wr.cell(rr, 3, "TOTAL DE INVERSIÓN")
-    wr.cell(rr, 4, f"='Desglose Detallado'!L{financial_summary_rows['TOTAL GENERAL']}")
-    for row_i in range(rr - 2, rr + 1):
-        wr.cell(row_i, 3).font = Font(bold=True)
-        wr.cell(row_i, 4).font = Font(bold=True)
-        wr.cell(row_i, 4).number_format = '$#,##0.00'
-        fill = green if row_i == rr else light
-        wr.cell(row_i, 3).fill = PatternFill("solid", fgColor=fill)
-        wr.cell(row_i, 4).fill = PatternFill("solid", fgColor=fill)
-
-    wr.merge_cells(start_row=rr + 3, start_column=2, end_row=rr + 3, end_column=8)
-    wr.cell(rr + 3, 2, "Alcance resumido")
-    wr.cell(rr + 3, 2).font = Font(bold=True, color=white)
-    wr.cell(rr + 3, 2).fill = PatternFill("solid", fgColor=navy)
-    wr.merge_cells(start_row=rr + 4, start_column=2, end_row=rr + 6, end_column=8)
-    wr.cell(rr + 4, 2, result.alcance_resumido)
-    wr.cell(rr + 4, 2).alignment = Alignment(wrap_text=True, vertical="top")
-
-    wr.column_dimensions["B"].width = 15
-    wr.column_dimensions["C"].width = 58
-    wr.column_dimensions["D"].width = 22
-    for col in ["E", "F", "G", "H"]:
-        wr.column_dimensions[col].width = 12
-
-    # -----------------------------------------------------
-    # TRAZABILIDAD INTERNA
-    # -----------------------------------------------------
-    wt = wb.create_sheet("Trazabilidad")
-    wt.merge_cells("A1:J1")
-    wt["A1"] = "Trazabilidad de conceptos y precios"
-    wt["A1"].font = Font(bold=True, size=14, color=white)
-    wt["A1"].fill = PatternFill("solid", fgColor=dark)
+    wt = wb.create_sheet("03 Trazabilidad")
+    wt.sheet_view.showGridLines = False
+    wt.merge_cells("A1:L1")
+    wt["A1"] = "TRAZABILIDAD DE CONCEPTOS Y PRECIOS"
+    wt["A1"].font = Font(size=15, bold=True, color=white)
+    wt["A1"].fill = PatternFill("solid", fgColor=internal_blue)
 
     trace_headers = [
+        "Sección",
+        "Título comercial",
         "Código",
-        "Concepto",
+        "Descripción",
         "Unidad",
         "Cantidad",
-        "Costo unitario",
         "Fuente precio",
-        "Confianza precio",
-        "Criterio cantidad",
-        "Fundamento",
+        "Detalle de fuente",
+        "Confianza",
+        "Criterio de cantidad",
+        "Fundamento de inclusión",
         "Consideraciones",
     ]
-    for c, h in enumerate(trace_headers, 1):
-        cell = wt.cell(3, c, h)
-        cell.font = Font(bold=True, color=white)
-        cell.fill = PatternFill("solid", fgColor=navy)
-        cell.border = border
-        cell.alignment = Alignment(wrap_text=True)
+    for col, header in enumerate(trace_headers, 1):
+        c = wt.cell(3, col, header)
+        c.font = Font(bold=True, color=white)
+        c.fill = PatternFill("solid", fgColor=internal_blue)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    for r, item in enumerate(items, start=4):
-        vals = [
+    for idx, item in enumerate(ordered_items, start=4):
+        values = [
+            normalizar_seccion_comercial(item.get("category")),
+            titulo_comercial_item(item),
             item["code"],
             item["description"],
             item["unit"],
             item["quantity"],
-            item["unit_cost"],
-            f"{item['price_source']} - {item['price_source_detail']}",
+            item["price_source"],
+            item["price_source_detail"],
             item["price_confidence"],
             item["quantity_criterion"],
             item["inclusion_basis"],
             item["considerations"],
         ]
-        for c, val in enumerate(vals, 1):
-            cell = wt.cell(r, c, val)
-            cell.border = border
+        for col, val in enumerate(values, 1):
+            cell = wt.cell(idx, col, val)
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-        wt.cell(r, 5).number_format = '$#,##0.00'
-        if item["price_source"] in {"IA_ESTIMADO", "HISTORICO_IA"}:
-            wt.cell(r, 6).fill = PatternFill("solid", fgColor=orange)
+            cell.border = Border(bottom=thin_gray)
 
-    trace_widths = [14, 70, 10, 11, 16, 48, 17, 50, 50, 55]
-    for idx, width in enumerate(trace_widths, 1):
-        wt.column_dimensions[get_column_letter(idx)].width = width
+        wt.cell(idx, 6).number_format = "0.00"
+        if item["price_source"] in {
+            "IA_ESTIMADO",
+            "HISTORICO_IA",
+            "HISTORICO_EXTERNO",
+        }:
+            wt.cell(idx, 7).fill = PatternFill("solid", fgColor=trace_orange)
+            wt.cell(idx, 8).fill = PatternFill("solid", fgColor=trace_orange)
+
+    trace_widths = [29, 30, 14, 62, 10, 11, 22, 70, 14, 48, 48, 52]
+    for col, width in enumerate(trace_widths, 1):
+        wt.column_dimensions[get_column_letter(col)].width = width
     wt.freeze_panes = "A4"
 
     out = BytesIO()
     wb.save(out)
-    out.seek(0)
-    return out.getvalue()
-
-
-# =========================================================
-# TXT PARA CAPTURA MANUAL EN PLATAFORMA
-# =========================================================
-
-
-def crear_txt(
-    project_code: str,
-    project_data: dict,
-    result: PresupuestoIA,
-    items: list[dict],
-    params: dict,
-    financials: dict,
-    version: int = 1,
-) -> bytes:
-    lines = []
-    lines.append(f"CLIENTE: {project_data['name']}")
-    lines.append(f"CÓDIGO: {project_code}")
-    lines.append(f"VERSIÓN: V{version:02d}")
-    lines.append(f"TIPO: {project_data['project_type']}")
-    lines.append(f"UBICACIÓN: {project_data['location'] or 'No indicada'}")
-    lines.append("")
-    lines.append("ACTIVIDADES PARA CAPTURA MANUAL")
-    lines.append("=" * 72)
-
-    current_category = None
-    for item in items:
-        if item["category"] != current_category:
-            current_category = item["category"]
-            lines.append("")
-            lines.append(current_category)
-            lines.append("-" * len(current_category))
-
-        lines.append("")
-        lines.append(f"SUBPARTIDA: {item['subcategory']}")
-        lines.append(f"ACTIVIDAD: {item['description']}")
-        lines.append(f"CANTIDAD: {item['quantity']:.3f}")
-        lines.append(f"UNIDAD: {item['unit']}")
-        lines.append(f"MARGEN DE VENTA (%): {item['sale_margin_pct']:.2f}")
-        lines.append(f"BENEFICIO ($): {item['benefit_amount']:.2f}")
-        lines.append(f"COSTO ($): {item['unit_cost']:.2f}")
-        lines.append(f"VENTA ($): {item['unit_sale']:.2f}")
-        lines.append(f"COSTO TOTAL ACTIVIDAD ($): {item['direct_amount']:.2f}")
-        lines.append(f"VENTA TOTAL ACTIVIDAD ($): {item['sale_amount']:.2f}")
-
-    lines.append("")
-    lines.append("=" * 72)
-    lines.append("RESUMEN")
-    lines.append(f"COSTO DIRECTO: {financials['direct_cost']:.2f}")
-    lines.append(f"INDIRECTOS ({params['indirect_pct']:.2f}%): {financials['indirect_cost']:.2f}")
-    lines.append(f"UTILIDAD ({params['profit_pct']:.2f}%): {financials['profit']:.2f}")
-    lines.append(f"VENTA ANTES DE IVA: {financials['sale_before_tax']:.2f}")
-    lines.append(f"IVA ({params['iva_pct']:.2f}%): {financials['iva_amount']:.2f}")
-    lines.append(f"TOTAL: {financials['total']:.2f}")
-
-    if result.consideraciones_generales:
-        lines.append("")
-        lines.append("CONSIDERACIONES")
-        for x in result.consideraciones_generales:
-            lines.append(f"- {x}")
-
-    return "\n".join(lines).encode("utf-8-sig")
-
-
-def crear_paquete_zip(project_code: str, excel_bytes: bytes, txt_bytes: bytes) -> bytes:
-    out = BytesIO()
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-        base = project_code
-        zf.writestr(f"{base}/{project_code}_Presupuesto.xlsx", excel_bytes)
-        zf.writestr(f"{base}/{project_code}_Captura_Plataforma.txt", txt_bytes)
     out.seek(0)
     return out.getvalue()
 
@@ -3042,19 +3205,16 @@ def crear_paquete_zip(project_code: str, excel_bytes: bytes, txt_bytes: bytes) -
 
 def dataframe_resumen(items: list[dict]) -> pd.DataFrame:
     rows = []
-    for x in items:
+    for x in ordenar_items_comercialmente(items):
         rows.append(
             {
-                "Partida": x["category"],
-                "Subpartida": x["subcategory"],
-                "Concepto": x["description"],
-                "Unidad": x["unit"],
+                "Sección": normalizar_seccion_comercial(x["category"]),
+                "Concepto": titulo_comercial_item(x),
+                "Descripción": x["description"],
                 "Cantidad": x["quantity"],
-                "Costo unitario": x["unit_cost"],
-                "Venta unitaria": x["unit_sale"],
-                "Importe venta": x["sale_amount"],
-                "Fuente": x["price_source"],
-                "Confianza": x["price_confidence"],
+                "Unidad": x["unit"],
+                "P.U. Venta": x["unit_sale"],
+                "Importe": x["sale_amount"],
             }
         )
     return pd.DataFrame(rows)
@@ -3824,21 +3984,18 @@ def render_admin_database(db: Database):
                         "Eliminar el proyecto borra sus presupuestos, partidas y los conceptos/precios "
                         "creados exclusivamente por ese proyecto."
                     )
-                    project_delete_key = st.text_input(
-                        "Clave de eliminación",
-                        type="password",
+                    confirm_project = st.checkbox(
+                        "Confirmo que deseo eliminar este proyecto completo.",
                         key=f"confirm_delete_project_{project_id}",
                     )
                     if st.button(
                         "Eliminar proyecto completo",
                         key=f"delete_project_button_{project_id}",
+                        disabled=not confirm_project,
                     ):
-                        if not validar_clave_borrado(project_delete_key):
-                            st.error("Clave de eliminación incorrecta o no configurada.")
-                        else:
-                            db.delete_project(project_id)
-                            st.success("Proyecto y su trazabilidad asociada fueron eliminados.")
-                            st.rerun()
+                        db.delete_project(project_id)
+                        st.success("Proyecto y su trazabilidad asociada fueron eliminados.")
+                        st.rerun()
 
     # =====================================================
     # PRESUPUESTOS
@@ -3941,10 +4098,10 @@ def render_admin_database(db: Database):
                     st.markdown("#### Actividades")
                     item_df = pd.DataFrame([
                         {
-                            "Partida": i.get("category") or "",
-                            "Subpartida": i.get("subcategory") or "",
+                            "Sección": i.get("category") or "",
+                            "Concepto": i.get("commercial_title") or i.get("subcategory") or "",
                             "Código": i.get("code") or "",
-                            "Actividad": i.get("description") or "",
+                            "Descripción": i.get("description") or "",
                             "Unidad": i.get("unit") or "",
                             "Cantidad": i.get("quantity"),
                             "Costo unitario": i.get("unit_cost"),
@@ -3972,20 +4129,18 @@ def render_admin_database(db: Database):
                         "Eliminar un presupuesto elimina sus actividades e historial vinculado. "
                         "Si es el único presupuesto del proyecto, también puede eliminarse el proyecto."
                     )
-                    confirm_budget = st.text_input(
-                        "Para eliminar, escriba ELIMINAR PRESUPUESTO",
+                    confirm_budget = st.checkbox(
+                        "Confirmo que deseo eliminar este presupuesto.",
                         key=f"confirm_delete_budget_{budget_id}",
                     )
                     if st.button(
                         "Eliminar presupuesto",
                         key=f"delete_budget_button_{budget_id}",
+                        disabled=not confirm_budget,
                     ):
-                        if confirm_budget.strip().upper() != "ELIMINAR PRESUPUESTO":
-                            st.error("Confirmación incorrecta.")
-                        else:
-                            db.delete_budget(budget_id)
-                            st.success("Presupuesto eliminado.")
-                            st.rerun()
+                        db.delete_budget(budget_id)
+                        st.success("Presupuesto eliminado.")
+                        st.rerun()
 
     # =====================================================
     # FUENTES EXTERNAS
@@ -4104,21 +4259,18 @@ def render_admin_database(db: Database):
                     "Esto no elimina presupuestos históricos. Solo elimina el catálogo externo "
                     "que se utiliza para nuevas búsquedas."
                 )
-                ext_delete_key = st.text_input(
-                    "Clave de eliminación",
-                    type="password",
-                    key="delete_external_cdmx_key",
+                confirm_ext_delete = st.checkbox(
+                    "Confirmo que deseo eliminar el catálogo CDMX importado.",
+                    key="confirm_delete_external_cdmx",
                 )
                 if st.button(
                     "Eliminar catálogo CDMX",
                     key="delete_external_cdmx",
+                    disabled=not confirm_ext_delete,
                 ):
-                    if not validar_clave_borrado(ext_delete_key):
-                        st.error("Clave incorrecta o no configurada.")
-                    else:
-                        db.delete_external_source("CDMX")
-                        st.success("Catálogo CDMX eliminado.")
-                        st.rerun()
+                    db.delete_external_source("CDMX")
+                    st.success("Catálogo CDMX eliminado.")
+                    st.rerun()
 
     # =====================================================
     # MANTENIMIENTO
@@ -4127,14 +4279,8 @@ def render_admin_database(db: Database):
         st.subheader("Mantenimiento")
         st.caption(
             "Herramientas para la etapa de pruebas. Las acciones de esta sección "
-            "afectan datos persistentes y requieren la clave de eliminación."
+            "afectan datos persistentes. Por ahora no se utiliza clave de eliminación."
         )
-
-        if not get_delete_key():
-            st.error(
-                "Falta DELETE_KEY en Streamlit Secrets. "
-                "Las operaciones destructivas permanecerán bloqueadas."
-            )
 
         stats_now = db.stats()
         with st.container(border=True):
@@ -4175,11 +4321,6 @@ def render_admin_database(db: Database):
                 "de precios. La estructura de las tablas se conserva para que la aplicación "
                 "pueda seguir funcionando."
             )
-            wipe_key = st.text_input(
-                "Clave de eliminación",
-                type="password",
-                key="maintenance_wipe_key",
-            )
             wipe_confirm = st.checkbox(
                 "Confirmo que deseo vaciar toda la base de datos de la aplicación.",
                 key="maintenance_wipe_confirm",
@@ -4191,13 +4332,10 @@ def render_admin_database(db: Database):
                 disabled=not wipe_confirm,
                 key="maintenance_wipe_database",
             ):
-                if not validar_clave_borrado(wipe_key):
-                    st.error("Clave de eliminación incorrecta o no configurada.")
-                else:
-                    db.clear_all_data()
-                    st.session_state.pop("generated", None)
-                    st.success("Todos los datos de la aplicación fueron eliminados.")
-                    st.rerun()
+                db.clear_all_data()
+                st.session_state.pop("generated", None)
+                st.success("Todos los datos de la aplicación fueron eliminados.")
+                st.rerun()
 
     # =====================================================
     # EXPORTAR
@@ -4239,22 +4377,16 @@ def render_admin_database(db: Database):
 
 
 # =========================================================
-# AUTENTICACIÓN Y ESTADO DE APLICACIÓN
+# ESTADO DE APLICACIÓN
 # =========================================================
 
 
-authenticator, user_roles = autenticar_usuario()
-is_admin = "admin" in user_roles
-
-st.caption("Generación inicial de presupuestos para remodelación e interiorismo.")
+st.title("Generador de presupuestos")
 
 database_url = get_secret("DATABASE_URL")
 try:
     db, db_error = get_database(database_url, DATABASE_CACHE_VERSION)
 
-    # Protección adicional para despliegues en caliente:
-    # si Streamlit llegara a conservar un objeto Database de una versión
-    # anterior, se limpia la caché de recursos y se crea uno nuevo.
     required_database_methods = (
         "get_latest_project_record",
         "clear_all_data",
@@ -4269,36 +4401,15 @@ try:
         st.cache_resource.clear()
         db, db_error = get_database(database_url, DATABASE_CACHE_VERSION)
 except Exception as exc:
-    st.error("No fue posible conectar con la base PostgreSQL configurada.")
-    st.caption(
-        "Revise DATABASE_URL en Streamlit Secrets y la cadena de conexión de Supabase. "
-        "La aplicación no usará SQLite como respaldo cuando exista una DATABASE_URL."
-    )
+    st.error("No fue posible conectar con la base de datos.")
     st.exception(exc)
     st.stop()
 
 with st.sidebar:
-    st.header("Sesión")
-    display_name = st.session_state.get("name") or st.session_state.get("username") or "Usuario"
-    st.write(str(display_name))
-    role_label = "Administrador" if is_admin else "Usuario"
-    st.caption(role_label)
-    authenticator.logout(
-        button_name="Cerrar sesión",
-        location="sidebar",
-        key="logout_main",
-        use_container_width=True,
-    )
-
-    st.divider()
     st.header("Navegación")
-    sections = ["Generar presupuesto"]
-    if is_admin:
-        sections.append("Catálogo e historial")
-
     section = st.radio(
         "Sección",
-        sections,
+        ["Generar presupuesto", "Catálogo e historial"],
         key="main_section",
         label_visibility="collapsed",
     )
@@ -4306,13 +4417,6 @@ with st.sidebar:
     if section == "Generar presupuesto":
         st.divider()
         st.header("Parámetros")
-
-        model_name = st.text_input(
-            "Modelo",
-            value="gemini-3.6-flash",
-            help="Modelo principal. Se prueban alternativas si no está disponible.",
-            key="model_name",
-        )
 
         indirect_pct = st.number_input(
             "Indirectos (%)",
@@ -4339,99 +4443,25 @@ with st.sidebar:
             key="iva_pct",
         )
         waste_pct = st.number_input(
-            "Desperdicio de referencia (%)",
+            "Desperdicio (%)",
             min_value=0.0,
             max_value=50.0,
             value=5.0,
             step=0.5,
             key="waste_pct",
         )
-        st.caption(
-            "El desperdicio es una referencia para la estimación cuando aplique; "
-            "no se suma de forma global."
-        )
 
-        st.divider()
-        st.subheader("Estado de base interna")
-        try:
-            stats = db.stats()
-            st.write(f"Proyectos: {stats['projects']}")
-            st.write(f"Presupuestos: {stats['budgets']}")
-            st.write(f"Conceptos: {stats['concepts']}")
-        except Exception:
-            st.write("Sin estadísticas disponibles.")
-
-        if db.persistent:
-            st.success("PostgreSQL conectado.")
-        else:
-            st.warning(
-                "SQLite local activo. Úselo solo para desarrollo; en Streamlit Community Cloud "
-                "configure DATABASE_URL para persistencia."
+        with st.expander("Configuración"):
+            model_name = st.text_input(
+                "Modelo Gemini",
+                value="gemini-3.6-flash",
+                key="model_name",
             )
 
-        if not get_api_key_runtime():
-            st.error("Falta GEMINI_API_KEY en Streamlit Secrets.")
-
-        try:
-            sidebar_cdmx = db.get_active_external_catalog("CDMX")
-            if sidebar_cdmx:
-                st.caption(
-                    f"Referencia externa: CDMX {sidebar_cdmx['version_label']} "
-                    f"· {int(sidebar_cdmx['concept_count'] or 0):,} conceptos"
-                )
-            else:
-                st.caption(
-                    "Referencia CDMX: sin catálogo. Un administrador puede cargarlo "
-                    "desde Catálogo e historial → Fuentes externas."
-                )
-        except Exception:
-            pass
-
         st.divider()
-        with st.expander("Corrección de última carga"):
-            st.caption(
-                "Permite retirar el último proyecto guardado si una prueba se cargó "
-                "por error. No requiere rol administrador, pero sí la clave de eliminación."
-            )
-            try:
-                latest_sidebar = db.get_latest_project_record()
-            except Exception as exc:
-                latest_sidebar = None
-                st.error(f"No fue posible consultar el último proyecto: {exc}")
-
-            if latest_sidebar:
-                st.write(
-                    f"**{latest_sidebar.get('code') or ''} — "
-                    f"{latest_sidebar.get('name') or ''}**"
-                )
-                if latest_sidebar.get("latest_total") is not None:
-                    st.caption(
-                        f"Total: {formato_moneda(float(latest_sidebar['latest_total']))}"
-                    )
-                last_delete_key = st.text_input(
-                    "Clave",
-                    type="password",
-                    key="sidebar_last_delete_key",
-                )
-                if st.button(
-                    "Borrar último proyecto y trazabilidad",
-                    key="sidebar_delete_last_project",
-                    use_container_width=True,
-                ):
-                    if not validar_clave_borrado(last_delete_key):
-                        st.error("Clave incorrecta o no configurada.")
-                    else:
-                        current = st.session_state.get("generated")
-                        db.delete_project(latest_sidebar["id"])
-                        if (
-                            current
-                            and current.get("project_id") == latest_sidebar["id"]
-                        ):
-                            st.session_state.pop("generated", None)
-                        st.success("Último proyecto eliminado por completo.")
-                        st.rerun()
-            else:
-                st.caption("No hay proyectos guardados.")
+        if st.button("Reiniciar página", use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
 
 # =========================================================
 # BASE INTERNA
@@ -4439,9 +4469,6 @@ with st.sidebar:
 
 
 if section == "Catálogo e historial":
-    if not is_admin:
-        st.error("No tiene permisos para administrar el catálogo e historial.")
-        st.stop()
     render_admin_database(db)
     st.stop()
 
@@ -4451,82 +4478,61 @@ if section == "Catálogo e historial":
 # =========================================================
 
 
-DESCRIPTION_EXAMPLE = """Ejemplo de formato esperado:
-
-Casa habitación.
+DESCRIPTION_EXAMPLE = """Ejemplo:
 
 SEGUNDA PLANTA
 Recámara principal de aproximadamente 4.20 x 3.80 m.
 - Retiro de piso laminado existente.
 - Colocación de piso nuevo.
 - Reparación y pintura de muros.
-- Sustitución de luminarias.
 
 AZOTEA
 Área aproximada de 9 x 4 m.
-- Retiro de material suelto y limpieza.
-- Preparación de superficie.
+- Limpieza y preparación de superficie.
 - Impermeabilización completa.
-- Revisión de bajadas pluviales existentes.
-
-ESCALERA
-- Reparación de acabados dañados.
-- Pintura de muros y plafón.
+- Revisión de bajadas pluviales.
 """
 
-GUIDE_EXAMPLE = """Ejemplo de criterios generales:
-
-- Considerar acabados de gama media.
-- Incluir protección con plástico y cartón engomado en las zonas de tránsito.
-- Considerar retiro de desperdicios y limpieza final.
-- El edificio permite trabajos de lunes a viernes de 09:00 a 18:00.
-- No considerar jardinería.
-- Cuando no exista una especificación definitiva, utilizar una alternativa
-  comercial de gama media y señalarla como consideración.
+DEFAULT_GUIDE_TEXT = """- Considerar protección básica de las áreas de trabajo y zonas de tránsito.
+- Incluir limpieza durante los trabajos y limpieza final.
+- Considerar retiro y disposición de residuos cuando corresponda.
+- Considerar herramienta menor, consumibles y elementos auxiliares necesarios.
+- En pintura, considerar preparación básica, resanes menores, sellador cuando sea necesario y dos manos de pintura.
+- En instalaciones y elementos nuevos, considerar suministro, colocación, fijaciones, conexiones y pruebas básicas cuando correspondan.
+- Considerar materiales y acabados de calidad media cuando no exista una especificación concreta.
+- No asumir trabajos o dimensiones no indicados; señalar los datos importantes que falten.
 """
 
-REVISION_EXAMPLE = """Ejemplo:
-
-El presupuesto no contempló la impermeabilización completa de la azotea.
-Agregar la preparación de superficie, reparación puntual de fisuras y el
-sistema de impermeabilización para el área de 9 x 4 m indicada en la
-descripción original.
-
-Además, la cancelería de la segunda planta debe contemplarse en aluminio
-línea pesada y cristal templado, por lo que esa actividad debe actualizarse
-de forma completa.
+ADJUSTMENT_EXAMPLE = """Ejemplos:
+- Falta considerar limpieza fina al terminar la obra.
+- El precio de la pintura me parece muy bajo, revísalo.
+- La cantidad de impermeabilización debe ser mayor.
+- Cambia la cancelería a aluminio línea pesada con cristal templado.
 """
+
+
+def volver_a_entrada():
+    """Regresa al formulario conservando los datos capturados."""
+    st.session_state.pop("generated", None)
+    st.rerun()
 
 
 if "generated" not in st.session_state:
+    if "guide_text" not in st.session_state:
+        st.session_state["guide_text"] = DEFAULT_GUIDE_TEXT
+
     with st.form("form_proyecto"):
-        simulation_mode = st.toggle(
-            "Simulación",
-            value=False,
-            help=(
-                "Genera resultados y archivos normalmente, pero no guarda nuevos "
-                "proyectos, presupuestos, conceptos ni precios."
-            ),
-            key="simulation_mode",
-        )
-        if simulation_mode:
-            st.info("Modo simulación activo. Esta corrida no escribirá en la base interna.")
-
-        st.subheader("Datos del proyecto")
-
         f1, f2 = st.columns(2)
         with f1:
             client_name = st.text_input(
                 "Nombre del cliente",
-                value=st.session_state.get("client_name", ""),
                 placeholder="Ej. Desarrollos de la Vega",
                 key="client_name",
             )
         with f2:
             location = st.text_input(
                 "Ubicación",
-                value=st.session_state.get("project_location", ""),
-                placeholder="Ej. Farallón, Álvaro Obregón, CDMX",
+                placeholder="Ej. Coyoacán, CDMX",
                 key="project_location",
             )
 
@@ -4546,30 +4552,17 @@ if "generated" not in st.session_state:
             key="project_type",
         )
 
-        st.markdown("**Descripción general de trabajos**")
-        st.caption(
-            "Describa zonas, medidas conocidas, estado actual, actividades solicitadas "
-            "y condiciones relevantes. Las dimensiones se escriben directamente aquí."
-        )
         description = st.text_area(
             "Descripción general de trabajos",
             placeholder=DESCRIPTION_EXAMPLE,
             height=430,
             key="project_description",
-            label_visibility="collapsed",
         )
 
-        st.markdown("**Texto guía**")
-        st.caption(
-            "Criterios que deben aplicarse al presupuesto en general: nivel de acabado, "
-            "exclusiones, restricciones, protecciones, horarios o instrucciones especiales."
-        )
         guide_text = st.text_area(
             "Texto guía",
-            placeholder=GUIDE_EXAMPLE,
             height=300,
             key="guide_text",
-            label_visibility="collapsed",
         )
 
         generate = st.form_submit_button(
@@ -4583,15 +4576,12 @@ if "generated" not in st.session_state:
         if not api_key:
             st.error("Falta GEMINI_API_KEY en Streamlit Secrets.")
             st.stop()
-
         if not client_name.strip():
             st.error("Ingrese el nombre del cliente.")
             st.stop()
-
         if not location.strip():
             st.error("Ingrese la ubicación.")
             st.stop()
-
         if not description.strip():
             st.error("Ingrese la descripción general de los trabajos.")
             st.stop()
@@ -4603,8 +4593,6 @@ if "generated" not in st.session_state:
             "waste_pct": float(waste_pct),
         }
         project_data = {
-            # Se conserva la llave "name" por compatibilidad con la base y el Excel.
-            # A partir de V7 representa el nombre del cliente.
             "name": client_name.strip(),
             "project_type": project_type,
             "location": location.strip(),
@@ -4614,7 +4602,7 @@ if "generated" not in st.session_state:
             "guide_text": guide_text.strip(),
         }
 
-        with st.spinner("Generando presupuesto inicial..."):
+        with st.spinner("Generando presupuesto..."):
             try:
                 result = generar_presupuesto_ia(
                     api_key=api_key,
@@ -4622,76 +4610,47 @@ if "generated" not in st.session_state:
                     project_data=project_data,
                     params=params,
                 )
-
                 items = resolver_items(db, result, project_data, params)
                 if not items:
                     raise RuntimeError("La IA no generó actividades utilizables.")
 
                 financials = calcular_financieros(items, params)
-                base_code = db.next_project_code(
+                provisional_code = db.next_project_code(
                     project_data["name"],
                     project_data["location"],
                 )
-                project_code = f"SIM-{base_code}" if simulation_mode else base_code
-                version = 1
-                file_code = f"{project_code}-V{version:02d}"
-
                 excel_bytes = crear_excel(
-                    project_code=project_code,
+                    project_code=provisional_code,
                     project_data=project_data,
                     result=result,
                     items=items,
                     params=params,
-                    version=version,
+                    version=1,
                 )
-                txt_bytes = crear_txt(
-                    project_code=project_code,
-                    project_data=project_data,
-                    result=result,
-                    items=items,
-                    params=params,
-                    financials=financials,
-                    version=version,
-                )
-                zip_bytes = crear_paquete_zip(file_code, excel_bytes, txt_bytes)
-
-                project_id = None
-                budget_id = None
-                if not simulation_mode:
-                    project_id, budget_id = db.save_generation(
-                        project_code=project_code,
-                        project_data=project_data,
-                        result=result,
-                        items=items,
-                        params=params,
-                        financials=financials,
-                    )
 
                 st.session_state["generated"] = {
-                    "project_id": project_id,
-                    "budget_id": budget_id,
-                    "simulation": bool(simulation_mode),
-                    "project_code": project_code,
-                    "file_code": file_code,
-                    "version": version,
+                    "project_id": None,
+                    "budget_id": None,
+                    "saved": False,
+                    "pending_revision": False,
+                    "project_code": provisional_code,
+                    "version": 1,
                     "project_data": project_data,
                     "params": params,
                     "result": result.model_dump(),
                     "items": items,
                     "financials": financials,
                     "excel_bytes": excel_bytes,
-                    "txt_bytes": txt_bytes,
-                    "zip_bytes": zip_bytes,
                     "revision_history": [],
+                    "pending_revision_notes": [],
                 }
                 st.rerun()
-
             except Exception as exc:
                 st.exception(exc)
 
 
 # =========================================================
-# RESULTADO FINAL Y REVISIONES ESTRUCTURALES
+# RESULTADO
 # =========================================================
 
 
@@ -4701,22 +4660,15 @@ else:
     items = g["items"]
     financials = g["financials"]
     version = int(g.get("version") or 1)
-
-    if g.get("simulation"):
-        st.warning("SIMULACIÓN: esta generación no fue guardada en la base interna.")
+    saved = bool(g.get("saved"))
 
     st.subheader(g["project_code"])
-    st.caption(f"Versión V{version:02d}")
-    st.write(result.alcance_resumido)
-
-    # -----------------------------------------------------
-    # Datos originales siempre visibles y bloqueados
-    # -----------------------------------------------------
-    st.subheader("Datos originales del proyecto")
-    st.caption(
-        "Estos datos permanecen bloqueados durante las revisiones para evitar que "
-        "una nueva versión cambie accidentalmente la definición original del proyecto."
-    )
+    if saved:
+        st.caption(f"Guardado · V{version:02d}")
+    elif g.get("project_id"):
+        st.caption(f"Cambios sin guardar · próxima versión V{version:02d}")
+    else:
+        st.caption("Borrador sin guardar")
 
     p1, p2, p3 = st.columns(3)
     with p1:
@@ -4724,158 +4676,106 @@ else:
             "Cliente",
             value=g["project_data"]["name"],
             disabled=True,
-            key=f"locked_client_{version}",
+            key=f"locked_client_{version}_{saved}",
         )
     with p2:
         st.text_input(
             "Ubicación",
             value=g["project_data"]["location"],
             disabled=True,
-            key=f"locked_location_{version}",
+            key=f"locked_location_{version}_{saved}",
         )
     with p3:
         st.text_input(
             "Tipo de obra",
             value=g["project_data"]["project_type"],
             disabled=True,
-            key=f"locked_type_{version}",
+            key=f"locked_type_{version}_{saved}",
         )
 
     st.text_area(
         "Descripción general de trabajos",
         value=g["project_data"]["description"],
-        height=260,
+        height=220,
         disabled=True,
-        key=f"locked_description_{version}",
+        key=f"locked_description_{version}_{saved}",
     )
     st.text_area(
         "Texto guía",
-        value=g["project_data"]["guide_text"] or "Sin texto guía adicional.",
-        height=170,
+        value=g["project_data"]["guide_text"] or "",
+        height=160,
         disabled=True,
-        key=f"locked_guide_{version}",
+        key=f"locked_guide_{version}_{saved}",
     )
 
-    # -----------------------------------------------------
-    # Resumen económico
-    # -----------------------------------------------------
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Costo directo", formato_moneda(financials["direct_cost"]))
-    m2.metric("Indirectos", formato_moneda(financials["indirect_cost"]))
-    m3.metric("Utilidad", formato_moneda(financials["profit"]))
-    m4.metric("Total con IVA", formato_moneda(financials["total"]))
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Presupuesto de obra", formato_moneda(financials["sale_before_tax"]))
+    m2.metric("IVA", formato_moneda(financials["iva_amount"]))
+    m3.metric("Total", formato_moneda(financials["total"]))
 
-    st.subheader("Presupuesto generado")
+    with st.expander("Detalle interno"):
+        i1, i2, i3 = st.columns(3)
+        i1.metric("Costo directo", formato_moneda(financials["direct_cost"]))
+        i2.metric("Indirectos", formato_moneda(financials["indirect_cost"]))
+        i3.metric("Utilidad", formato_moneda(financials["profit"]))
+
     df = dataframe_resumen(items)
     st.dataframe(
         df,
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Cantidad": st.column_config.NumberColumn(format="%.3f"),
-            "Costo unitario": st.column_config.NumberColumn(format="$ %.2f"),
-            "Venta unitaria": st.column_config.NumberColumn(format="$ %.2f"),
-            "Importe venta": st.column_config.NumberColumn(format="$ %.2f"),
+            "Cantidad": st.column_config.NumberColumn(format="%.2f"),
+            "P.U. Venta": st.column_config.NumberColumn(format="$ %.2f"),
+            "Importe": st.column_config.NumberColumn(format="$ %.2f"),
         },
     )
 
-    source_counts = df["Fuente"].value_counts().to_dict() if not df.empty else {}
-    source_text = " | ".join(f"{k}: {v}" for k, v in source_counts.items())
-    if source_text:
-        st.caption(f"Origen de precios: {source_text}")
-
     if result.consideraciones_generales or result.datos_faltantes:
         with st.expander("Consideraciones"):
-            if result.consideraciones_generales:
-                st.markdown("**Consideraciones generales**")
-                for item in result.consideraciones_generales:
-                    st.write(f"- {item}")
+            for item in result.consideraciones_generales:
+                st.write(f"- {item}")
             if result.datos_faltantes:
-                st.markdown("**Datos no confirmados**")
+                st.markdown("**Datos por confirmar**")
                 for item in result.datos_faltantes:
                     st.write(f"- {item}")
 
-    # -----------------------------------------------------
-    # Archivos
-    # -----------------------------------------------------
-    st.subheader("Archivos")
-    file_code = g.get("file_code") or f"{g['project_code']}-V{version:02d}"
+    file_status = f"V{version:02d}" if g.get("project_id") else "BORRADOR"
     st.download_button(
-        "Descargar paquete",
-        data=g["zip_bytes"],
-        file_name=f"{file_code}.zip",
-        mime="application/zip",
+        "Descargar Excel",
+        data=g["excel_bytes"],
+        file_name=f"{g['project_code']}-{file_status}_Presupuesto.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
-        type="primary",
     )
 
-    with st.expander("Descargas individuales"):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button(
-                "Descargar Excel",
-                data=g["excel_bytes"],
-                file_name=f"{file_code}_Presupuesto.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        with c2:
-            st.download_button(
-                "Descargar TXT",
-                data=g["txt_bytes"],
-                file_name=f"{file_code}_Captura_Plataforma.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
-
     # -----------------------------------------------------
-    # Historial breve de revisiones de la sesión
-    # -----------------------------------------------------
-    revision_history = g.get("revision_history") or []
-    if revision_history:
-        with st.expander("Historial de revisiones de esta sesión"):
-            for rev in revision_history:
-                st.markdown(f"**V{int(rev['version']):02d} — {rev['summary']}**")
-                st.caption(rev["request"])
-                for change in rev.get("changes") or []:
-                    st.write(f"- {change}")
-
-    # -----------------------------------------------------
-    # Revisión estructural
+    # Ajuste sencillo con IA
     # -----------------------------------------------------
     st.divider()
-    st.subheader("Revisión estructural del presupuesto")
-    st.warning(
-        "Utilice esta opción únicamente para cambios importantes de alcance: "
-        "actividades omitidas, especificaciones que cambian una partida completa, "
-        "nuevas zonas o trabajos que requieren agregar, sustituir o eliminar conceptos."
-    )
-    st.markdown(
-        "**No utilice esta herramienta para cambios menores de precio, cantidad o redacción. "
-        "Esas correcciones deben realizarse directamente en el Excel.**"
-    )
+    st.subheader("Ajustar con IA")
 
-    revision_request = st.text_area(
-        "Cambios estructurales solicitados",
-        placeholder=REVISION_EXAMPLE,
-        height=260,
-        key=f"revision_request_v{version}",
+    adjustment_request = st.text_area(
+        "¿Qué quieres revisar, agregar o cambiar?",
+        placeholder=ADJUSTMENT_EXAMPLE,
+        height=180,
+        key=f"adjustment_request_{version}_{saved}",
     )
 
     if st.button(
-        "Generar nueva versión",
+        "Aplicar ajuste",
         type="primary",
         use_container_width=True,
-        key=f"generate_revision_v{version}",
+        key=f"apply_adjustment_{version}_{saved}",
     ):
-        if not revision_request.strip():
-            st.error("Describa los cambios estructurales que desea realizar.")
+        if not adjustment_request.strip():
+            st.error("Escriba el cambio que desea realizar.")
         else:
             api_key = get_api_key_runtime()
             if not api_key:
                 st.error("Falta GEMINI_API_KEY en Streamlit Secrets.")
             else:
-                with st.spinner("Analizando cambios y generando nueva versión..."):
+                with st.spinner("Aplicando ajuste..."):
                     try:
                         revision = revisar_presupuesto_ia(
                             api_key=api_key,
@@ -4884,7 +4784,7 @@ else:
                             params=g["params"],
                             current_result=result,
                             current_items=items,
-                            revision_request=revision_request.strip(),
+                            revision_request=adjustment_request.strip(),
                         )
 
                         revised_result, revised_items, change_log = aplicar_revision_estructural(
@@ -4895,106 +4795,87 @@ else:
                             project_data=g["project_data"],
                             params=g["params"],
                         )
-
                         revised_financials = calcular_financieros(
                             revised_items,
                             g["params"],
                         )
 
-                        if g.get("simulation"):
-                            new_budget_id = None
-                            new_version = version + 1
+                        # Si el proyecto ya existe en la base, el ajuste queda como
+                        # borrador de la siguiente versión hasta que el usuario lo guarde.
+                        if g.get("project_id"):
+                            target_version = version if g.get("pending_revision") else version + 1
+                            pending_revision = True
                         else:
-                            if not g.get("project_id") or not g.get("budget_id"):
-                                raise RuntimeError(
-                                    "La generación actual no tiene referencias persistentes válidas."
-                                )
-                            new_budget_id, new_version = db.save_revision(
-                                project_id=g["project_id"],
-                                parent_budget_id=g["budget_id"],
-                                result=revised_result,
-                                items=revised_items,
-                                params=g["params"],
-                                financials=revised_financials,
-                                revision_instruction=revision_request.strip(),
-                            )
+                            target_version = 1
+                            pending_revision = False
 
-                        new_file_code = f"{g['project_code']}-V{new_version:02d}"
                         excel_bytes = crear_excel(
                             project_code=g["project_code"],
                             project_data=g["project_data"],
                             result=revised_result,
                             items=revised_items,
                             params=g["params"],
-                            version=new_version,
-                        )
-                        txt_bytes = crear_txt(
-                            project_code=g["project_code"],
-                            project_data=g["project_data"],
-                            result=revised_result,
-                            items=revised_items,
-                            params=g["params"],
-                            financials=revised_financials,
-                            version=new_version,
-                        )
-                        zip_bytes = crear_paquete_zip(
-                            new_file_code,
-                            excel_bytes,
-                            txt_bytes,
+                            version=target_version,
                         )
 
                         history = list(g.get("revision_history") or [])
                         history.append(
                             {
-                                "version": new_version,
-                                "request": revision_request.strip(),
+                                "request": adjustment_request.strip(),
                                 "summary": revision.resumen_revision,
                                 "changes": change_log,
                             }
                         )
+                        pending_notes = list(g.get("pending_revision_notes") or [])
+                        if g.get("project_id"):
+                            pending_notes.append(adjustment_request.strip())
 
                         g.update(
                             {
-                                "budget_id": new_budget_id if not g.get("simulation") else g.get("budget_id"),
-                                "version": new_version,
-                                "file_code": new_file_code,
+                                "saved": False,
+                                "pending_revision": pending_revision,
+                                "version": target_version,
                                 "result": revised_result.model_dump(),
                                 "items": revised_items,
                                 "financials": revised_financials,
                                 "excel_bytes": excel_bytes,
-                                "txt_bytes": txt_bytes,
-                                "zip_bytes": zip_bytes,
                                 "revision_history": history,
+                                "pending_revision_notes": pending_notes,
                             }
                         )
                         st.session_state["generated"] = g
-                        st.success(f"Nueva versión V{new_version:02d} generada.")
                         st.rerun()
-
                     except Exception as exc:
                         st.exception(exc)
 
+    history = g.get("revision_history") or []
+    if history:
+        with st.expander("Ajustes realizados"):
+            for i, rev in enumerate(history, start=1):
+                st.markdown(f"**Ajuste {i}: {rev['summary']}**")
+                st.caption(rev["request"])
+                for change in rev.get("changes") or []:
+                    st.write(f"- {change}")
+
     # -----------------------------------------------------
-    # Acciones persistentes / destructivas
+    # Acciones del proyecto
     # -----------------------------------------------------
     st.divider()
-    st.subheader("Acciones sobre esta generación")
+    a1, a2, a3 = st.columns(3)
 
-    if g.get("simulation"):
-        st.caption(
-            "Esta corrida sigue siendo una simulación. Puede guardar la versión actual "
-            "como proyecto real sin volver a ejecutar Gemini."
+    with a1:
+        save_label = "Guardado en base" if saved else (
+            "Guardar nueva versión" if g.get("project_id") else "Guardar en base"
         )
-
-        ac1, ac2 = st.columns(2)
-        with ac1:
-            if st.button(
-                "Guardar versión actual en la base de datos",
-                type="primary",
-                use_container_width=True,
-                key=f"promote_simulation_v{version}",
-            ):
-                try:
+        if st.button(
+            save_label,
+            type="primary" if not saved else "secondary",
+            use_container_width=True,
+            disabled=saved,
+            key=f"save_project_{version}_{saved}",
+        ):
+            try:
+                if not g.get("project_id"):
                     real_code = db.next_project_code(
                         g["project_data"]["name"],
                         g["project_data"]["location"],
@@ -5007,85 +4888,74 @@ else:
                         params=g["params"],
                         financials=financials,
                     )
-
-                    # Al persistir una simulación se convierte en V01 real. Las
-                    # revisiones previas de simulación no habían sido persistidas.
                     real_version = 1
-                    real_file_code = f"{real_code}-V{real_version:02d}"
-                    excel_bytes = crear_excel(
-                        project_code=real_code,
-                        project_data=g["project_data"],
-                        result=result,
-                        items=items,
-                        params=g["params"],
-                        version=real_version,
-                    )
-                    txt_bytes = crear_txt(
-                        project_code=real_code,
-                        project_data=g["project_data"],
+                else:
+                    budget_id, real_version = db.save_revision(
+                        project_id=g["project_id"],
+                        parent_budget_id=g["budget_id"],
                         result=result,
                         items=items,
                         params=g["params"],
                         financials=financials,
-                        version=real_version,
+                        revision_instruction=(
+                            "\n\n".join(g.get("pending_revision_notes") or [])
+                            or (history[-1]["request"] if history else "Ajuste del presupuesto")
+                        ),
                     )
-                    zip_bytes = crear_paquete_zip(
-                        real_file_code,
-                        excel_bytes,
-                        txt_bytes,
-                    )
+                    project_id = g["project_id"]
+                    real_code = g["project_code"]
 
-                    g.update(
-                        {
-                            "project_id": project_id,
-                            "budget_id": budget_id,
-                            "simulation": False,
-                            "project_code": real_code,
-                            "file_code": real_file_code,
-                            "version": real_version,
-                            "excel_bytes": excel_bytes,
-                            "txt_bytes": txt_bytes,
-                            "zip_bytes": zip_bytes,
-                            "revision_history": [],
-                        }
-                    )
-                    st.session_state["generated"] = g
-                    st.success("La versión actual fue guardada como proyecto real.")
-                    st.rerun()
-                except Exception as exc:
-                    st.exception(exc)
+                excel_bytes = crear_excel(
+                    project_code=real_code,
+                    project_data=g["project_data"],
+                    result=result,
+                    items=items,
+                    params=g["params"],
+                    version=real_version,
+                )
 
-        with ac2:
-            if st.button(
-                "Descartar simulación",
-                use_container_width=True,
-                key=f"discard_simulation_v{version}",
-            ):
-                st.session_state.pop("generated", None)
+                clean_items = []
+                for saved_item in items:
+                    cleaned = dict(saved_item)
+                    cleaned.pop("record_new_price", None)
+                    clean_items.append(cleaned)
+
+                g.update(
+                    {
+                        "project_id": project_id,
+                        "budget_id": budget_id,
+                        "project_code": real_code,
+                        "version": real_version,
+                        "saved": True,
+                        "pending_revision": False,
+                        "items": clean_items,
+                        "excel_bytes": excel_bytes,
+                        "pending_revision_notes": [],
+                    }
+                )
+                st.session_state["generated"] = g
                 st.rerun()
+            except Exception as exc:
+                st.exception(exc)
 
-    else:
-        st.caption(
-            "Las revisiones crean nuevas versiones y conservan las anteriores. "
-            "La siguiente acción elimina únicamente la versión actualmente mostrada."
-        )
-        current_delete_key = st.text_input(
-            "Clave de eliminación",
-            type="password",
-            key=f"current_generation_delete_key_v{version}",
-        )
-
+    with a2:
         if st.button(
-            "Eliminar esta versión de la base",
+            "Editar entrada inicial",
             use_container_width=True,
-            key=f"delete_current_generation_v{version}",
+            key=f"edit_initial_{version}_{saved}",
         ):
-            if not validar_clave_borrado(current_delete_key):
-                st.error("Clave incorrecta o no configurada.")
-            elif not g.get("project_id") or not g.get("budget_id"):
-                st.error("No se encontró la referencia guardada de esta versión.")
-            else:
-                db.delete_generation(g["project_id"], g["budget_id"])
+            volver_a_entrada()
+
+    with a3:
+        if st.button(
+            "Eliminar proyecto",
+            use_container_width=True,
+            key=f"delete_project_result_{version}_{saved}",
+        ):
+            try:
+                if g.get("project_id"):
+                    db.delete_project(g["project_id"])
                 st.session_state.pop("generated", None)
-                st.success("La versión actual fue eliminada.")
                 st.rerun()
+            except Exception as exc:
+                st.exception(exc)
