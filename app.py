@@ -141,15 +141,18 @@ def limpiar_codigo(codigo: str, fallback: str) -> str:
 
 
 SECCIONES_COMERCIALES_PREFERENTES = [
+    # Orden de presentación basado en la secuencia normal de preparación y obra.
     "PROYECTO Y TRÁMITES",
+    "PRELIMINARES Y PROTECCIONES",
     "DESMONTAJES Y DEMOLICIONES",
     "ALBAÑILERÍA Y ESTRUCTURA",
-    "INSTALACIONES ELÉCTRICAS",
     "INSTALACIONES HIDROSANITARIAS",
+    "INSTALACIONES ELÉCTRICAS",
     "ACABADOS Y RECUBRIMIENTOS",
     "CARPINTERÍA",
     "CANCELERÍA Y HERRERÍA",
     "EXTERIORES Y AMENIDADES",
+    "OTROS TRABAJOS",
     "LIMPIEZA Y ENTREGA",
 ]
 
@@ -157,6 +160,10 @@ SECCION_ALIASES = {
     "PROYECTO Y TRAMITES": "PROYECTO Y TRÁMITES",
     "PROYECTO": "PROYECTO Y TRÁMITES",
     "TRAMITES": "PROYECTO Y TRÁMITES",
+    "PRELIMINARES": "PRELIMINARES Y PROTECCIONES",
+    "PRELIMINARES Y PROTECCIONES": "PRELIMINARES Y PROTECCIONES",
+    "PROTECCIONES": "PRELIMINARES Y PROTECCIONES",
+    "PREPARACION": "PRELIMINARES Y PROTECCIONES",
     "PREPARACION Y DEMOLICIONES": "DESMONTAJES Y DEMOLICIONES",
     "PRELIMINARES Y DEMOLICIONES": "DESMONTAJES Y DEMOLICIONES",
     "DEMOLICIONES": "DESMONTAJES Y DEMOLICIONES",
@@ -178,6 +185,7 @@ SECCION_ALIASES = {
     "EXTERIORES": "EXTERIORES Y AMENIDADES",
     "EXTERIORES Y AMENIDADES": "EXTERIORES Y AMENIDADES",
     "LIMPIEZA": "LIMPIEZA Y ENTREGA",
+    "LIMPIEZA FINAL": "LIMPIEZA Y ENTREGA",
     "LIMPIEZA Y ENTREGA": "LIMPIEZA Y ENTREGA",
 }
 
@@ -200,9 +208,40 @@ def titulo_comercial_item(item: dict) -> str:
     description = str(item.get("description") or "").strip()
     if not description:
         return "Concepto"
-    # Fallback corto para datos históricos creados antes de V10.
     first = re.split(r"[.;:]", description, maxsplit=1)[0].strip()
     return first[:80] or description[:80]
+
+
+def seccion_ejecucion_item(item: dict) -> str:
+    """Corrige clasificaciones que afectan el orden real de ejecución."""
+    category = normalizar_seccion_comercial(item.get("category"))
+    context = normalizar_texto(
+        " ".join(
+            str(item.get(k) or "")
+            for k in ("category", "subcategory", "commercial_title", "description")
+        )
+    ).upper()
+
+    # Las protecciones son trabajos PREVIOS y nunca deben quedar con la limpieza final.
+    prelim_keywords = (
+        "PROTECCION", "PROTECCIONES", "PROTEGER", "CUBRIR PISOS",
+        "CUBRIR AREAS", "TAPIALES", "TAPIAL", "INSTALACION PROVISIONAL",
+        "TRAZO", "REPLANTEO", "PRELIMINAR",
+    )
+    if any(k in context for k in prelim_keywords):
+        return "PRELIMINARES Y PROTECCIONES"
+
+    # La limpieza fina/final sí permanece al cierre de la obra.
+    final_keywords = (
+        "LIMPIEZA FINA", "LIMPIEZA FINAL", "LIMPIEZA DE ENTREGA",
+        "ENTREGA FINAL", "ASEO FINAL",
+    )
+    if any(k in context for k in final_keywords):
+        return "LIMPIEZA Y ENTREGA"
+
+    # Datos viejos que mezclaban 'Prelim. y Limpieza': si no son claramente
+    # limpieza final, priorizamos preliminares únicamente cuando el texto lo indica.
+    return category
 
 
 def ordenar_items_comercialmente(items: list[dict]) -> list[dict]:
@@ -211,40 +250,43 @@ def ordenar_items_comercialmente(items: list[dict]) -> list[dict]:
     }
     first_seen = {}
     for idx, item in enumerate(items):
-        section = normalizar_seccion_comercial(item.get("category"))
+        section = seccion_ejecucion_item(item)
         first_seen.setdefault(section, idx)
 
     def key(pair):
         idx, item = pair
-        section = normalizar_seccion_comercial(item.get("category"))
+        section = seccion_ejecucion_item(item)
         if section in preferred:
             return (0, preferred[section], idx)
-        return (1, first_seen.get(section, idx), idx)
+        # Secciones no previstas van antes de la limpieza final, respetando
+        # el orden en que fueron propuestas por la IA.
+        return (0, preferred.get("OTROS TRABAJOS", 10), first_seen.get(section, idx), idx)
 
     ordered = [dict(item) for _, item in sorted(enumerate(items), key=key)]
     for item in ordered:
-        item["category"] = normalizar_seccion_comercial(item.get("category"))
+        item["category"] = seccion_ejecucion_item(item)
     return ordered
 
 
 def nombre_partida_excel(section: str) -> str:
-    """Convierte una sección interna en un nombre breve de partida para el Excel."""
+    """Nombre breve de partida para el Excel, en orden de ejecución."""
     section = normalizar_seccion_comercial(section)
     preferred_names = {
         "PROYECTO Y TRÁMITES": "Trámites",
+        "PRELIMINARES Y PROTECCIONES": "Preliminares y Protecciones",
         "DESMONTAJES Y DEMOLICIONES": "Desmontajes y Demoliciones",
         "ALBAÑILERÍA Y ESTRUCTURA": "Albañilería y Estructura",
-        "INSTALACIONES ELÉCTRICAS": "Instalaciones Eléctricas",
         "INSTALACIONES HIDROSANITARIAS": "Instalaciones Hidrosanitarias",
+        "INSTALACIONES ELÉCTRICAS": "Instalaciones Eléctricas",
         "ACABADOS Y RECUBRIMIENTOS": "Acabados",
         "CARPINTERÍA": "Carpintería",
         "CANCELERÍA Y HERRERÍA": "Cancelería y Herrería",
         "EXTERIORES Y AMENIDADES": "Exteriores y Amenidades",
-        "LIMPIEZA Y ENTREGA": "Prelim. y Limpieza",
+        "LIMPIEZA Y ENTREGA": "Limpieza y Entrega",
+        "OTROS TRABAJOS": "Otros Trabajos",
     }
     if section in preferred_names:
         return preferred_names[section]
-    # Mantener nombres adicionales creados por Gemini, pero en formato legible.
     return section.title()
 
 
@@ -273,7 +315,7 @@ def estructura_partidas_excel(items: list[dict]) -> list[dict]:
     output = []
 
     for item in ordered:
-        section = normalizar_seccion_comercial(item.get("category"))
+        section = seccion_ejecucion_item(item)
 
         if section not in section_numbers:
             section_numbers[section] = len(section_numbers) + 1
@@ -2058,7 +2100,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-08-21-v11-costos-empresa"
+DATABASE_CACHE_VERSION = "2026-08-21-v11.1-orden-excel"
 
 
 @st.cache_resource(show_spinner=False)
@@ -2255,6 +2297,7 @@ REVISIÓN DEL ALCANCE
 PARTIDAS Y SUBPARTIDAS
 5. Usa preferentemente, cuando correspondan:
    - PROYECTO Y TRÁMITES
+   - PRELIMINARES Y PROTECCIONES
    - DESMONTAJES Y DEMOLICIONES
    - ALBAÑILERÍA Y ESTRUCTURA
    - INSTALACIONES ELÉCTRICAS
@@ -2265,6 +2308,11 @@ PARTIDAS Y SUBPARTIDAS
    - EXTERIORES Y AMENIDADES
    - LIMPIEZA Y ENTREGA
    Puedes crear otras partidas si el proyecto realmente lo requiere.
+   Ordena mentalmente el alcance según una secuencia razonable de ejecución.
+   Las protecciones temporales de pisos, accesos, mobiliario o áreas colindantes
+   pertenecen SIEMPRE a PRELIMINARES Y PROTECCIONES y deben ocurrir antes de
+   demoliciones, instalaciones, acabados, carpintería y demás trabajos.
+   LIMPIEZA Y ENTREGA se reserva para limpieza fina/final y cierre de obra.
 6. subpartida se muestra en el Excel. Debe ser corta, legible, sin numeración y
    normalmente de 1 a 5 palabras. Ejemplos: Licencias, Pisos, Muros, Frentes,
    Módulo Refri, Barra, Retiros.
@@ -3017,6 +3065,12 @@ def crear_excel(
       fuentes, criterios y consideraciones.
     """
     wb = Workbook()
+    # Forzar recálculo al abrir/guardar para que Excel y hojas compatibles
+    # actualicen todos los enlaces entre Presupuesto y Control Interno.
+    wb.calculation.calcMode = "auto"
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
+    wb.calculation.calcOnSave = True
     ws = wb.active
     ws.title = "01 Presupuesto"
 
@@ -3040,29 +3094,29 @@ def crear_excel(
     # -----------------------------------------------------
     ws.sheet_view.showGridLines = False
 
+    ws.merge_cells("A1:G1")
+    ws["A1"] = "PRESUPUESTO"
+    ws["A1"].font = Font(size=20, bold=True, color=brown)
+
     ws.merge_cells("A2:G2")
-    ws["A2"] = "PRESUPUESTO"
-    ws["A2"].font = Font(size=20, bold=True, color=brown)
+    ws["A2"] = project_data["name"]
+    ws["A2"].font = Font(size=12, bold=True, color=brown)
 
     ws.merge_cells("A3:G3")
-    ws["A3"] = project_data["name"]
-    ws["A3"].font = Font(size=12, bold=True, color=brown)
-
-    ws.merge_cells("A4:G4")
-    ws["A4"] = (
+    ws["A3"] = (
         f"{project_data['project_type']} · {project_data.get('budget_level', 'Medio-alto')} · "
         f"{project_data['location']} · {project_code} · V{version:02d}"
     )
-    ws["A4"].font = Font(size=9, color=dark_gray)
+    ws["A3"].font = Font(size=9, color=dark_gray)
 
     # -----------------------------------------------------
     # RESUMEN POR PARTIDAS
     # -----------------------------------------------------
-    ws.merge_cells("A6:G6")
-    ws["A6"] = "RESUMEN"
-    ws["A6"].font = Font(size=13, bold=True, color=brown)
+    ws.merge_cells("A5:G5")
+    ws["A5"] = "RESUMEN"
+    ws["A5"].font = Font(size=13, bold=True, color=brown)
 
-    summary_row = 7
+    summary_row = 6
     summary_map = {}
     sections = []
 
@@ -3116,7 +3170,7 @@ def crear_excel(
     # -----------------------------------------------------
     # TABLA DE PARTIDAS Y SUBPARTIDAS
     # -----------------------------------------------------
-    table_header_row = summary_row + 3
+    table_header_row = summary_row + 2
     headers = [
         "Partida",
         "Subpartida",
@@ -3198,7 +3252,7 @@ def crear_excel(
         start_row=row, start_column=1, end_row=row, end_column=6
     )
     ws.cell(row, 1, f"IVA {params['iva_pct']:.0f}%")
-    ws.cell(row, 7, f"=G{subtotal_detail_row}*'02 Control Interno'!$B$6")
+    ws.cell(row, 7, f"=G{subtotal_detail_row}*'02 Control Interno'!$B$5")
     ws.cell(row, 7).number_format = '$#,##0.00'
 
     row += 1
@@ -3238,7 +3292,6 @@ def crear_excel(
         ws.column_dimensions[get_column_letter(col)].width = width
 
     ws.row_dimensions[table_header_row].height = 30
-    ws.freeze_panes = f"A{table_header_row + 1}"
     ws.auto_filter.ref = (
         f"A{table_header_row}:G{table_header_row + len(structured_items)}"
     )
@@ -3263,23 +3316,23 @@ def crear_excel(
     wc["A1"].font = Font(size=15, bold=True, color=white)
     wc["A1"].fill = PatternFill("solid", fgColor=internal_blue)
 
-    wc["A3"] = "Parámetro"
-    wc["B3"] = "Valor"
-    for cell in ("A3", "B3"):
+    wc["A2"] = "Parámetro"
+    wc["B2"] = "Valor"
+    for cell in ("A2", "B2"):
         wc[cell].font = Font(bold=True, color=white)
         wc[cell].fill = PatternFill("solid", fgColor=internal_blue)
 
-    wc["A4"] = "Indirectos"
-    wc["B4"] = params["indirect_pct"] / 100.0
-    wc["A5"] = "Utilidad"
-    wc["B5"] = params["profit_pct"] / 100.0
-    wc["A6"] = "IVA"
-    wc["B6"] = params["iva_pct"] / 100.0
-    wc["A7"] = "Desperdicio general de referencia"
-    wc["B7"] = params["waste_pct"] / 100.0
-    wc["A8"] = "Nivel de presupuesto"
-    wc["B8"] = project_data.get("budget_level", "Medio-alto")
-    for rr in range(4, 8):
+    wc["A3"] = "Indirectos"
+    wc["B3"] = params["indirect_pct"] / 100.0
+    wc["A4"] = "Utilidad"
+    wc["B4"] = params["profit_pct"] / 100.0
+    wc["A5"] = "IVA"
+    wc["B5"] = params["iva_pct"] / 100.0
+    wc["A6"] = "Desperdicio general de referencia"
+    wc["B6"] = params["waste_pct"] / 100.0
+    wc["A7"] = "Nivel de presupuesto"
+    wc["B7"] = project_data.get("budget_level", "Medio-alto")
+    for rr in range(3, 7):
         wc.cell(rr, 2).number_format = "0.00%"
 
     headers = [
@@ -3306,7 +3359,7 @@ def crear_excel(
         "Margen venta",
         "Dif. P.U. vs calculado",
     ]
-    header_row = 10
+    header_row = 8
     for col, header in enumerate(headers, 1):
         c = wc.cell(header_row, col, header)
         c.font = Font(bold=True, color=white)
@@ -3340,8 +3393,8 @@ def crear_excel(
         wc.cell(idx, 13, float(item.get("waste_reference_unit", 0.0)))
 
         wc.cell(idx, 14, f"=G{idx}*H{idx}")
-        wc.cell(idx, 15, f"=H{idx}*$B$4")
-        wc.cell(idx, 16, f"=(H{idx}+O{idx})*$B$5")
+        wc.cell(idx, 15, f"=H{idx}*$B$3")
+        wc.cell(idx, 16, f"=(H{idx}+O{idx})*$B$4")
         wc.cell(idx, 17, f"=H{idx}+O{idx}+P{idx}")
 
         if commercial_row:
@@ -3374,7 +3427,6 @@ def crear_excel(
     ]
     for col, width in enumerate(widths, 1):
         wc.column_dimensions[get_column_letter(col)].width = width
-    wc.freeze_panes = "A11"
 
     # -----------------------------------------------------
     # 03 TRAZABILIDAD
@@ -3402,12 +3454,12 @@ def crear_excel(
         "Consideraciones",
     ]
     for col, header in enumerate(trace_headers, 1):
-        c = wt.cell(3, col, header)
+        c = wt.cell(2, col, header)
         c.font = Font(bold=True, color=white)
         c.fill = PatternFill("solid", fgColor=internal_blue)
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    for idx, item in enumerate(ordered_items, start=4):
+    for idx, item in enumerate(ordered_items, start=3):
         values = [
             item.get("partida_excel") or nombre_partida_excel(item.get("category")),
             item.get("subpartida_excel") or nombre_subpartida_excel(item),
@@ -3440,7 +3492,6 @@ def crear_excel(
     trace_widths = [23, 25, 28, 14, 62, 10, 11, 22, 70, 14, 48, 48, 52]
     for col, width in enumerate(trace_widths, 1):
         wt.column_dimensions[get_column_letter(col)].width = width
-    wt.freeze_panes = "A4"
 
     out = BytesIO()
     wb.save(out)
