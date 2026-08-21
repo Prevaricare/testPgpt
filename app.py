@@ -316,6 +316,78 @@ def descripcion_excel_item(item: dict) -> str:
     return f"{title}. {description}"
 
 
+NIVELES_PRESUPUESTO = ["Económico", "Medio", "Medio-alto", "Alto"]
+
+
+def criterio_nivel_presupuesto(nivel: str) -> str:
+    criterios = {
+        "Económico": (
+            "Prioriza soluciones funcionales, comerciales y de costo contenido. "
+            "Evita especificaciones premium salvo que el alcance las exija."
+        ),
+        "Medio": (
+            "Utiliza soluciones comerciales de calidad media, durables y comunes "
+            "en remodelación residencial y comercial."
+        ),
+        "Medio-alto": (
+            "Utiliza especificaciones de buena calidad, acabados cuidados y soluciones "
+            "comerciales superiores al promedio, sin llegar automáticamente a opciones premium."
+        ),
+        "Alto": (
+            "Prioriza especificaciones, acabados y soluciones de gama alta cuando sean "
+            "coherentes con el proyecto; identifica trabajos que requieran proveedor especializado."
+        ),
+    }
+    return criterios.get(nivel, criterios["Medio-alto"])
+
+
+def normalizar_composicion_costos(
+    materiales_pct: float,
+    mano_obra_pct: float,
+    otros_pct: float,
+) -> tuple[float, float, float]:
+    """Normaliza la composición estimada para que sume 100 %."""
+    material = max(float(materiales_pct or 0), 0.0)
+    labor = max(float(mano_obra_pct or 0), 0.0)
+    other = max(float(otros_pct or 0), 0.0)
+    total = material + labor + other
+
+    if total <= 0:
+        # Para datos históricos sin desglose preferimos no inventar.
+        return 0.0, 0.0, 100.0
+
+    return (
+        material / total * 100.0,
+        labor / total * 100.0,
+        other / total * 100.0,
+    )
+
+
+def aplicar_composicion_costo(item: dict) -> dict:
+    """
+    Calcula una descomposición informativa del costo integrado.
+    No modifica el costo ni agrega nuevamente el desperdicio.
+    """
+    out = dict(item)
+    material_pct, labor_pct, other_pct = normalizar_composicion_costos(
+        out.get("material_share_pct", 0.0),
+        out.get("labor_share_pct", 0.0),
+        out.get("other_share_pct", 0.0),
+    )
+    waste_pct = max(float(out.get("waste_reference_pct", 0.0) or 0.0), 0.0)
+    unit_cost = max(float(out.get("unit_cost", 0.0) or 0.0), 0.0)
+
+    out["material_share_pct"] = material_pct
+    out["labor_share_pct"] = labor_pct
+    out["other_share_pct"] = other_pct
+    out["waste_reference_pct"] = waste_pct
+    out["material_unit_est"] = unit_cost * material_pct / 100.0
+    out["labor_unit_est"] = unit_cost * labor_pct / 100.0
+    out["other_unit_est"] = unit_cost * other_pct / 100.0
+    out["waste_reference_unit"] = out["material_unit_est"] * waste_pct / 100.0
+    return out
+
+
 # =========================================================
 # CATÁLOGOS EXTERNOS - CDMX
 # =========================================================
@@ -808,6 +880,11 @@ class Database:
             "parent_budget_id",
             "revision_instruction",
             "commercial_title",
+            "budget_level",
+            "material_share_pct",
+            "labor_share_pct",
+            "other_share_pct",
+            "waste_reference_pct",
         }
         if table not in allowed_tables or column not in allowed_columns:
             raise ValueError("Migración de columna no permitida.")
@@ -864,6 +941,7 @@ class Database:
                 code TEXT UNIQUE NOT NULL,
                 name TEXT NOT NULL,
                 project_type TEXT NOT NULL,
+                budget_level TEXT,
                 location TEXT,
                 dimension_mode TEXT,
                 dimensions_text TEXT,
@@ -947,6 +1025,10 @@ class Database:
                 price_source TEXT,
                 price_source_detail TEXT,
                 price_confidence TEXT,
+                material_share_pct REAL,
+                labor_share_pct REAL,
+                other_share_pct REAL,
+                waste_reference_pct REAL,
                 quantity_criterion TEXT,
                 inclusion_basis TEXT,
                 considerations TEXT,
@@ -1000,6 +1082,11 @@ class Database:
         self._ensure_column("budgets", "parent_budget_id", "TEXT")
         self._ensure_column("budgets", "revision_instruction", "TEXT")
         self._ensure_column("budget_items", "commercial_title", "TEXT")
+        self._ensure_column("projects", "budget_level", "TEXT")
+        self._ensure_column("budget_items", "material_share_pct", "REAL")
+        self._ensure_column("budget_items", "labor_share_pct", "REAL")
+        self._ensure_column("budget_items", "other_share_pct", "REAL")
+        self._ensure_column("budget_items", "waste_reference_pct", "REAL")
 
     def stats(self) -> dict:
         return {
@@ -1321,15 +1408,16 @@ class Database:
         self.execute(
             """
             INSERT INTO projects (
-                id, code, name, project_type, location, dimension_mode,
+                id, code, name, project_type, budget_level, location, dimension_mode,
                 dimensions_text, description, guide_text, main_activity, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 project_id,
                 project_code,
                 project_data["name"],
                 project_data["project_type"],
+                project_data.get("budget_level", "Medio-alto"),
                 project_data["location"],
                 project_data["dimension_mode"],
                 project_data["dimensions_text"],
@@ -1449,9 +1537,10 @@ class Database:
                     commercial_title, description, unit, quantity, unit_cost, direct_amount,
                     unit_indirect, unit_profit, unit_sale, sale_amount,
                     sale_margin_pct, benefit_amount, price_source,
-                    price_source_detail, price_confidence, quantity_criterion,
-                    inclusion_basis, considerations, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    price_source_detail, price_confidence,
+                    material_share_pct, labor_share_pct, other_share_pct, waste_reference_pct,
+                    quantity_criterion, inclusion_basis, considerations, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -1475,6 +1564,10 @@ class Database:
                     item["price_source"],
                     item["price_source_detail"],
                     item["price_confidence"],
+                    item.get("material_share_pct", 0.0),
+                    item.get("labor_share_pct", 0.0),
+                    item.get("other_share_pct", 100.0),
+                    item.get("waste_reference_pct", 0.0),
                     item["quantity_criterion"],
                     item["inclusion_basis"],
                     item["considerations"],
@@ -1615,9 +1708,10 @@ class Database:
                     commercial_title, description, unit, quantity, unit_cost, direct_amount,
                     unit_indirect, unit_profit, unit_sale, sale_amount,
                     sale_margin_pct, benefit_amount, price_source,
-                    price_source_detail, price_confidence, quantity_criterion,
-                    inclusion_basis, considerations, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    price_source_detail, price_confidence,
+                    material_share_pct, labor_share_pct, other_share_pct, waste_reference_pct,
+                    quantity_criterion, inclusion_basis, considerations, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -1641,6 +1735,10 @@ class Database:
                     item["price_source"],
                     item["price_source_detail"],
                     item["price_confidence"],
+                    item.get("material_share_pct", 0.0),
+                    item.get("labor_share_pct", 0.0),
+                    item.get("other_share_pct", 100.0),
+                    item.get("waste_reference_pct", 0.0),
                     item["quantity_criterion"],
                     item["inclusion_basis"],
                     item["considerations"],
@@ -1960,7 +2058,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-08-21-v10.1-partidas-subpartidas"
+DATABASE_CACHE_VERSION = "2026-08-21-v11-costos-empresa"
 
 
 @st.cache_resource(show_spinner=False)
@@ -2007,7 +2105,32 @@ class ActividadIA(BaseModel):
     cantidad: float = Field(ge=0, description="Cantidad justificable con la información disponible")
     costo_unitario_estimado: float = Field(
         ge=0,
-        description="Costo unitario integrado estimado del subcontratista, en MXN, antes de indirectos y utilidad"
+        description=(
+            "Costo unitario integrado estimado del subcontratista, en MXN, antes de "
+            "indirectos y utilidad. Es respaldo si no existe una referencia más confiable."
+        )
+    )
+    porcentaje_materiales: float = Field(
+        ge=0,
+        le=100,
+        description="Participación estimada de materiales dentro del costo integrado; solo informativa"
+    )
+    porcentaje_mano_obra: float = Field(
+        ge=0,
+        le=100,
+        description="Participación estimada de mano de obra dentro del costo integrado; solo informativa"
+    )
+    porcentaje_otros: float = Field(
+        ge=0,
+        le=100,
+        description="Participación estimada de equipo, proveedor, transporte u otros dentro del costo integrado"
+    )
+    desperdicio_materiales_pct: float = Field(
+        ge=0,
+        le=50,
+        description=(
+            "Desperdicio de referencia aplicable a materiales; informativo y no aditivo"
+        )
     )
     criterio_cantidad: str = Field(description="Criterio verificable usado para determinar la cantidad")
     fundamento_inclusion: str = Field(description="Razón breve para incluir la actividad en el alcance")
@@ -2069,106 +2192,127 @@ def generar_presupuesto_ia(
 ) -> PresupuestoIA:
     client = genai.Client(api_key=api_key)
     year = datetime.now().year
+    budget_level = project_data.get("budget_level", "Medio-alto")
+    level_criterion = criterio_nivel_presupuesto(budget_level)
 
     prompt = f"""
-Actúa como especialista en presupuestación para una empresa de interiorismo y
-remodelación en México. La empresa SUBCONTRATA prácticamente todas las
-actividades. El objetivo no es desarrollar análisis de precios unitarios de
-materiales y mano de obra, sino generar actividades contratables, claras y
-útiles para solicitar o comparar cotizaciones.
+Actúa como un INGENIERO DE COSTOS SENIOR de una empresa de remodelación de alto
+nivel, con experiencia en presupuestos residenciales y comerciales. La empresa
+opera principalmente en Ciudad de México y SUBCONTRATA prácticamente todas las
+actividades.
 
-OBJETIVO
-Genera un presupuesto inicial consistente con una estructura comercial similar
-a la utilizada por una empresa de remodelación para presentar propuestas:
-SECCIÓN COMERCIAL → TÍTULO CORTO DEL CONCEPTO → DESCRIPCIÓN → CANTIDAD/UNIDAD.
+No te limites a copiar la lista del usuario. Interpreta el alcance como un
+profesional de costos, detecta trabajos indispensables y conviértelos en
+conceptos comerciales claros.
 
-El archivo Excel tendrá una hoja principal de presupuesto comercial y hojas
-separadas para control interno y trazabilidad.
+CONFIGURACIÓN FIJA DE LA EMPRESA
+- Referencia de mercado: Ciudad de México, {year}.
+- Nivel comercial seleccionado: {budget_level}.
+- Criterio del nivel: {level_criterion}
+- El nivel afecta especificaciones, calidad y solución constructiva; NO apliques
+  un multiplicador arbitrario a todos los precios.
+- Cuando el alcance lo haga razonablemente necesario, contempla proyecto
+  ejecutivo, ingenierías, licencias, permisos o trámites aplicables.
+- La aplicación buscará después precios en la base histórica de la empresa y en
+  catálogos externos como CDMX. costo_unitario_estimado es una referencia de
+  respaldo y no la única fuente.
+- Los conceptos deben poder presentarse al cliente y servir para solicitar
+  cotizaciones a subcontratistas.
 
 DATOS DEL PROYECTO
 Cliente: {project_data['name']}
 Ubicación: {project_data['location'] or 'No indicada'}
 Tipo de obra: {project_data['project_type']}
+Nivel de presupuesto: {budget_level}
 
 DESCRIPCIÓN GENERAL DE LOS TRABAJOS
 {project_data['description']}
 
-TEXTO GUÍA / CRITERIOS ADICIONALES
-{project_data['guide_text'] or 'Sin texto guía adicional.'}
+CONSIDERACIONES GENERALES DEL PROYECTO
+{project_data['guide_text'] or 'Sin consideraciones adicionales.'}
 
 PARÁMETROS COMERCIALES
 Indirectos: {params['indirect_pct']:.2f}%
 Utilidad: {params['profit_pct']:.2f}%
 IVA: {params['iva_pct']:.2f}%
-Desperdicio de referencia: {params['waste_pct']:.2f}%
+Desperdicio general de referencia: {params['waste_pct']:.2f}%
 
-REGLAS DE GENERACIÓN
-1. Trabaja con actividades generales subcontratables. No desgloses materiales,
-   cuadrillas, rendimientos o herramienta salvo que sea indispensable para
-   describir correctamente el alcance.
-2. El costo_unitario_estimado representa el COSTO PARA LA EMPRESA del servicio
-   completo del subcontratista. NO incluye indirectos corporativos, utilidad ni
-   IVA; esos conceptos se calculan posteriormente en Python.
-3. Los costos se expresan en MXN y deben representar una referencia razonable
-   para {project_data['location'] or 'México'} en {year}, con nivel comercial
-   medio-medio salvo que el texto guía indique otro nivel.
-4. No aparentes precisión inexistente. En actividades poco comunes, especializadas
-   o con alta variación de proveedor, utiliza una estimación prudente, marca
-   requiere_cotizacion=True y asigna confianza de precio Baja.
-5. Si la actividad es más apropiada como paquete integral, usa LOTE, PZA, JGO o
-   una unidad equivalente en lugar de inventar cuantificaciones detalladas.
-6. Solo calcula M2, ML, M3 u otras cantidades cuando las medidas incluidas en
-   la descripción general permitan hacerlo razonablemente. Las dimensiones pueden
-   aparecer por planta, zona o elemento. Evita asumir medidas no indicadas.
-7. El desperdicio es una referencia técnica. En un costo integrado de
-   subcontratista se considera dentro de la estimación cuando aplique; NO lo
-   devuelvas como una partida separada ni agregues un porcentaje global.
-8. Usa como SECCIONES COMERCIALES preferentes, cuando correspondan:
+REVISIÓN DEL ALCANCE
+1. Antes de generar conceptos, revisa el proyecto completo y detecta:
+   a) trabajos solicitados explícitamente;
+   b) trabajos previos indispensables;
+   c) trabajos complementarios necesarios para entregar correctamente lo pedido;
+   d) proyecto, ingenierías, licencias o permisos previsibles por el tipo de obra.
+2. Después AGRUPA COMERCIALMENTE esos trabajos. No conviertas el presupuesto en
+   un APU ni generes una fila por material, herramienta o cuadrilla. Si varias
+   tareas forman naturalmente un paquete subcontratable, intégralas en un solo
+   concepto y explica las inclusiones en descripcion_tecnica.
+3. No omitas un trabajo indispensable solo porque no fue escrito literalmente.
+   Si la inclusión es inferida, indícalo brevemente en fundamento_inclusion o
+   consideraciones.
+4. No agregues trabajos opcionales o decorativos ajenos al alcance.
+
+PARTIDAS Y SUBPARTIDAS
+5. Usa preferentemente, cuando correspondan:
    - PROYECTO Y TRÁMITES
    - DESMONTAJES Y DEMOLICIONES
    - ALBAÑILERÍA Y ESTRUCTURA
+   - INSTALACIONES ELÉCTRICAS
+   - INSTALACIONES HIDROSANITARIAS
    - ACABADOS Y RECUBRIMIENTOS
    - CARPINTERÍA
    - CANCELERÍA Y HERRERÍA
    - EXTERIORES Y AMENIDADES
-   Puedes crear otras secciones necesarias, especialmente INSTALACIONES
-   ELÉCTRICAS, INSTALACIONES HIDROSANITARIAS, CLIMATIZACIÓN, EQUIPAMIENTO,
-   LIMPIEZA Y ENTREGA u otras que el proyecto realmente requiera. No fuerces un
-   trabajo dentro de una sección incorrecta solo para utilizar la lista anterior.
-9. Cada actividad debe tener titulo_comercial. Debe ser corto, claro y apto para
-   mostrar al cliente, normalmente de 2 a 8 palabras. Ejemplos: "Pintura general",
-   "Pisos en recámaras", "Demolición de muros", "Ventanal de escalera".
-   Los títulos pueden repetirse cuando el mismo tipo de trabajo se realice en
-   zonas distintas.
-10. descripcion_tecnica debe aparecer debajo del título comercial. Debe explicar
-   de forma concreta qué se hará, dónde se hará, la especificación principal y
-   qué elementos importantes incluye. Evita convertirla en un APU o en una lista
-   excesivamente larga de insumos.
-11. subpartida es una parte IMPORTANTE del Excel. Debe ser corta, legible y
-   específica dentro de su partida. No incluyas números porque Python agregará
-   automáticamente la jerarquía 1.1, 1.2, 2.1, etc. Ejemplos:
-   - Partida TRÁMITES → subpartida "Licencias"
-   - Partida ACABADOS → subpartidas "Pisos", "Muros"
-   - Partida CARPINTERÍA → "Frentes", "Módulo Refri", "Barra", "Área Lavado"
-   - Partida PRELIMINARES/LIMPIEZA → "Retiros"
-   codigo_sugerido continúa siendo un dato interno.
-12. Dentro de una misma partida procura que las subpartidas sean suficientemente
-   distintas para identificar rápidamente cada renglón del presupuesto.
-13. Incluye trámites o licencias únicamente cuando el alcance realmente los haga
-   previsibles o el usuario los solicite.
-14. No dupliques actividades. No agregues trabajos que no se desprendan del
-    alcance salvo complementos técnicos indispensables, y en ese caso indícalo
-    claramente en consideraciones.
-15. Para cada actividad explica de forma breve el criterio de cantidad y el
-    fundamento de inclusión. No expongas cadenas de pensamiento ni razonamiento
-    interno.
-16. Los datos faltantes deben concentrarse en datos_faltantes, pero no deben
-    impedir generar un presupuesto inicial cuando sea posible trabajar con LOTE
-    o con una estimación razonable.
-17. La descripción técnica debe ser suficientemente completa para poder copiarse
-    a una plataforma de presupuestación o solicitar una cotización a proveedor.
-18. No calcules indirectos, utilidad, venta, beneficio, margen ni IVA. Python los
-    calculará de forma determinista.
+   - LIMPIEZA Y ENTREGA
+   Puedes crear otras partidas si el proyecto realmente lo requiere.
+6. subpartida se muestra en el Excel. Debe ser corta, legible, sin numeración y
+   normalmente de 1 a 5 palabras. Ejemplos: Licencias, Pisos, Muros, Frentes,
+   Módulo Refri, Barra, Retiros.
+7. titulo_comercial debe ser corto y apto para cliente. Puede repetirse si el
+   mismo tipo de trabajo corresponde a zonas distintas.
+8. descripcion_tecnica debe indicar qué se hace, dónde, especificación principal
+   y qué incluye, sin volverse excesivamente larga.
+9. codigo_sugerido es interno.
+
+CANTIDADES Y METRAJES
+10. Calcula M2, ML, M3, PZA u otras cantidades cuando las dimensiones aportadas
+    permitan hacerlo de forma justificable.
+11. Si el usuario pide "promediar", utiliza una estimación razonable y explica
+    brevemente el criterio.
+12. Si faltan datos, utiliza LOTE/PZA/JGO cuando sea profesionalmente más correcto
+    que inventar un metraje.
+
+COSTOS Y MERCADO
+13. costo_unitario_estimado es el COSTO integrado para la empresa del servicio
+    subcontratado, antes de indirectos, utilidad e IVA.
+14. Los costos deben ser razonables para el mercado de CDMX en {year} y
+    coherentes con el nivel {budget_level}.
+15. En trabajos especializados o muy variables, usa una estimación prudente,
+    requiere_cotizacion=True y confianza de precio baja.
+16. No calcules indirectos, utilidad, venta, margen ni IVA; Python lo hará.
+
+DESGLOSE INTERNO
+17. porcentaje_materiales, porcentaje_mano_obra y porcentaje_otros son una
+    DESCOMPOSICIÓN ESTIMADA e informativa del costo integrado y deben sumar
+    aproximadamente 100 %. No cambian el costo total.
+18. En servicios profesionales, trámites o paquetes donde no sea razonable
+    separar materiales y mano de obra, asigna la mayor parte a porcentaje_otros
+    en vez de inventar una división.
+19. desperdicio_materiales_pct es una referencia sobre materiales. El costo
+    integrado ya debe contemplar desperdicio aplicable; NO se suma nuevamente.
+
+PROYECTO EJECUTIVO Y TRÁMITES
+20. Evalúa automáticamente ampliaciones, modificaciones estructurales, nuevas
+    losas, escaleras, cambios relevantes de fachada, instalaciones mayores y
+    otras obras que razonablemente requieran proyecto, ingenierías o permisos.
+21. Incluye esos conceptos solamente cuando sean previsibles para el alcance.
+    Para una remodelación pequeña no agregues trámites por rutina.
+
+CONTROL DE CALIDAD
+22. No dupliques conceptos.
+23. Para cada actividad da criterio_cantidad y fundamento_inclusion breves.
+24. Concentra incertidumbres en datos_faltantes sin bloquear una estimación útil.
+25. No expongas cadenas de pensamiento ni razonamiento interno.
 """
 
     modelos = []
@@ -2207,7 +2351,9 @@ REGLAS DE GENERACIÓN
             if not model_error:
                 raise
 
-    raise RuntimeError(f"No fue posible usar un modelo Gemini disponible. Último error: {last_error}")
+    raise RuntimeError(
+        f"No fue posible usar un modelo Gemini disponible. Último error: {last_error}"
+    )
 
 
 def revisar_presupuesto_ia(
@@ -2237,6 +2383,10 @@ def revisar_presupuesto_ia(
             "costo_unitario_actual": x["unit_cost"],
             "fuente_precio": x["price_source"],
             "detalle_fuente": x.get("price_source_detail") or "",
+            "materiales_pct": x.get("material_share_pct", 0.0),
+            "mano_obra_pct": x.get("labor_share_pct", 0.0),
+            "otros_pct": x.get("other_share_pct", 100.0),
+            "desperdicio_materiales_pct": x.get("waste_reference_pct", 0.0),
             "criterio_cantidad": x["quantity_criterion"],
             "consideraciones": x["considerations"],
         }
@@ -2252,6 +2402,7 @@ DATOS DEL PROYECTO
 Cliente: {project_data['name']}
 Ubicación: {project_data['location']}
 Tipo de obra: {project_data['project_type']}
+Nivel de presupuesto: {project_data.get('budget_level', 'Medio-alto')}
 
 DESCRIPCIÓN ORIGINAL
 {project_data['description']}
@@ -2296,9 +2447,12 @@ INSTRUCCIONES
 13. Conserva la estructura comercial: partida amplia, subpartida corta,
     titulo_comercial y descripción. Si el usuario solo pide revisar precio o
     cantidad, conserva partida y subpartida salvo que el cambio realmente las afecte.
-14. No calcules indirectos, utilidad, venta ni IVA; Python hará esos cálculos.
-15. Devuelve el alcance, consideraciones y datos faltantes completos y actualizados.
-16. En motivo escribe solo una explicación breve del cambio, sin razonamiento interno.
+14. Conserva el nivel comercial seleccionado del proyecto.
+15. porcentaje_materiales, porcentaje_mano_obra y porcentaje_otros son solamente
+    una composición estimada; mantenla coherente y cercana a 100 %.
+16. No calcules indirectos, utilidad, venta ni IVA; Python hará esos cálculos.
+17. Devuelve el alcance, consideraciones y datos faltantes completos y actualizados.
+18. En motivo escribe solo una explicación breve del cambio, sin razonamiento interno.
 """
 
     modelos = []
@@ -2546,8 +2700,7 @@ def resolver_items(
         if act.requiere_cotizacion:
             considerations = (considerations + " | " if considerations else "") + "Requiere cotización de proveedor."
 
-        items.append(
-            {
+        item_data = {
                 "concept_id": concept_id,
                 "category": normalizar_seccion_comercial(act.partida),
                 "subcategory": act.subpartida.strip(),
@@ -2568,12 +2721,17 @@ def resolver_items(
                 "price_source_detail": source_detail,
                 "price_status": price_status,
                 "price_confidence": price_confidence,
+                "material_share_pct": act.porcentaje_materiales,
+                "labor_share_pct": act.porcentaje_mano_obra,
+                "other_share_pct": act.porcentaje_otros,
+                "waste_reference_pct": act.desperdicio_materiales_pct,
                 "quantity_confidence": act.nivel_confianza_cantidad,
                 "quantity_criterion": act.criterio_cantidad.strip(),
                 "inclusion_basis": act.fundamento_inclusion.strip(),
                 "considerations": considerations,
             }
-        )
+        item_data = aplicar_composicion_costo(item_data)
+        items.append(item_data)
 
     return items
 
@@ -2605,7 +2763,7 @@ def recalcular_item_financiero(item: dict, params: dict) -> dict:
             "sale_margin_pct": sale_margin_pct,
         }
     )
-    return out
+    return aplicar_composicion_costo(out)
 
 
 def item_a_actividad(item: dict) -> ActividadIA:
@@ -2618,6 +2776,14 @@ def item_a_actividad(item: dict) -> ActividadIA:
         unidad=item["unit"],
         cantidad=float(item["quantity"]),
         costo_unitario_estimado=float(item["unit_cost"]),
+        porcentaje_materiales=float(item.get("material_share_pct") or 0.0),
+        porcentaje_mano_obra=float(item.get("labor_share_pct") or 0.0),
+        porcentaje_otros=float(
+            item.get("other_share_pct")
+            if item.get("other_share_pct") is not None
+            else 100.0
+        ),
+        desperdicio_materiales_pct=float(item.get("waste_reference_pct") or 0.0),
         criterio_cantidad=item.get("quantity_criterion") or "Cantidad de la versión vigente.",
         fundamento_inclusion=item.get("inclusion_basis") or "Actividad incluida en el alcance vigente.",
         nivel_confianza_cantidad=item.get("quantity_confidence") or "Media",
@@ -2735,6 +2901,10 @@ def aplicar_revision_estructural(
                     "price_source_detail",
                     "price_status",
                     "price_confidence",
+                    "material_share_pct",
+                    "labor_share_pct",
+                    "other_share_pct",
+                    "waste_reference_pct",
                 ]:
                     new_item[key] = old_item.get(key)
                 new_item = recalcular_item_financiero(new_item, params)
@@ -2880,8 +3050,8 @@ def crear_excel(
 
     ws.merge_cells("A4:G4")
     ws["A4"] = (
-        f"{project_data['project_type']} · {project_data['location']} · "
-        f"{project_code} · V{version:02d}"
+        f"{project_data['project_type']} · {project_data.get('budget_level', 'Medio-alto')} · "
+        f"{project_data['location']} · {project_code} · V{version:02d}"
     )
     ws["A4"].font = Font(size=9, color=dark_gray)
 
@@ -3088,7 +3258,7 @@ def crear_excel(
     wc = wb.create_sheet("02 Control Interno")
     wc.sheet_view.showGridLines = False
 
-    wc.merge_cells("A1:Q1")
+    wc.merge_cells("A1:V1")
     wc["A1"] = "CONTROL INTERNO DEL PRESUPUESTO"
     wc["A1"].font = Font(size=15, bold=True, color=white)
     wc["A1"].fill = PatternFill("solid", fgColor=internal_blue)
@@ -3105,8 +3275,10 @@ def crear_excel(
     wc["B5"] = params["profit_pct"] / 100.0
     wc["A6"] = "IVA"
     wc["B6"] = params["iva_pct"] / 100.0
-    wc["A7"] = "Desperdicio de referencia"
+    wc["A7"] = "Desperdicio general de referencia"
     wc["B7"] = params["waste_pct"] / 100.0
+    wc["A8"] = "Nivel de presupuesto"
+    wc["B8"] = project_data.get("budget_level", "Medio-alto")
     for rr in range(4, 8):
         wc.cell(rr, 2).number_format = "0.00%"
 
@@ -3119,6 +3291,11 @@ def crear_excel(
         "Unidad",
         "Cantidad",
         "Costo base unit.",
+        "Materiales est. unit.",
+        "M.O. est. unit.",
+        "Otros / integrado est. unit.",
+        "Desperdicio materiales ref. %",
+        "Desperdicio ref. unit. (no aditivo)",
         "Costo directo",
         "Indirecto unit.",
         "Utilidad unit.",
@@ -3129,7 +3306,7 @@ def crear_excel(
         "Margen venta",
         "Dif. P.U. vs calculado",
     ]
-    header_row = 9
+    header_row = 10
     for col, header in enumerate(headers, 1):
         c = wc.cell(header_row, col, header)
         c.font = Font(bold=True, color=white)
@@ -3149,35 +3326,42 @@ def crear_excel(
         for col, val in enumerate(values, 1):
             wc.cell(idx, col, val)
 
+        # Hoja principal: E=Cantidad, F=Precio Unitario, G=Importe.
         if commercial_row:
-            wc.cell(idx, 7, f"='01 Presupuesto'!B{commercial_row}")
+            wc.cell(idx, 7, f"='01 Presupuesto'!E{commercial_row}")
         else:
             wc.cell(idx, 7, float(item["quantity"]))
 
         wc.cell(idx, 8, float(item["unit_cost"]))
-        wc.cell(idx, 9, f"=G{idx}*H{idx}")
-        wc.cell(idx, 10, f"=H{idx}*$B$4")
-        wc.cell(idx, 11, f"=(H{idx}+J{idx})*$B$5")
-        wc.cell(idx, 12, f"=H{idx}+J{idx}+K{idx}")
+        wc.cell(idx, 9, float(item.get("material_unit_est", 0.0)))
+        wc.cell(idx, 10, float(item.get("labor_unit_est", 0.0)))
+        wc.cell(idx, 11, float(item.get("other_unit_est", item["unit_cost"])))
+        wc.cell(idx, 12, float(item.get("waste_reference_pct", 0.0)) / 100.0)
+        wc.cell(idx, 13, float(item.get("waste_reference_unit", 0.0)))
+
+        wc.cell(idx, 14, f"=G{idx}*H{idx}")
+        wc.cell(idx, 15, f"=H{idx}*$B$4")
+        wc.cell(idx, 16, f"=(H{idx}+O{idx})*$B$5")
+        wc.cell(idx, 17, f"=H{idx}+O{idx}+P{idx}")
 
         if commercial_row:
-            wc.cell(idx, 13, f"='01 Presupuesto'!D{commercial_row}")
-            wc.cell(idx, 14, f"='01 Presupuesto'!E{commercial_row}")
+            wc.cell(idx, 18, f"='01 Presupuesto'!F{commercial_row}")
+            wc.cell(idx, 19, f"='01 Presupuesto'!G{commercial_row}")
         else:
-            wc.cell(idx, 13, float(item["unit_sale"]))
-            wc.cell(idx, 14, float(item["sale_amount"]))
+            wc.cell(idx, 18, float(item["unit_sale"]))
+            wc.cell(idx, 19, float(item["sale_amount"]))
 
-        wc.cell(idx, 15, f"=N{idx}-I{idx}")
-        wc.cell(idx, 16, f'=IF(N{idx}=0,0,O{idx}/N{idx})')
-        wc.cell(idx, 17, f"=M{idx}-L{idx}")
+        wc.cell(idx, 20, f"=S{idx}-N{idx}")
+        wc.cell(idx, 21, f'=IF(S{idx}=0,0,T{idx}/S{idx})')
+        wc.cell(idx, 22, f"=R{idx}-Q{idx}")
 
         wc.cell(idx, 7).number_format = "0.00"
-        for col in range(8, 16):
+        for col in [8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 22]:
             wc.cell(idx, col).number_format = '$#,##0.00'
-        wc.cell(idx, 16).number_format = "0.00%"
-        wc.cell(idx, 17).number_format = '$#,##0.00'
+        wc.cell(idx, 12).number_format = "0.00%"
+        wc.cell(idx, 21).number_format = "0.00%"
 
-        for col in range(1, 18):
+        for col in range(1, 23):
             wc.cell(idx, col).alignment = Alignment(
                 vertical="top",
                 wrap_text=col in {1, 2, 4, 5},
@@ -3185,11 +3369,12 @@ def crear_excel(
             wc.cell(idx, col).border = Border(bottom=thin_gray)
 
     widths = [
-        29, 20, 14, 30, 58, 10, 11, 17, 17, 17, 17, 19, 18, 18, 18, 15, 19
+        29, 20, 14, 30, 58, 10, 11, 17, 18, 18, 21,
+        20, 23, 17, 17, 17, 19, 18, 18, 18, 15, 19,
     ]
     for col, width in enumerate(widths, 1):
         wc.column_dimensions[get_column_letter(col)].width = width
-    wc.freeze_panes = "A10"
+    wc.freeze_panes = "A11"
 
     # -----------------------------------------------------
     # 03 TRAZABILIDAD
@@ -4564,8 +4749,8 @@ DEFAULT_GUIDE_TEXT = """- Considerar protección básica de las áreas de trabaj
 - Considerar herramienta menor, consumibles y elementos auxiliares necesarios.
 - En pintura, considerar preparación básica, resanes menores, sellador cuando sea necesario y dos manos de pintura.
 - En instalaciones y elementos nuevos, considerar suministro, colocación, fijaciones, conexiones y pruebas básicas cuando correspondan.
-- Considerar materiales y acabados de calidad media cuando no exista una especificación concreta.
-- No asumir trabajos o dimensiones no indicados; señalar los datos importantes que falten.
+- Mantener materiales y acabados coherentes con el nivel de presupuesto seleccionado.
+- No asumir dimensiones no indicadas; señalar los datos importantes que falten.
 """
 
 ADJUSTMENT_EXAMPLE = """Ejemplos:
@@ -4617,6 +4802,13 @@ if "generated" not in st.session_state:
             key="project_type",
         )
 
+        budget_level = st.selectbox(
+            "Nivel de presupuesto",
+            NIVELES_PRESUPUESTO,
+            index=2,
+            key="budget_level",
+        )
+
         description = st.text_area(
             "Descripción general de trabajos",
             placeholder=DESCRIPTION_EXAMPLE,
@@ -4660,6 +4852,7 @@ if "generated" not in st.session_state:
         project_data = {
             "name": client_name.strip(),
             "project_type": project_type,
+            "budget_level": budget_level,
             "location": location.strip(),
             "dimension_mode": "Integradas en descripción",
             "dimensions_text": "",
@@ -4735,7 +4928,7 @@ else:
     else:
         st.caption("Borrador sin guardar")
 
-    p1, p2, p3 = st.columns(3)
+    p1, p2, p3, p4 = st.columns(4)
     with p1:
         st.text_input(
             "Cliente",
@@ -4756,6 +4949,13 @@ else:
             value=g["project_data"]["project_type"],
             disabled=True,
             key=f"locked_type_{version}_{saved}",
+        )
+    with p4:
+        st.text_input(
+            "Nivel",
+            value=g["project_data"].get("budget_level", "Medio-alto"),
+            disabled=True,
+            key=f"locked_level_{version}_{saved}",
         )
 
     st.text_area(
