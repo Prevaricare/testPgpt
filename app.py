@@ -213,54 +213,80 @@ def titulo_comercial_item(item: dict) -> str:
 
 
 def seccion_ejecucion_item(item: dict) -> str:
-    """Corrige clasificaciones que afectan el orden real de ejecución."""
+    """
+    Clasificación final de seguridad.
+
+    La clasificación principal la revisa Gemini viendo el presupuesto completo.
+    Python solo corrige dos casos inequívocos de secuencia:
+    - protección TEMPORAL de áreas de obra -> preliminares;
+    - limpieza FINA/FINAL de entrega -> cierre.
+
+    No se usan palabras aisladas como "protección", porque pueden describir una
+    propiedad técnica de un elemento permanente y provocar falsos positivos.
+    """
     category = normalizar_seccion_comercial(item.get("category"))
-    context = normalizar_texto(
+
+    title_context = normalizar_texto(
         " ".join(
             str(item.get(k) or "")
-            for k in ("category", "subcategory", "commercial_title", "description")
+            for k in ("subcategory", "commercial_title")
         )
     ).upper()
 
-    # Las protecciones son trabajos PREVIOS y nunca deben quedar con la limpieza final.
-    prelim_keywords = (
-        "PROTECCION", "PROTECCIONES", "PROTEGER", "CUBRIR PISOS",
-        "CUBRIR AREAS", "TAPIALES", "TAPIAL", "INSTALACION PROVISIONAL",
-        "TRAZO", "REPLANTEO", "PRELIMINAR",
+    preliminary_phrases = (
+        "PROTECCION DE AREAS",
+        "PROTECCION DE AREA",
+        "PROTECCION DE PISOS",
+        "PROTECCION DE PISO",
+        "PROTECCION DE ACCESOS",
+        "PROTECCION DE MOBILIARIO",
+        "PROTECCION TEMPORAL",
+        "PROTECCIONES TEMPORALES",
+        "CUBRIR AREAS",
+        "CUBRIR PISOS",
+        "TAPIAL DE OBRA",
+        "TAPIALES DE OBRA",
+        "TRAZO Y REPLANTEO",
+        "REPLANTEO",
     )
-    if any(k in context for k in prelim_keywords):
+    if any(phrase in title_context for phrase in preliminary_phrases):
         return "PRELIMINARES Y PROTECCIONES"
 
-    # La limpieza fina/final sí permanece al cierre de la obra.
-    final_keywords = (
-        "LIMPIEZA FINA", "LIMPIEZA FINAL", "LIMPIEZA DE ENTREGA",
-        "ENTREGA FINAL", "ASEO FINAL",
+    closing_phrases = (
+        "LIMPIEZA FINA",
+        "LIMPIEZA FINAL",
+        "LIMPIEZA DE ENTREGA",
+        "LIMPIEZA Y ENTREGA",
+        "ASEO FINAL",
+        "ENTREGA FINAL",
+        "CIERRE DE OBRA",
     )
-    if any(k in context for k in final_keywords):
+    if any(phrase in title_context for phrase in closing_phrases):
         return "LIMPIEZA Y ENTREGA"
 
-    # Datos viejos que mezclaban 'Prelim. y Limpieza': si no son claramente
-    # limpieza final, priorizamos preliminares únicamente cuando el texto lo indica.
     return category
 
 
 def ordenar_items_comercialmente(items: list[dict]) -> list[dict]:
+    """
+    Ordena por fase macro de obra y después por orden_ejecucion auditado.
+    """
     preferred = {
         name: index for index, name in enumerate(SECCIONES_COMERCIALES_PREFERENTES)
     }
-    first_seen = {}
-    for idx, item in enumerate(items):
-        section = seccion_ejecucion_item(item)
-        first_seen.setdefault(section, idx)
 
     def key(pair):
         idx, item = pair
         section = seccion_ejecucion_item(item)
-        if section in preferred:
-            return (0, preferred[section], idx)
-        # Secciones no previstas van antes de la limpieza final, respetando
-        # el orden en que fueron propuestas por la IA.
-        return (0, preferred.get("OTROS TRABAJOS", 10), first_seen.get(section, idx), idx)
+        try:
+            execution_order = int(item.get("execution_order") or 500)
+        except (TypeError, ValueError):
+            execution_order = 500
+        phase = preferred.get(
+            section,
+            preferred.get("OTROS TRABAJOS", 10),
+        )
+        return (phase, execution_order, idx)
 
     ordered = [dict(item) for _, item in sorted(enumerate(items), key=key)]
     for item in ordered:
@@ -927,6 +953,7 @@ class Database:
             "labor_share_pct",
             "other_share_pct",
             "waste_reference_pct",
+            "execution_order",
         }
         if table not in allowed_tables or column not in allowed_columns:
             raise ValueError("Migración de columna no permitida.")
@@ -1071,6 +1098,7 @@ class Database:
                 labor_share_pct REAL,
                 other_share_pct REAL,
                 waste_reference_pct REAL,
+                execution_order INTEGER,
                 quantity_criterion TEXT,
                 inclusion_basis TEXT,
                 considerations TEXT,
@@ -1129,6 +1157,7 @@ class Database:
         self._ensure_column("budget_items", "labor_share_pct", "REAL")
         self._ensure_column("budget_items", "other_share_pct", "REAL")
         self._ensure_column("budget_items", "waste_reference_pct", "REAL")
+        self._ensure_column("budget_items", "execution_order", "INTEGER")
 
     def stats(self) -> dict:
         return {
@@ -1581,8 +1610,8 @@ class Database:
                     sale_margin_pct, benefit_amount, price_source,
                     price_source_detail, price_confidence,
                     material_share_pct, labor_share_pct, other_share_pct, waste_reference_pct,
-                    quantity_criterion, inclusion_basis, considerations, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    execution_order, quantity_criterion, inclusion_basis, considerations, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -1610,6 +1639,7 @@ class Database:
                     item.get("labor_share_pct", 0.0),
                     item.get("other_share_pct", 100.0),
                     item.get("waste_reference_pct", 0.0),
+                    int(item.get("execution_order") or 500),
                     item["quantity_criterion"],
                     item["inclusion_basis"],
                     item["considerations"],
@@ -1752,8 +1782,8 @@ class Database:
                     sale_margin_pct, benefit_amount, price_source,
                     price_source_detail, price_confidence,
                     material_share_pct, labor_share_pct, other_share_pct, waste_reference_pct,
-                    quantity_criterion, inclusion_basis, considerations, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    execution_order, quantity_criterion, inclusion_basis, considerations, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -1781,6 +1811,7 @@ class Database:
                     item.get("labor_share_pct", 0.0),
                     item.get("other_share_pct", 100.0),
                     item.get("waste_reference_pct", 0.0),
+                    int(item.get("execution_order") or 500),
                     item["quantity_criterion"],
                     item["inclusion_basis"],
                     item["considerations"],
@@ -2100,7 +2131,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-08-21-v11.2-importe-editable"
+DATABASE_CACHE_VERSION = "2026-08-21-v11.3-auditoria-secuencia"
 
 
 @st.cache_resource(show_spinner=False)
@@ -2137,6 +2168,14 @@ class ActividadIA(BaseModel):
         )
     )
     codigo_sugerido: str = Field(description="Código interno breve como PRE-01 o CAR-03")
+    orden_ejecucion: int = Field(
+        ge=1,
+        le=999,
+        description=(
+            "Orden relativo de ejecución dentro de la obra. Menor significa antes. "
+            "Debe responder a dependencias constructivas y no al orden del texto del usuario."
+        ),
+    )
     titulo_comercial: str = Field(
         description="Título corto y legible para el cliente, por ejemplo Pintura general o Demolición de muros"
     )
@@ -2189,6 +2228,21 @@ class PresupuestoIA(BaseModel):
     consideraciones_generales: list[str]
     datos_faltantes: list[str]
     actividades: list[ActividadIA]
+
+
+class ClasificacionActividadIA(BaseModel):
+    codigo: str = Field(description="Código exacto de la actividad recibida")
+    partida: str = Field(description="Partida comercial corregida")
+    subpartida: str = Field(description="Subpartida breve corregida, sin numeración")
+    orden_ejecucion: int = Field(
+        ge=1,
+        le=999,
+        description="Orden relativo corregido según la secuencia constructiva",
+    )
+
+
+class AuditoriaEstructuraIA(BaseModel):
+    actividades: list[ClasificacionActividadIA]
 
 
 class OperacionRevisionIA(BaseModel):
@@ -2308,19 +2362,23 @@ PARTIDAS Y SUBPARTIDAS
    - EXTERIORES Y AMENIDADES
    - LIMPIEZA Y ENTREGA
    Puedes crear otras partidas si el proyecto realmente lo requiere.
-   Ordena mentalmente el alcance según una secuencia razonable de ejecución.
-   Las protecciones temporales de pisos, accesos, mobiliario o áreas colindantes
-   pertenecen SIEMPRE a PRELIMINARES Y PROTECCIONES y deben ocurrir antes de
-   demoliciones, instalaciones, acabados, carpintería y demás trabajos.
-   LIMPIEZA Y ENTREGA se reserva para limpieza fina/final y cierre de obra.
-6. subpartida se muestra en el Excel. Debe ser corta, legible, sin numeración y
+   Clasifica cada actividad por la NATURALEZA PRINCIPAL del trabajo y por el
+   elemento o sistema que realmente se entrega. No uses palabras secundarias,
+   propiedades del material o adjetivos técnicos para decidir la partida.
+   PRELIMINARES Y PROTECCIONES se usa únicamente cuando el propósito principal
+   sea preparar o proteger TEMPORALMENTE la obra.
+   LIMPIEZA Y ENTREGA se reserva únicamente para limpieza final y cierre.
+6. orden_ejecucion debe representar la secuencia constructiva real del conjunto.
+   No copies el orden en que el usuario enumeró las tareas. Considera dependencias
+   entre actividades y deja la limpieza/entrega al final.
+7. subpartida se muestra en el Excel. Debe ser corta, legible, sin numeración y
    normalmente de 1 a 5 palabras. Ejemplos: Licencias, Pisos, Muros, Frentes,
    Módulo Refri, Barra, Retiros.
-7. titulo_comercial debe ser corto y apto para cliente. Puede repetirse si el
+8. titulo_comercial debe ser corto y apto para cliente. Puede repetirse si el
    mismo tipo de trabajo corresponde a zonas distintas.
-8. descripcion_tecnica debe indicar qué se hace, dónde, especificación principal
+9. descripcion_tecnica debe indicar qué se hace, dónde, especificación principal
    y qué incluye, sin volverse excesivamente larga.
-9. codigo_sugerido es interno.
+10. codigo_sugerido es interno.
 
 CANTIDADES Y METRAJES
 10. Calcula M2, ML, M3, PZA u otras cantidades cuando las dimensiones aportadas
@@ -2404,6 +2462,152 @@ CONTROL DE CALIDAD
     )
 
 
+
+def auditar_estructura_presupuesto_ia(
+    api_key: str,
+    model_name: str,
+    project_data: dict,
+    result: PresupuestoIA,
+) -> PresupuestoIA:
+    """
+    Segunda pasada de Gemini dedicada solamente a partida, subpartida y secuencia.
+    Evalúa todas las actividades juntas y no modifica costos ni alcance.
+    """
+    if not result.actividades:
+        return result
+
+    client = genai.Client(api_key=api_key)
+    activities = [
+        {
+            "codigo": act.codigo_sugerido,
+            "partida_actual": act.partida,
+            "subpartida_actual": act.subpartida,
+            "titulo": act.titulo_comercial,
+            "descripcion": act.descripcion_tecnica,
+            "orden_actual": act.orden_ejecucion,
+        }
+        for act in result.actividades
+    ]
+
+    prompt = f"""
+Actúa como AUDITOR DE PARTIDAS Y SECUENCIA DE OBRA.
+
+Revisa el presupuesto COMPLETO como un conjunto. No cambies actividades,
+cantidades, unidades, descripciones, especificaciones ni precios. Solo corrige:
+- partida;
+- subpartida;
+- orden_ejecucion.
+
+PROYECTO
+Tipo: {project_data['project_type']}
+Ubicación: {project_data['location']}
+Descripción:
+{project_data['description']}
+
+ACTIVIDADES
+{json.dumps(activities, ensure_ascii=False, separators=(',', ':'))}
+
+CRITERIOS
+1. Clasifica por la naturaleza principal del trabajo y por el elemento, sistema
+   u oficio que realmente se entrega.
+2. No clasifiques usando palabras incidentales de la descripción, propiedades
+   del producto, tratamientos, resistencias, garantías o adjetivos técnicos.
+3. PRELIMINARES Y PROTECCIONES se reserva para trabajos temporales de preparación,
+   protección de áreas, trazos o instalaciones provisionales.
+4. LIMPIEZA Y ENTREGA se reserva para limpieza final, retiro de protecciones,
+   puesta a punto y cierre de obra.
+5. Un elemento permanente debe quedar en la partida que mejor represente el
+   trabajo permanente ejecutado.
+6. No copies el orden en que el usuario escribió las tareas. Revisa dependencias
+   constructivas reales entre todas las actividades.
+7. Trabajos previos deben anteceder a lo que depende de ellos; demoliciones a las
+   reconstrucciones; preparaciones e instalaciones ocultas a cierres y acabados;
+   elementos finales a sus soportes terminados; limpieza y entrega al final.
+8. Asigna orden_ejecucion creciente con espacios entre valores (10, 20, 30...).
+9. Devuelve exactamente una entrada por cada código recibido y conserva el código.
+
+No incluyas explicaciones adicionales.
+"""
+
+    models = []
+    for model in [
+        model_name,
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+    ]:
+        if model and model not in models:
+            models.append(model)
+
+    for model in models:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=AuditoriaEstructuraIA,
+                ),
+            )
+            if not response.text:
+                continue
+
+            audit = AuditoriaEstructuraIA.model_validate_json(response.text)
+            by_code = {
+                str(x.codigo or "").strip().upper(): x
+                for x in audit.actividades
+            }
+
+            updated = []
+            for act in result.actividades:
+                correction = by_code.get(
+                    str(act.codigo_sugerido or "").strip().upper()
+                )
+                if correction is None:
+                    updated.append(act)
+                    continue
+
+                updated.append(
+                    act.model_copy(
+                        update={
+                            "partida": normalizar_seccion_comercial(correction.partida),
+                            "subpartida": correction.subpartida.strip() or act.subpartida,
+                            "orden_ejecucion": int(correction.orden_ejecucion),
+                        }
+                    )
+                )
+
+            return result.model_copy(update={"actividades": updated})
+        except Exception:
+            # Es una capa adicional de calidad; si falla un modelo se prueba el
+            # siguiente y, si todos fallan, se conserva la primera clasificación.
+            continue
+
+    return result
+
+
+def sincronizar_items_con_estructura(
+    result: PresupuestoIA,
+    items: list[dict],
+) -> list[dict]:
+    """Sincroniza partida/subpartida/orden sin modificar costos."""
+    by_code = {
+        str(act.codigo_sugerido or "").strip().upper(): act
+        for act in result.actividades
+    }
+    output = []
+
+    for item in items:
+        out = dict(item)
+        act = by_code.get(str(out.get("code") or "").strip().upper())
+        if act is not None:
+            out["category"] = normalizar_seccion_comercial(act.partida)
+            out["subcategory"] = act.subpartida.strip()
+            out["execution_order"] = int(act.orden_ejecucion)
+        output.append(out)
+
+    return output
+
 def revisar_presupuesto_ia(
     api_key: str,
     model_name: str,
@@ -2424,6 +2628,7 @@ def revisar_presupuesto_ia(
             "codigo": x["code"],
             "partida": x["category"],
             "subpartida": x["subcategory"],
+            "orden_ejecucion": x.get("execution_order", 500),
             "titulo_comercial": titulo_comercial_item(x),
             "descripcion": x["description"],
             "unidad": x["unit"],
@@ -2493,8 +2698,9 @@ INSTRUCCIONES
 12. Mantén actividades generales subcontratables; no desarrolles APU de materiales y mano de
     obra salvo que la petición lo requiera expresamente.
 13. Conserva la estructura comercial: partida amplia, subpartida corta,
-    titulo_comercial y descripción. Si el usuario solo pide revisar precio o
-    cantidad, conserva partida y subpartida salvo que el cambio realmente las afecte.
+    titulo_comercial, descripción y orden_ejecucion. Si el usuario solo pide
+    revisar precio o cantidad, conserva esos campos salvo que el cambio realmente
+    afecte la naturaleza o dependencia de la actividad.
 14. Conserva el nivel comercial seleccionado del proyecto.
 15. porcentaje_materiales, porcentaje_mano_obra y porcentaje_otros son solamente
     una composición estimada; mantenla coherente y cercana a 100 %.
@@ -2753,6 +2959,7 @@ def resolver_items(
                 "category": normalizar_seccion_comercial(act.partida),
                 "subcategory": act.subpartida.strip(),
                 "code": code,
+                "execution_order": int(act.orden_ejecucion),
                 "commercial_title": act.titulo_comercial.strip(),
                 "description": act.descripcion_tecnica.strip(),
                 "unit": act.unidad.strip().upper(),
@@ -2819,6 +3026,7 @@ def item_a_actividad(item: dict) -> ActividadIA:
         partida=item["category"],
         subpartida=item["subcategory"],
         codigo_sugerido=item["code"],
+        orden_ejecucion=int(item.get("execution_order") or 500),
         titulo_comercial=titulo_comercial_item(item),
         descripcion_tecnica=item["description"],
         unidad=item["unit"],
@@ -4942,6 +5150,12 @@ if "generated" not in st.session_state:
                     project_data=project_data,
                     params=params,
                 )
+                result = auditar_estructura_presupuesto_ia(
+                    api_key=api_key,
+                    model_name=model_name,
+                    project_data=project_data,
+                    result=result,
+                )
                 items = resolver_items(db, result, project_data, params)
                 if not items:
                     raise RuntimeError("La IA no generó actividades utilizables.")
@@ -5133,6 +5347,16 @@ else:
                             revision=revision,
                             project_data=g["project_data"],
                             params=g["params"],
+                        )
+                        revised_result = auditar_estructura_presupuesto_ia(
+                            api_key=api_key,
+                            model_name=model_name,
+                            project_data=g["project_data"],
+                            result=revised_result,
+                        )
+                        revised_items = sincronizar_items_con_estructura(
+                            revised_result,
+                            revised_items,
                         )
                         revised_financials = calcular_financieros(
                             revised_items,
