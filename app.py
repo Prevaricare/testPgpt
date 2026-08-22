@@ -2131,7 +2131,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-08-21-v11.3-auditoria-secuencia"
+DATABASE_CACHE_VERSION = "2026-08-21-v11.4-restaurar-entrada"
 
 
 @st.cache_resource(show_spinner=False)
@@ -5044,12 +5044,46 @@ ADJUSTMENT_EXAMPLE = """Ejemplos:
 
 
 def volver_a_entrada():
-    """Regresa al formulario conservando los datos capturados."""
+    """
+    Regresa al formulario conservando exactamente los datos con los que se
+    generó el presupuesto.
+
+    Se utiliza un estado intermedio independiente de los widgets porque
+    Streamlit puede retirar del session_state los valores de widgets que dejan
+    de renderizarse mientras se muestra la pantalla de resultados.
+    """
+    generated = st.session_state.get("generated")
+    if generated:
+        project_data = generated.get("project_data") or {}
+
+        st.session_state["_restore_project_form"] = {
+            "client_name": project_data.get("name", ""),
+            "project_location": project_data.get("location", ""),
+            "project_type": project_data.get(
+                "project_type",
+                "Remodelación interior general",
+            ),
+            "budget_level": project_data.get("budget_level", "Medio-alto"),
+            "project_description": project_data.get("description", ""),
+            "guide_text": (
+                project_data.get("guide_text")
+                if project_data.get("guide_text") is not None
+                else DEFAULT_GUIDE_TEXT
+            ),
+        }
+
     st.session_state.pop("generated", None)
     st.rerun()
 
 
 if "generated" not in st.session_state:
+    # Restauración explícita al volver desde un presupuesto ya generado.
+    # Debe ocurrir ANTES de crear los widgets del formulario.
+    restore_data = st.session_state.pop("_restore_project_form", None)
+    if restore_data:
+        for field_key, field_value in restore_data.items():
+            st.session_state[field_key] = field_value
+
     if "guide_text" not in st.session_state:
         st.session_state["guide_text"] = DEFAULT_GUIDE_TEXT
 
