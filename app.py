@@ -385,54 +385,238 @@ def descripcion_excel_item(item: dict) -> str:
 
 
 AREA_GENERAL = "General"
+BRAND_MARKUP_PCT = 30.0
+
+
+PATRONES_AREAS_EXPLICITAS = [
+    r"\broof\s*garden\b",
+    r"\b(?:cuarto|área|area)\s+de\s+lavado\b",
+    r"\b(?:walk[\s-]*in\s+closet|walking\s+closet|vestidor)\b",
+    r"\bbañ(?:o|os)(?:\s+(?:principal|de\s+visitas|visitas|social|secundario|[1-9]))?\b",
+    r"\bcocina\b",
+    r"\bsala(?:\s*(?:/|y)\s*comedor)?\b",
+    r"\bcomedor\b",
+    r"\brec[aá]mara(?:\s+(?:principal|secundaria|[1-9]))?\b",
+    r"\bhabitaci[oó]n(?:\s+(?:principal|secundaria|[1-9]))?\b",
+    r"\bestudio(?:\s+[1-9])?\b",
+    r"\bpatio(?:\s+(?:trasero|posterior|frontal|delantero))?\b",
+    r"\bazotea\b",
+    r"\bterraza\b",
+    r"\bbalc[oó]n\b",
+    r"\bfachada\b",
+    r"\bescalera\b",
+    r"\blavander[ií]a\b",
+    r"\bbodega\b",
+    r"\bestacionamiento(?:\s+[1-9])?\b",
+    r"\bcochera(?:\s+[1-9])?\b",
+    r"\bjard[ií]n\b",
+    r"\bpasillo\b",
+]
 
 
 def normalizar_nombre_area(value: str) -> str:
-    """Normaliza el nombre visible de un área sin intentar adivinar espacios."""
     raw = re.sub(r"\s+", " ", str(value or "").strip())
     if not raw:
         return AREA_GENERAL
 
     key = normalizar_texto(raw).upper()
-    aliases_general = {
-        "GENERAL",
-        "GENERALES",
-        "AREA GENERAL",
-        "AREAS GENERALES",
-        "TODA LA OBRA",
-        "TODO EL PROYECTO",
-        "PROYECTO GENERAL",
-        "OBRA GENERAL",
-    }
-    if key in aliases_general:
+    if key in {
+        "GENERAL", "GENERALES", "AREA GENERAL", "AREAS GENERALES",
+        "TODA LA OBRA", "TODO EL PROYECTO",
+    }:
         return AREA_GENERAL
 
+    display = raw.replace("area ", "Área ").replace("Area ", "Área ")
     words = []
-    for word in raw.split():
-        if word.isupper() and len(word) <= 4:
+    for word in display.split():
+        if any(ch.isdigit() for ch in word):
             words.append(word)
-        elif any(ch.isdigit() for ch in word):
-            words.append(word)
+        elif word.upper() in {"UV"}:
+            words.append(word.upper())
         else:
             words.append(word[:1].upper() + word[1:].lower())
     return " ".join(words)
 
 
-def _allocation_to_dict(value) -> dict:
-    if value is None:
-        return {}
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    if isinstance(value, dict):
-        return dict(value)
-    return {}
+def tipo_base_area(area: str) -> str:
+    key = normalizar_texto(area).upper()
+    equivalencias = [
+        ("BANO", "BANO"), ("COCINA", "COCINA"), ("SALA", "SALA"),
+        ("COMEDOR", "COMEDOR"), ("RECAMARA", "DORMITORIO"),
+        ("HABITACION", "DORMITORIO"), ("ESTUDIO", "ESTUDIO"),
+        ("PATIO", "PATIO"), ("AZOTEA", "AZOTEA"),
+        ("ROOF GARDEN", "ROOF GARDEN"), ("TERRAZA", "TERRAZA"),
+        ("BALCON", "BALCON"), ("FACHADA", "FACHADA"),
+        ("ESCALERA", "ESCALERA"), ("CUARTO DE LAVADO", "LAVADO"),
+        ("AREA DE LAVADO", "LAVADO"), ("LAVANDERIA", "LAVADO"),
+        ("BODEGA", "BODEGA"), ("WALK IN CLOSET", "VESTIDOR"),
+        ("WALKING CLOSET", "VESTIDOR"), ("VESTIDOR", "VESTIDOR"),
+        ("ESTACIONAMIENTO", "ESTACIONAMIENTO"), ("COCHERA", "ESTACIONAMIENTO"),
+        ("JARDIN", "JARDIN"), ("PASILLO", "PASILLO"),
+    ]
+    for prefix, base in equivalencias:
+        if key.startswith(prefix):
+            return base
+    return key
+
+
+def detectar_areas_explicitas(project_data: dict) -> list[str]:
+    """Detecta áreas solo en la descripción original escrita por el usuario."""
+    source = str(project_data.get("description") or "")
+    if not source.strip():
+        return []
+
+    matches = []
+    occupied = []
+    for pattern in PATRONES_AREAS_EXPLICITAS:
+        for match in re.finditer(pattern, source, flags=re.I):
+            span = match.span()
+            if any(not (span[1] <= a or span[0] >= b) for a, b in occupied):
+                continue
+            occupied.append(span)
+            matches.append((span[0], normalizar_nombre_area(match.group(0))))
+
+    matches.sort(key=lambda x: x[0])
+    output, seen = [], set()
+    for _, area in matches:
+        key = normalizar_texto(area).upper()
+        if key not in seen:
+            seen.add(key)
+            output.append(area)
+    return output
+
+
+def _texto_item_para_area(item: dict) -> str:
+    return " ".join(
+        str(item.get(key) or "")
+        for key in (
+            "subcategory", "commercial_title", "description",
+            "quantity_criterion", "inclusion_basis",
+        )
+    )
+
+
+def _areas_mencionadas_en_item(project_data: dict, item: dict) -> list[str]:
+    areas = detectar_areas_explicitas(project_data)
+    if not areas:
+        return []
+
+    item_key = normalizar_texto(_texto_item_para_area(item)).upper()
+    exact = []
+    for area in areas:
+        area_key = normalizar_texto(area).upper()
+        if area_key and area_key in item_key:
+            exact.append(area)
+    if exact:
+        return exact
+
+    by_type = {}
+    for area in areas:
+        by_type.setdefault(tipo_base_area(area), []).append(area)
+
+    generic = []
+    tokens_by_type = {
+        "BANO": ("BANO",), "COCINA": ("COCINA",), "SALA": ("SALA",),
+        "COMEDOR": ("COMEDOR",), "DORMITORIO": ("RECAMARA", "HABITACION"),
+        "ESTUDIO": ("ESTUDIO",), "PATIO": ("PATIO",), "AZOTEA": ("AZOTEA",),
+        "ROOF GARDEN": ("ROOF GARDEN",), "TERRAZA": ("TERRAZA",),
+        "BALCON": ("BALCON",), "FACHADA": ("FACHADA",),
+        "ESCALERA": ("ESCALERA",), "LAVADO": ("LAVADO", "LAVANDERIA"),
+        "BODEGA": ("BODEGA",), "VESTIDOR": ("VESTIDOR", "CLOSET"),
+        "ESTACIONAMIENTO": ("ESTACIONAMIENTO", "COCHERA"),
+        "JARDIN": ("JARDIN",), "PASILLO": ("PASILLO",),
+    }
+    for base, candidates in by_type.items():
+        if len(candidates) != 1:
+            continue
+        if any(token in item_key for token in tokens_by_type.get(base, (base,))):
+            generic.append(candidates[0])
+    return generic
+
+
+def _m2_explicitos_cerca_de_area(project_data: dict, area: str) -> float | None:
+    source = str(project_data.get("description") or "")
+    source_norm = normalizar_texto(source).upper()
+    area_norm = normalizar_texto(area).upper()
+    start = source_norm.find(area_norm)
+    if start < 0:
+        return None
+
+    # Cortar la búsqueda antes de la siguiente área explícita. Así una medida de
+    # Cocina no puede terminar asignándose accidentalmente a Baño 1, por ejemplo.
+    next_starts = []
+    for other in detectar_areas_explicitas(project_data):
+        other_norm = normalizar_texto(other).upper()
+        pos = source_norm.find(other_norm, start + len(area_norm))
+        if pos > start:
+            next_starts.append(pos)
+    end = min(next_starts) if next_starts else min(len(source), start + 120)
+    end = min(end, start + 120)
+    window = source[start:end]
+
+    direct = re.search(
+        r"(\d+(?:[.,]\d+)?)\s*(?:m2|m²|metros?\s+cuadrados?)",
+        window, flags=re.I,
+    )
+    if direct:
+        return float(direct.group(1).replace(",", "."))
+
+    dims = re.search(
+        r"(\d+(?:[.,]\d+)?)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*m\b",
+        window, flags=re.I,
+    )
+    if dims:
+        return float(dims.group(1).replace(",", ".")) * float(dims.group(2).replace(",", "."))
+    return None
+
+
+def asignar_areas_deterministicamente(project_data: dict, item: dict) -> list[dict]:
+    """
+    1) una sola área explícita -> 100 %;
+    2) varias áreas + concepto M2 + m² explícitos conciliables -> proporcional;
+    3) cualquier caso ambiguo -> General 100 %.
+    """
+    matches = _areas_mencionadas_en_item(project_data, item)
+
+    if len(matches) == 1:
+        return [{
+            "area": matches[0], "porcentaje": 100.0,
+            "cantidad_referencia": float(item.get("quantity") or 0.0),
+            "criterio": "Área indicada explícitamente en el alcance del concepto.",
+            "confianza": "Alta",
+        }]
+
+    if len(matches) > 1 and normalizar_unidad(item.get("unit")) == "M2":
+        measures = {area: _m2_explicitos_cerca_de_area(project_data, area) for area in matches}
+        if all(v is not None and v > 0 for v in measures.values()):
+            total_measure = sum(measures.values())
+            item_qty = float(item.get("quantity") or 0.0)
+            tolerance = max(1.0, item_qty * 0.15)
+            if item_qty > 0 and abs(total_measure - item_qty) <= tolerance:
+                result, accumulated = [], 0.0
+                for idx, area in enumerate(matches):
+                    if idx == len(matches) - 1:
+                        pct = max(100.0 - accumulated, 0.0)
+                    else:
+                        pct = round(measures[area] / total_measure * 100.0, 6)
+                        accumulated += pct
+                    result.append({
+                        "area": area, "porcentaje": pct,
+                        "cantidad_referencia": measures[area],
+                        "criterio": "Reparto calculado con m² explícitos del texto inicial.",
+                        "confianza": "Alta",
+                    })
+                return result
+
+    return [{
+        "area": AREA_GENERAL, "porcentaje": 100.0,
+        "cantidad_referencia": None,
+        "criterio": "No existe una asignación por área verificable con los datos iniciales.",
+        "confianza": "Alta",
+    }]
 
 
 def normalizar_asignaciones_area(asignaciones) -> list[dict]:
-    """
-    Valida una distribución y garantiza que cada concepto suma exactamente 100 %.
-    Si no existe una asignación justificable, usa General 100 %.
-    """
     if isinstance(asignaciones, str):
         try:
             asignaciones = json.loads(asignaciones)
@@ -441,78 +625,39 @@ def normalizar_asignaciones_area(asignaciones) -> list[dict]:
 
     rows = []
     for raw in asignaciones or []:
-        data = _allocation_to_dict(raw)
-        area = normalizar_nombre_area(data.get("area"))
+        if hasattr(raw, "model_dump"):
+            raw = raw.model_dump()
+        if not isinstance(raw, dict):
+            continue
         try:
-            pct = max(float(data.get("porcentaje") or 0.0), 0.0)
+            pct = max(float(raw.get("porcentaje") or 0.0), 0.0)
         except (TypeError, ValueError):
             pct = 0.0
-        try:
-            qty = data.get("cantidad_referencia")
-            qty = None if qty in (None, "") else max(float(qty), 0.0)
-        except (TypeError, ValueError):
-            qty = None
-
         if pct <= 0:
             continue
-
-        rows.append(
-            {
-                "area": area,
-                "porcentaje": pct,
-                "cantidad_referencia": qty,
-                "criterio": str(data.get("criterio") or "").strip(),
-                "confianza": str(data.get("confianza") or "Media").strip() or "Media",
-            }
-        )
+        rows.append({
+            "area": normalizar_nombre_area(raw.get("area")),
+            "porcentaje": pct,
+            "cantidad_referencia": raw.get("cantidad_referencia"),
+            "criterio": str(raw.get("criterio") or ""),
+            "confianza": str(raw.get("confianza") or "Alta"),
+        })
 
     if not rows:
-        return [
-            {
-                "area": AREA_GENERAL,
-                "porcentaje": 100.0,
-                "cantidad_referencia": None,
-                "criterio": "No existe información suficiente para asignar el concepto a un área específica.",
-                "confianza": "Baja",
-            }
-        ]
+        return [{
+            "area": AREA_GENERAL, "porcentaje": 100.0,
+            "cantidad_referencia": None,
+            "criterio": "Sin asignación verificable.", "confianza": "Alta",
+        }]
 
-    combined = {}
-    order = []
-    for row in rows:
-        key = normalizar_texto(row["area"]).upper()
-        if key not in combined:
-            combined[key] = dict(row)
-            order.append(key)
-        else:
-            combined[key]["porcentaje"] += row["porcentaje"]
-            a = combined[key].get("cantidad_referencia")
-            b = row.get("cantidad_referencia")
-            if a is not None and b is not None:
-                combined[key]["cantidad_referencia"] = a + b
-            elif a is None:
-                combined[key]["cantidad_referencia"] = b
-            if not combined[key].get("criterio") and row.get("criterio"):
-                combined[key]["criterio"] = row["criterio"]
-
-    rows = [combined[key] for key in order]
-    total = sum(row["porcentaje"] for row in rows)
-    if total <= 0:
-        return normalizar_asignaciones_area([])
-
-    normalized = []
-    running = 0.0
+    total, running = sum(x["porcentaje"] for x in rows), 0.0
     for idx, row in enumerate(rows):
-        out = dict(row)
         if idx == len(rows) - 1:
-            pct = max(100.0 - running, 0.0)
+            row["porcentaje"] = max(100.0 - running, 0.0)
         else:
-            pct = round(row["porcentaje"] / total * 100.0, 6)
-            running += pct
-        out["porcentaje"] = pct
-        normalized.append(out)
-
-    return normalized
+            row["porcentaje"] = round(row["porcentaje"] / total * 100.0, 6)
+            running += row["porcentaje"]
+    return rows
 
 
 def obtener_asignaciones_area_item(item: dict) -> list[dict]:
@@ -523,11 +668,17 @@ def obtener_asignaciones_area_item(item: dict) -> list[dict]:
     return normalizar_asignaciones_area([])
 
 
+def recalcular_areas_items(project_data: dict, items: list[dict]) -> list[dict]:
+    output = []
+    for item in items:
+        out = dict(item)
+        out["area_allocations"] = asignar_areas_deterministicamente(project_data, out)
+        output.append(out)
+    return output
+
+
 def descripcion_areas_item(item: dict) -> str:
-    return " · ".join(
-        f"{x['area']} {x['porcentaje']:.1f}%"
-        for x in obtener_asignaciones_area_item(item)
-    )
+    return " · ".join(x["area"] for x in obtener_asignaciones_area_item(item))
 
 
 NIVELES_PRESUPUESTO = ["Económico", "Medio", "Medio-alto", "Alto"]
@@ -2292,7 +2443,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-08-24-v12-costos-por-area"
+DATABASE_CACHE_VERSION = "2026-08-25-v13-marca-y-areas-deterministas"
 
 
 @st.cache_resource(show_spinner=False)
@@ -2315,32 +2466,6 @@ def get_database(database_url: str | None, cache_version: str):
 # =========================================================
 # MODELOS DE RESPUESTA ESTRUCTURADA
 # =========================================================
-
-
-class AsignacionAreaIA(BaseModel):
-    area: str = Field(
-        description=(
-            "Área física o funcional beneficiada por esta parte del concepto, "
-            "por ejemplo Cocina, Baño 1, Baño principal, Sala o General."
-        )
-    )
-    porcentaje: float = Field(
-        ge=0,
-        le=100,
-        description="Porcentaje del importe del concepto atribuible a esta área",
-    )
-    cantidad_referencia: float | None = Field(
-        default=None,
-        ge=0,
-        description=(
-            "Cantidad o metraje usado como referencia para repartir el concepto, "
-            "si existe. No altera la cantidad contractual del concepto."
-        ),
-    )
-    criterio: str = Field(
-        description="Criterio breve usado para justificar esta distribución"
-    )
-    confianza: str = Field(description="Alta, Media o Baja")
 
 
 class ActividadIA(BaseModel):
@@ -2406,12 +2531,6 @@ class ActividadIA(BaseModel):
     nivel_confianza_precio: str = Field(description="Alta, Media o Baja")
     requiere_cotizacion: bool = Field(description="True si el costo debería confirmarse con proveedor especializado")
     consideraciones: str = Field(description="Supuestos, exclusiones o condiciones relevantes")
-    asignaciones_area: list[AsignacionAreaIA] = Field(
-        description=(
-            "Distribución del concepto entre áreas. Debe sumar aproximadamente 100 %. "
-            "Si no puede justificarse una distribución específica, usar General 100 %."
-        )
-    )
 
 
 class PresupuestoIA(BaseModel):
@@ -2431,9 +2550,6 @@ class ClasificacionActividadIA(BaseModel):
         ge=1,
         le=999,
         description="Orden relativo corregido según la secuencia constructiva",
-    )
-    asignaciones_area: list[AsignacionAreaIA] = Field(
-        description="Distribución corregida del concepto entre áreas del proyecto"
     )
 
 
@@ -2610,33 +2726,11 @@ PROYECTO EJECUTIVO Y TRÁMITES
 21. Incluye esos conceptos solamente cuando sean previsibles para el alcance.
     Para una remodelación pequeña no agregues trámites por rutina.
 
-DISTRIBUCIÓN POR ÁREAS
-22. Además de Partida/Subpartida, identifica DÓNDE se realiza o a qué espacio
-    beneficia cada actividad. Esta es una dimensión distinta:
-    - Partida/Subpartida = qué tipo de trabajo es.
-    - Área = en qué espacio físico o funcional se aplica.
-23. Usa nombres de área consistentes en todo el presupuesto. Cuando existan varios
-    espacios del mismo tipo, diferéncialos con los nombres o números disponibles,
-    por ejemplo Baño 1 / Baño 2, o Baño principal / Baño visitas.
-24. Para cada actividad devuelve asignaciones_area. La suma de porcentaje debe ser
-    aproximadamente 100 %.
-25. Prioridad para distribuir:
-    a) metraje o cantidad conocida por área;
-    b) distribución explícita indicada por el usuario;
-    c) estimación profesional razonable si existen datos suficientes;
-    d) si no puede justificarse, General 100 %.
-26. No repartas arbitrariamente conceptos generales solo para hacer desaparecer
-    General. Proyecto ejecutivo, permisos, protecciones generales, supervisión,
-    limpieza general u otros trabajos de toda la obra pueden permanecer en General.
-27. Si un mismo concepto sirve a varias áreas, repártelo entre ellas sin duplicar
-    su costo. cantidad_referencia puede documentar los metrajes usados, pero la
-    suma de importes asignados debe seguir representando un solo concepto.
-
 CONTROL DE CALIDAD
-28. No dupliques conceptos.
-29. Para cada actividad da criterio_cantidad y fundamento_inclusion breves.
-30. Concentra incertidumbres en datos_faltantes sin bloquear una estimación útil.
-31. No expongas cadenas de pensamiento ni razonamiento interno.
+22. No dupliques conceptos.
+23. Para cada actividad da criterio_cantidad y fundamento_inclusion breves.
+24. Concentra incertidumbres en datos_faltantes sin bloquear una estimación útil.
+25. No expongas cadenas de pensamiento ni razonamiento interno.
 """
 
     modelos = []
@@ -2703,9 +2797,6 @@ def auditar_estructura_presupuesto_ia(
             "titulo": act.titulo_comercial,
             "descripcion": act.descripcion_tecnica,
             "orden_actual": act.orden_ejecucion,
-            "areas_actuales": [
-                x.model_dump() for x in act.asignaciones_area
-            ],
         }
         for act in result.actividades
     ]
@@ -2717,8 +2808,7 @@ Revisa el presupuesto COMPLETO como un conjunto. No cambies actividades,
 cantidades, unidades, descripciones, especificaciones ni precios. Solo corrige:
 - partida;
 - subpartida;
-- orden_ejecucion;
-- distribución por áreas.
+- orden_ejecucion.
 
 PROYECTO
 Tipo: {project_data['project_type']}
@@ -2747,19 +2837,7 @@ CRITERIOS
    elementos finales a sus soportes terminados; limpieza y entrega al final.
 8. Asigna orden_ejecucion creciente con espacios entre valores (10, 20, 30...).
 
-DISTRIBUCIÓN POR ÁREAS
-9. Revisa las áreas de TODAS las actividades juntas y usa nombres consistentes.
-10. Área no significa Partida: un concepto de Acabados puede estar en Cocina,
-    Baño 1 o varias áreas.
-11. Cuando existan cantidades o metrajes conocidos por área, úsalos como primera
-    base de reparto. Si el usuario dio una distribución explícita, respétala.
-12. Si un concepto pertenece a varias áreas, devuelve varios porcentajes sin
-    duplicar el costo. La suma debe ser aproximadamente 100 %.
-13. Los costos comunes de toda la obra que no puedan asignarse justificadamente
-    deben permanecer en General. No los repartas arbitrariamente.
-14. Si la información no permite identificar un área específica con confianza,
-    usa General 100 %.
-15. Devuelve exactamente una entrada por cada código recibido y conserva el código.
+9. Devuelve exactamente una entrada por cada código recibido y conserva el código.
 
 No incluyas explicaciones adicionales.
 """
@@ -2808,12 +2886,6 @@ No incluyas explicaciones adicionales.
                             "partida": normalizar_seccion_comercial(correction.partida),
                             "subpartida": correction.subpartida.strip() or act.subpartida,
                             "orden_ejecucion": int(correction.orden_ejecucion),
-                            "asignaciones_area": [
-                                AsignacionAreaIA.model_validate(x)
-                                for x in normalizar_asignaciones_area(
-                                    correction.asignaciones_area
-                                )
-                            ],
                         }
                     )
                 )
@@ -2831,7 +2903,7 @@ def sincronizar_items_con_estructura(
     result: PresupuestoIA,
     items: list[dict],
 ) -> list[dict]:
-    """Sincroniza partida/subpartida/orden/áreas sin modificar costos."""
+    """Sincroniza partida/subpartida/orden sin modificar costos."""
     by_code = {
         str(act.codigo_sugerido or "").strip().upper(): act
         for act in result.actividades
@@ -2845,9 +2917,6 @@ def sincronizar_items_con_estructura(
             out["category"] = normalizar_seccion_comercial(act.partida)
             out["subcategory"] = act.subpartida.strip()
             out["execution_order"] = int(act.orden_ejecucion)
-            out["area_allocations"] = normalizar_asignaciones_area(
-                act.asignaciones_area
-            )
         output.append(out)
 
     return output
@@ -2884,7 +2953,6 @@ def revisar_presupuesto_ia(
             "mano_obra_pct": x.get("labor_share_pct", 0.0),
             "otros_pct": x.get("other_share_pct", 100.0),
             "desperdicio_materiales_pct": x.get("waste_reference_pct", 0.0),
-            "areas": obtener_asignaciones_area_item(x),
             "criterio_cantidad": x["quantity_criterion"],
             "consideraciones": x["considerations"],
         }
@@ -2949,11 +3017,7 @@ INSTRUCCIONES
 14. Conserva el nivel comercial seleccionado del proyecto.
 15. porcentaje_materiales, porcentaje_mano_obra y porcentaje_otros son solamente
     una composición estimada; mantenla coherente y cercana a 100 %.
-16. Conserva asignaciones_area cuando el cambio no afecte dónde se realiza el
-    trabajo. Si el alcance cambia de área o se agrega una actividad, actualiza la
-    distribución. No dupliques costos entre áreas y usa General cuando no exista
-    una distribución justificable.
-17. No calcules indirectos, utilidad, venta ni IVA; Python hará esos cálculos.
+16. No calcules indirectos, utilidad, venta ni IVA; Python hará esos cálculos.
 17. Devuelve el alcance, consideraciones y datos faltantes completos y actualizados.
 18. En motivo escribe solo una explicación breve del cambio, sin razonamiento interno.
 """
@@ -3229,15 +3293,16 @@ def resolver_items(
                 "labor_share_pct": act.porcentaje_mano_obra,
                 "other_share_pct": act.porcentaje_otros,
                 "waste_reference_pct": act.desperdicio_materiales_pct,
-                "area_allocations": normalizar_asignaciones_area(
-                    act.asignaciones_area
-                ),
                 "quantity_confidence": act.nivel_confianza_cantidad,
                 "quantity_criterion": act.criterio_cantidad.strip(),
                 "inclusion_basis": act.fundamento_inclusion.strip(),
                 "considerations": considerations,
             }
         item_data = aplicar_composicion_costo(item_data)
+        item_data["area_allocations"] = asignar_areas_deterministicamente(
+            project_data,
+            item_data,
+        )
         items.append(item_data)
 
     return items
@@ -3298,10 +3363,6 @@ def item_a_actividad(item: dict) -> ActividadIA:
         nivel_confianza_precio=item.get("price_confidence") or "Media",
         requiere_cotizacion="requiere cotización" in (item.get("considerations") or "").lower(),
         consideraciones=item.get("considerations") or "",
-        asignaciones_area=[
-            AsignacionAreaIA.model_validate(x)
-            for x in obtener_asignaciones_area_item(item)
-        ],
     )
 
 
@@ -3532,8 +3593,8 @@ def crear_excel(
       fuentes, criterios y consideraciones.
 
     04 Costos por Área:
-      distribución del importe comercial entre espacios físicos o funcionales.
-      Está enlazada a 01 Presupuesto para conservar ajustes manuales.
+      revisión interna simplificada calculada únicamente con áreas y metrajes
+      explícitos del texto inicial. No aplica IVA ni 30 % de marca.
     """
     wb = Workbook()
     # Forzar recálculo al abrir/guardar para que Excel y hojas compatibles
@@ -3558,6 +3619,7 @@ def crear_excel(
 
     thin_gray = Side(style="thin", color="D4D4D4")
 
+    items = recalcular_areas_items(project_data, items)
     structured_items = estructura_partidas_excel(items)
     ordered_items = [dict(x) for x in structured_items]
     commercial_row_map = {}
@@ -3612,14 +3674,22 @@ def crear_excel(
         summary_map[section] = summary_row
         summary_row += 1
 
-    subtotal_summary_row = summary_row
+    internal_summary_row = summary_row
     ws.merge_cells(
         start_row=summary_row, start_column=1, end_row=summary_row, end_column=6
     )
-    ws.cell(summary_row, 1, "Subtotal Ejecución")
+    ws.cell(summary_row, 1, "Presupuesto interno (sin IVA)")
     ws.cell(summary_row, 1).font = Font(bold=True)
     ws.cell(summary_row, 1).fill = PatternFill("solid", fgColor=gray)
     ws.cell(summary_row, 7).fill = PatternFill("solid", fgColor=gray)
+    summary_row += 1
+
+    brand_summary_row = summary_row
+    ws.merge_cells(
+        start_row=summary_row, start_column=1, end_row=summary_row, end_column=6
+    )
+    ws.cell(summary_row, 1, f"Presupuesto + {BRAND_MARKUP_PCT:.0f}% marca (sin IVA)")
+    ws.cell(summary_row, 1).font = Font(bold=True)
     summary_row += 1
 
     iva_summary_row = summary_row
@@ -3634,7 +3704,7 @@ def crear_excel(
     ws.merge_cells(
         start_row=summary_row, start_column=1, end_row=summary_row, end_column=6
     )
-    ws.cell(summary_row, 1, "Gran Total (MXN)")
+    ws.cell(summary_row, 1, "Total final con IVA (MXN)")
     ws.cell(summary_row, 1).font = Font(size=11, bold=True, color=brown)
     ws.cell(summary_row, 7).font = Font(size=11, bold=True, color=brown)
     ws.cell(summary_row, 1).fill = PatternFill("solid", fgColor=brown_light)
@@ -3718,44 +3788,20 @@ def crear_excel(
         row += 1
 
     # -----------------------------------------------------
-    # TOTALES AL FINAL DE LA TABLA
+    # TOTAL INTERNO AL FINAL DE LA TABLA
     # -----------------------------------------------------
     row += 1
-    subtotal_detail_row = row
-    ws.merge_cells(
-        start_row=row, start_column=1, end_row=row, end_column=6
-    )
-    ws.cell(row, 1, "Subtotal Ejecución")
+    internal_detail_row = row
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+    ws.cell(row, 1, "Presupuesto interno (sin IVA / sin 30% marca)")
     ws.cell(row, 1).font = Font(bold=True)
     ws.cell(row, 7, f"=SUM(G{table_header_row + 1}:G{row - 2})")
     ws.cell(row, 7).number_format = '$#,##0.00'
     ws.cell(row, 7).font = Font(bold=True)
+    ws.cell(row, 1).fill = PatternFill("solid", fgColor=gray)
+    ws.cell(row, 7).fill = PatternFill("solid", fgColor=gray)
 
-    row += 1
-    iva_detail_row = row
-    ws.merge_cells(
-        start_row=row, start_column=1, end_row=row, end_column=6
-    )
-    ws.cell(row, 1, f"IVA {params['iva_pct']:.0f}%")
-    ws.cell(row, 7, f"=G{subtotal_detail_row}*'02 Control Interno'!$B$5")
-    ws.cell(row, 7).number_format = '$#,##0.00'
-
-    row += 1
-    total_detail_row = row
-    ws.merge_cells(
-        start_row=row, start_column=1, end_row=row, end_column=6
-    )
-    ws.cell(row, 1, "Gran Total (MXN)")
-    ws.cell(row, 1).font = Font(size=11, bold=True, color=brown)
-    ws.cell(row, 7, f"=G{subtotal_detail_row}+G{iva_detail_row}")
-    ws.cell(row, 7).number_format = '$#,##0.00'
-    ws.cell(row, 7).font = Font(size=11, bold=True, color=brown)
-
-    for rr in (subtotal_detail_row, total_detail_row):
-        ws.cell(rr, 1).fill = PatternFill("solid", fgColor=gray)
-        ws.cell(rr, 7).fill = PatternFill("solid", fgColor=gray)
-
-    # Resumen superior enlazado al detalle.
+    # Resumen superior enlazado al presupuesto interno.
     for section in sections:
         amount_rows = section_amount_rows.get(section) or []
         formula = "+".join(f"G{r}" for r in amount_rows) if amount_rows else "0"
@@ -3764,11 +3810,21 @@ def crear_excel(
         ws.cell(sr, 7).number_format = '$#,##0.00'
         ws.cell(sr, 7).alignment = Alignment(horizontal="right")
 
-    ws.cell(subtotal_summary_row, 7, f"=G{subtotal_detail_row}")
-    ws.cell(subtotal_summary_row, 7).number_format = '$#,##0.00'
-    ws.cell(iva_summary_row, 7, f"=G{iva_detail_row}")
+    ws.cell(internal_summary_row, 7, f"=G{internal_detail_row}")
+    ws.cell(internal_summary_row, 7).number_format = '$#,##0.00'
+
+    # El 30 % de marca existe únicamente en este resumen.
+    ws.cell(
+        brand_summary_row,
+        7,
+        f"=G{internal_summary_row}*(1+{BRAND_MARKUP_PCT / 100.0:.6f})",
+    )
+    ws.cell(brand_summary_row, 7).number_format = '$#,##0.00'
+
+    ws.cell(iva_summary_row, 7, f"=G{brand_summary_row}*'02 Control Interno'!$B$5")
     ws.cell(iva_summary_row, 7).number_format = '$#,##0.00'
-    ws.cell(total_summary_row, 7, f"=G{total_detail_row}")
+
+    ws.cell(total_summary_row, 7, f"=G{brand_summary_row}+G{iva_summary_row}")
     ws.cell(total_summary_row, 7).number_format = '$#,##0.00'
 
     # Medidas similares a una hoja de trabajo tradicional.
@@ -3943,7 +3999,7 @@ def crear_excel(
         "Criterio de cantidad",
         "Fundamento de inclusión",
         "Consideraciones",
-        "Distribución por área",
+        "Área calculada",
     ]
     for col, header in enumerate(trace_headers, 1):
         c = wt.cell(2, col, header)
@@ -3987,163 +4043,110 @@ def crear_excel(
         wt.column_dimensions[get_column_letter(col)].width = width
 
     # -----------------------------------------------------
-    # 04 COSTOS POR ÁREA
+    # 04 COSTOS POR ÁREA - REVISIÓN INTERNA SIMPLE
     # -----------------------------------------------------
     wa = wb.create_sheet("04 Costos por Área")
     wa.sheet_view.showGridLines = False
 
-    wa.merge_cells("A1:H1")
-    wa["A1"] = "COSTOS POR ÁREA"
+    wa.merge_cells("A1:C1")
+    wa["A1"] = "COSTOS INTERNOS POR ÁREA"
     wa["A1"].font = Font(size=15, bold=True, color=white)
     wa["A1"].fill = PatternFill("solid", fgColor=internal_blue)
 
     area_names = []
     for item in ordered_items:
         for allocation in obtener_asignaciones_area_item(item):
-            area = allocation["area"]
-            if area not in area_names:
-                area_names.append(area)
+            if allocation["area"] not in area_names:
+                area_names.append(allocation["area"])
     if AREA_GENERAL in area_names:
         area_names = [x for x in area_names if x != AREA_GENERAL] + [AREA_GENERAL]
     if not area_names:
         area_names = [AREA_GENERAL]
 
-    summary_headers = ["Área", "Subtotal sin IVA", "IVA", "Total con IVA"]
-    for col, header in enumerate(summary_headers, 1):
-        cell = wa.cell(2, col, header)
-        cell.font = Font(bold=True, color=white)
-        cell.fill = PatternFill("solid", fgColor=internal_blue)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+    wa["A2"] = "Área"
+    wa["B2"] = "Importe interno"
+    for cell in ("A2", "B2"):
+        wa[cell].font = Font(bold=True, color=white)
+        wa[cell].fill = PatternFill("solid", fgColor=internal_blue)
 
-    area_summary_rows = {}
+    summary_rows = {}
     for area in area_names:
-        rr = 3 + len(area_summary_rows)
-        area_summary_rows[area] = rr
+        rr = 3 + len(summary_rows)
+        summary_rows[area] = rr
         wa.cell(rr, 1, area)
-        wa.cell(rr, 1).fill = PatternFill("solid", fgColor=gray_light)
 
-    summary_total_row = 3 + len(area_names)
-    wa.cell(summary_total_row, 1, "TOTAL")
-    for col in range(1, 5):
-        wa.cell(summary_total_row, col).font = Font(bold=True, color=brown)
-        wa.cell(summary_total_row, col).fill = PatternFill("solid", fgColor=brown_light)
+    total_summary_area_row = 3 + len(area_names)
+    wa.cell(total_summary_area_row, 1, "TOTAL INTERNO")
+    wa.cell(total_summary_area_row, 1).font = Font(bold=True, color=brown)
+    wa.cell(total_summary_area_row, 1).fill = PatternFill("solid", fgColor=brown_light)
+    wa.cell(total_summary_area_row, 2, f"='01 Presupuesto'!G{internal_detail_row}")
+    wa.cell(total_summary_area_row, 2).number_format = '$#,##0.00'
+    wa.cell(total_summary_area_row, 2).font = Font(bold=True, color=brown)
+    wa.cell(total_summary_area_row, 2).fill = PatternFill("solid", fgColor=brown_light)
 
-    detail_header_row = summary_total_row + 2
-    detail_headers = [
-        "Área",
-        "Partida",
-        "Subpartida",
-        "Concepto",
-        "% Asignación",
-        "Importe asignado sin IVA",
-        "IVA",
-        "Total con IVA",
-    ]
-    for col, header in enumerate(detail_headers, 1):
-        cell = wa.cell(detail_header_row, col, header)
-        cell.font = Font(bold=True, color=white)
-        cell.fill = PatternFill("solid", fgColor=internal_blue)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    current_row = total_summary_area_row + 2
+    area_total_cells = {}
 
-    detail_row = detail_header_row + 1
-    first_detail_row = detail_row
+    for area in area_names:
+        wa.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=3)
+        wa.cell(current_row, 1, area.upper())
+        wa.cell(current_row, 1).font = Font(bold=True, color=white)
+        wa.cell(current_row, 1).fill = PatternFill("solid", fgColor=internal_blue)
+        current_row += 1
 
-    for item in ordered_items:
-        commercial_row = commercial_row_map.get(item["code"])
-        if not commercial_row:
-            continue
+        for col, header in enumerate(["Partida", "Concepto", "Importe interno"], 1):
+            wa.cell(current_row, col, header)
+            wa.cell(current_row, col).font = Font(bold=True)
+            wa.cell(current_row, col).fill = PatternFill("solid", fgColor=gray_light)
+        current_row += 1
 
-        for allocation in obtener_asignaciones_area_item(item):
-            wa.cell(detail_row, 1, allocation["area"])
-            wa.cell(
-                detail_row,
-                2,
-                item.get("partida_excel")
-                or nombre_partida_excel(item.get("category")),
-            )
-            wa.cell(
-                detail_row,
-                3,
-                item.get("subpartida_excel")
-                or nombre_subpartida_excel(item),
-            )
-            wa.cell(detail_row, 4, titulo_comercial_item(item))
-            wa.cell(detail_row, 5, float(allocation["porcentaje"]) / 100.0)
-
-            # Enlace directo al Importe Total editable de 01 Presupuesto.
-            wa.cell(
-                detail_row,
-                6,
-                f"='01 Presupuesto'!G{commercial_row}*E{detail_row}",
-            )
-            wa.cell(
-                detail_row,
-                7,
-                f"=F{detail_row}*'02 Control Interno'!$B$5",
-            )
-            wa.cell(detail_row, 8, f"=F{detail_row}+G{detail_row}")
-
-            wa.cell(detail_row, 5).number_format = "0.00%"
-            for col in (6, 7, 8):
-                wa.cell(detail_row, col).number_format = '$#,##0.00'
-
-            for col in range(1, 9):
-                wa.cell(detail_row, col).alignment = Alignment(
-                    vertical="top",
-                    wrap_text=col in {1, 2, 3, 4},
+        first_area_item_row = current_row
+        for item in ordered_items:
+            commercial_row = commercial_row_map.get(item["code"])
+            if not commercial_row:
+                continue
+            for allocation in obtener_asignaciones_area_item(item):
+                if allocation["area"] != area:
+                    continue
+                wa.cell(current_row, 1, item.get("partida_excel") or nombre_partida_excel(item.get("category")))
+                wa.cell(current_row, 2, titulo_comercial_item(item))
+                wa.cell(
+                    current_row,
+                    3,
+                    f"='01 Presupuesto'!G{commercial_row}*{float(allocation['porcentaje']) / 100.0:.8f}",
                 )
-                wa.cell(detail_row, col).border = Border(bottom=thin_gray)
+                wa.cell(current_row, 3).number_format = '$#,##0.00'
+                for col in range(1, 4):
+                    wa.cell(current_row, col).alignment = Alignment(vertical="top", wrap_text=col in {1, 2})
+                    wa.cell(current_row, col).border = Border(bottom=thin_gray)
+                current_row += 1
 
-            detail_row += 1
+        if current_row == first_area_item_row:
+            wa.cell(current_row, 2, "Sin conceptos asignables de forma verificable.")
+            current_row += 1
 
-    last_detail_row = max(first_detail_row, detail_row - 1)
+        area_total_row = current_row
+        wa.cell(area_total_row, 1, f"Total {area}")
+        wa.cell(area_total_row, 1).font = Font(bold=True)
+        wa.cell(area_total_row, 3, f"=SUM(C{first_area_item_row}:C{area_total_row - 1})")
+        wa.cell(area_total_row, 3).number_format = '$#,##0.00'
+        wa.cell(area_total_row, 3).font = Font(bold=True)
+        area_total_cells[area] = f"C{area_total_row}"
+        current_row += 2
 
-    for area, rr in area_summary_rows.items():
-        safe_area = str(area).replace('"', '""')
-        wa.cell(
-            rr,
-            2,
-            f'=SUMIF($A${first_detail_row}:$A${last_detail_row},"{safe_area}",'
-            f'$F${first_detail_row}:$F${last_detail_row})',
-        )
-        wa.cell(
-            rr,
-            3,
-            f'=SUMIF($A${first_detail_row}:$A${last_detail_row},"{safe_area}",'
-            f'$G${first_detail_row}:$G${last_detail_row})',
-        )
-        wa.cell(
-            rr,
-            4,
-            f'=SUMIF($A${first_detail_row}:$A${last_detail_row},"{safe_area}",'
-            f'$H${first_detail_row}:$H${last_detail_row})',
-        )
-        for col in (2, 3, 4):
-            wa.cell(rr, col).number_format = '$#,##0.00'
-            wa.cell(rr, col).alignment = Alignment(horizontal="right")
+    for area, rr in summary_rows.items():
+        wa.cell(rr, 2, f"={area_total_cells[area]}")
+        wa.cell(rr, 2).number_format = '$#,##0.00'
 
-    # Estos tres totales se enlazan directamente a 01 para garantizar conciliación.
-    wa.cell(summary_total_row, 2, f"='01 Presupuesto'!G{subtotal_detail_row}")
-    wa.cell(summary_total_row, 3, f"='01 Presupuesto'!G{iva_detail_row}")
-    wa.cell(summary_total_row, 4, f"='01 Presupuesto'!G{total_detail_row}")
-    for col in (2, 3, 4):
-        wa.cell(summary_total_row, col).number_format = '$#,##0.00'
-        wa.cell(summary_total_row, col).alignment = Alignment(horizontal="right")
-
-    area_widths = [24, 28, 28, 34, 16, 24, 18, 22]
-    for col, width in enumerate(area_widths, 1):
-        wa.column_dimensions[get_column_letter(col)].width = width
-
-    wa.row_dimensions[detail_header_row].height = 30
-    if detail_row > first_detail_row:
-        wa.auto_filter.ref = f"A{detail_header_row}:H{detail_row - 1}"
-
+    wa.column_dimensions["A"].width = 30
+    wa.column_dimensions["B"].width = 48
+    wa.column_dimensions["C"].width = 22
     wa.sheet_properties.pageSetUpPr.fitToPage = True
-    wa.page_setup.orientation = "landscape"
+    wa.page_setup.orientation = "portrait"
     wa.page_setup.fitToWidth = 1
     wa.page_setup.fitToHeight = 0
-    wa.page_margins.left = 0.25
-    wa.page_margins.right = 0.25
+    wa.page_margins.left = 0.3
+    wa.page_margins.right = 0.3
     wa.page_margins.top = 0.45
     wa.page_margins.bottom = 0.45
 
@@ -5813,6 +5816,10 @@ else:
                         )
                         revised_items = sincronizar_items_con_estructura(
                             revised_result,
+                            revised_items,
+                        )
+                        revised_items = recalcular_areas_items(
+                            g["project_data"],
                             revised_items,
                         )
                         revised_financials = calcular_financieros(
