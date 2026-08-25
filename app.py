@@ -2443,7 +2443,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-08-25-v13-marca-y-areas-deterministas"
+DATABASE_CACHE_VERSION = "2026-08-25-v13.1-resumen-streamlit"
 
 
 @st.cache_resource(show_spinner=False)
@@ -5718,10 +5718,29 @@ else:
         key=f"locked_guide_{version}_{saved}",
     )
 
+    # Resumen comercial igual al utilizado en 01 Presupuesto:
+    # 1) presupuesto interno;
+    # 2) presupuesto con 30 % de marca;
+    # 3) total final después de aplicar IVA al presupuesto con marca.
+    presupuesto_interno = float(financials["sale_before_tax"])
+    presupuesto_con_marca = presupuesto_interno * (1.0 + BRAND_MARKUP_PCT / 100.0)
+    presupuesto_final_iva = presupuesto_con_marca * (
+        1.0 + float(g["params"]["iva_pct"]) / 100.0
+    )
+
     m1, m2, m3 = st.columns(3)
-    m1.metric("Presupuesto de obra", formato_moneda(financials["sale_before_tax"]))
-    m2.metric("IVA", formato_moneda(financials["iva_amount"]))
-    m3.metric("Total", formato_moneda(financials["total"]))
+    m1.metric(
+        "Presupuesto interno",
+        formato_moneda(presupuesto_interno),
+    )
+    m2.metric(
+        f"Presupuesto + {BRAND_MARKUP_PCT:.0f}% marca",
+        formato_moneda(presupuesto_con_marca),
+    )
+    m3.metric(
+        "Presupuesto final con IVA",
+        formato_moneda(presupuesto_final_iva),
+    )
 
     with st.expander("Detalle interno"):
         i1, i2, i3 = st.columns(3)
