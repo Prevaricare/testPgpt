@@ -5453,12 +5453,9 @@ AZOTEA
 
 DEFAULT_GUIDE_TEXT = """- Considerar protección básica de las áreas de trabajo y zonas de tránsito.
 - Incluir limpieza durante los trabajos y limpieza final.
-- Considerar retiro y disposición de residuos cuando corresponda.
-- Considerar herramienta menor, consumibles y elementos auxiliares necesarios.
 - En pintura, considerar preparación básica, resanes menores, sellador cuando sea necesario y dos manos de pintura.
-- En instalaciones y elementos nuevos, considerar suministro, colocación, fijaciones, conexiones y pruebas básicas cuando correspondan.
+- En instalaciones y elementos nuevos, considerar suministro, colocación, fijaciones y conexiones, cuando correspondan.
 - Mantener materiales y acabados coherentes con el nivel de presupuesto seleccionado.
-- No asumir dimensiones no indicadas; señalar los datos importantes que falten.
 """
 
 ADJUSTMENT_EXAMPLE = """Ejemplos:
