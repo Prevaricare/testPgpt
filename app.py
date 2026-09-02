@@ -19,7 +19,7 @@ from pypdf import PdfReader
 import streamlit as st
 from google import genai
 from google.genai import types
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from pydantic import BaseModel, Field
@@ -2443,7 +2443,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-08-25-v13.1-resumen-streamlit"
+DATABASE_CACHE_VERSION = "2026-09-01-v14.1-recargar-excel"
 
 
 @st.cache_resource(show_spinner=False)
@@ -2655,6 +2655,28 @@ REVISIÓN DEL ALCANCE
    un APU ni generes una fila por material, herramienta o cuadrilla. Si varias
    tareas forman naturalmente un paquete subcontratable, intégralas en un solo
    concepto y explica las inclusiones en descripcion_tecnica.
+
+   EXCEPCIÓN OBLIGATORIA — CARPINTERÍA Y MOBILIARIO:
+   Los muebles, módulos o elementos de carpintería DISTINTOS no deben agruparse
+   dentro de una sola actividad únicamente por pertenecer al mismo espacio o al
+   mismo proveedor. Cada tipo, modelo, diseño, función, especificación o dimensión
+   materialmente distinta debe convertirse en una actividad independiente con su
+   propio costo unitario.
+
+   - Si existen varias unidades IDÉNTICAS, pueden mantenerse en una sola actividad
+     usando cantidad mayor a 1.
+   - Si existen unidades diferentes, deben separarse aunque estén en la misma área.
+   - No uses LOTE para mezclar muebles distintos cuando el usuario permita
+     identificar cada mueble o tipo de mueble.
+   - Para mobiliario individual usa preferentemente PZA cuando sea coherente con
+     la forma de cotización.
+   - titulo_comercial y subpartida deben permitir reconocer qué mueble se está
+     cobrando sin tener que leer toda la descripcion_tecnica.
+
+   Ejemplo conceptual: si el alcance indica dos muebles de un tipo y uno de otro
+   tipo, genera dos actividades: una con cantidad 2 para el primer tipo y otra
+   con cantidad 1 para el segundo. No combines ambos tipos en una sola actividad.
+
 3. No omitas un trabajo indispensable solo porque no fue escrito literalmente.
    Si la inclusión es inferida, indícalo brevemente en fundamento_inclusion o
    consideraciones.
@@ -2694,7 +2716,9 @@ PARTIDAS Y SUBPARTIDAS
 
 CANTIDADES Y METRAJES
 10. Calcula M2, ML, M3, PZA u otras cantidades cuando las dimensiones aportadas
-    permitan hacerlo de forma justificable.
+    permitan hacerlo de forma justificable. En muebles o módulos de carpintería
+    claramente individualizables, conserva por separado cada tipo distinto y usa
+    la cantidad para repetir únicamente unidades realmente equivalentes.
 11. Si el usuario pide "promediar", utiliza una estimación razonable y explica
     brevemente el criterio.
 12. Si faltan datos, utiliza LOTE/PZA/JGO cuando sea profesionalmente más correcto
@@ -2836,8 +2860,10 @@ CRITERIOS
    reconstrucciones; preparaciones e instalaciones ocultas a cierres y acabados;
    elementos finales a sus soportes terminados; limpieza y entrega al final.
 8. Asigna orden_ejecucion creciente con espacios entre valores (10, 20, 30...).
-
-9. Devuelve exactamente una entrada por cada código recibido y conserva el código.
+9. En CARPINTERÍA/MOBILIARIO considera que actividades separadas pueden representar
+   muebles distintos del mismo espacio. No homogeneices títulos o subpartidas de
+   forma que se pierda la distinción entre esos muebles.
+10. Devuelve exactamente una entrada por cada código recibido y conserva el código.
 
 No incluyas explicaciones adicionales.
 """
@@ -3010,6 +3036,13 @@ INSTRUCCIONES
 11. No modifiques precios no mencionados ni hagas ajustes generales por iniciativa propia.
 12. Mantén actividades generales subcontratables; no desarrolles APU de materiales y mano de
     obra salvo que la petición lo requiera expresamente.
+    EXCEPCIÓN: en CARPINTERÍA y MOBILIARIO, no agrupes muebles distintos dentro
+    de una sola actividad. Si la petición incorpora varios muebles:
+    - unidades idénticas pueden usar una actividad con cantidad N;
+    - cada tipo/modelo/diseño/función/especificación o dimensión materialmente
+      distinta debe tener una actividad independiente y su propio costo unitario;
+    - no mezcles muebles diferentes en un solo LOTE cuando puedan identificarse
+      individualmente.
 13. Conserva la estructura comercial: partida amplia, subpartida corta,
     titulo_comercial, descripción y orden_ejecucion. Si el usuario solo pide
     revisar precio o cantidad, conserva esos campos salvo que el cambio realmente
@@ -3545,10 +3578,15 @@ def aplicar_revision_estructural(
 
 
 def calcular_financieros(items: list[dict], params: dict) -> dict:
-    direct_cost = sum(x["direct_amount"] for x in items)
+    direct_cost = sum(float(x.get("direct_amount") or 0.0) for x in items)
     indirect_cost = direct_cost * params["indirect_pct"] / 100.0
     profit = (direct_cost + indirect_cost) * params["profit_pct"] / 100.0
-    sale_before_tax = direct_cost + indirect_cost + profit
+
+    # El presupuesto interno visible debe respetar el Importe Total vigente de
+    # cada concepto. Esto permite reimportar un Excel cuyos precios hayan sido
+    # redondeados o ajustados manualmente sin perder esos cambios.
+    sale_before_tax = sum(float(x.get("sale_amount") or 0.0) for x in items)
+
     iva_amount = sale_before_tax * params["iva_pct"] / 100.0
     total = sale_before_tax + iva_amount
 
@@ -3559,6 +3597,567 @@ def calcular_financieros(items: list[dict], params: dict) -> dict:
         "sale_before_tax": sale_before_tax,
         "iva_amount": iva_amount,
         "total": total,
+    }
+
+
+# =========================================================
+# IMPORTAR PRESUPUESTO DESDE EXCEL
+# =========================================================
+
+
+def _valor_float_excel(value, default: float = 0.0) -> float:
+    if value is None or value == "":
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    raw = str(value).strip()
+    raw = raw.replace("$", "").replace(",", "")
+    raw = raw.replace("%", "")
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _pct_excel_a_porcentaje(value, default: float) -> float:
+    number = _valor_float_excel(value, default)
+    # Excel suele guardar 12 % como 0.12.
+    if 0 <= number <= 1:
+        return number * 100.0
+    return number
+
+
+def _quitar_numeracion_excel(value: str) -> str:
+    raw = str(value or "").strip()
+    raw = re.sub(r"^\s*\d+(?:\.\d+)*\.?\s*", "", raw)
+    return raw.strip()
+
+
+def _buscar_encabezado_presupuesto(ws) -> int | None:
+    """Busca la fila de Partida/Subpartida/... sin depender de una versión."""
+    expected = {
+        "PARTIDA",
+        "SUBPARTIDA",
+        "DESCRIPCION TECNICA",
+        "UNIDAD",
+    }
+
+    for row in range(1, min(ws.max_row, 150) + 1):
+        values = {
+            normalizar_texto(ws.cell(row, col).value or "").upper()
+            for col in range(1, min(ws.max_column, 12) + 1)
+        }
+        if expected.issubset(values):
+            return row
+    return None
+
+
+def _buscar_hoja_presupuesto(workbook):
+    preferred = [
+        "01 Presupuesto",
+        "Presupuesto",
+        "PRESUPUESTO",
+    ]
+    for name in preferred:
+        if name in workbook.sheetnames:
+            ws = workbook[name]
+            header = _buscar_encabezado_presupuesto(ws)
+            if header:
+                return ws, header
+
+    for ws in workbook.worksheets:
+        header = _buscar_encabezado_presupuesto(ws)
+        if header:
+            return ws, header
+
+    raise RuntimeError(
+        "No encontré una tabla de presupuesto reconocible. "
+        "Se requieren las columnas Partida, Subpartida, Descripción Técnica y Unidad."
+    )
+
+
+def _mapear_columnas_excel(ws, header_row: int) -> dict:
+    aliases = {
+        "partida": {"PARTIDA"},
+        "subpartida": {"SUBPARTIDA"},
+        "description": {
+            "DESCRIPCION TECNICA",
+            "DESCRIPCION",
+            "CONCEPTO",
+        },
+        "unit": {"UNIDAD"},
+        "quantity": {"CANT", "CANTIDAD", "CANT."},
+        "unit_price": {
+            "PRECIO UNITARIO MXN",
+            "PRECIO UNITARIO",
+            "P U",
+            "P U VENTA",
+        },
+        "amount": {
+            "IMPORTE TOTAL MXN",
+            "IMPORTE TOTAL",
+            "IMPORTE",
+        },
+    }
+
+    mapping = {}
+    for col in range(1, ws.max_column + 1):
+        key = normalizar_texto(ws.cell(header_row, col).value or "").upper()
+        for field, options in aliases.items():
+            if key in options and field not in mapping:
+                mapping[field] = col
+
+    required = {"partida", "subpartida", "description", "unit"}
+    missing = required - set(mapping)
+    if missing:
+        raise RuntimeError(
+            "Faltan columnas necesarias en el presupuesto: "
+            + ", ".join(sorted(missing))
+        )
+
+    return mapping
+
+
+def _leer_parametros_control(workbook, fallback_params: dict) -> tuple[dict, list[dict]]:
+    """
+    Recupera parámetros y filas de Control Interno cuando existen.
+    Si la hoja no existe, conserva los parámetros actuales de la app.
+    """
+    params = dict(fallback_params)
+    control_rows = []
+
+    if "02 Control Interno" not in workbook.sheetnames:
+        return params, control_rows
+
+    ws = workbook["02 Control Interno"]
+
+    # Parámetros por etiqueta, no por número de fila.
+    for row in range(1, min(ws.max_row, 30) + 1):
+        label = normalizar_texto(ws.cell(row, 1).value or "").upper()
+        value = ws.cell(row, 2).value
+
+        if label == "INDIRECTOS":
+            params["indirect_pct"] = _pct_excel_a_porcentaje(
+                value, params["indirect_pct"]
+            )
+        elif label == "UTILIDAD":
+            params["profit_pct"] = _pct_excel_a_porcentaje(
+                value, params["profit_pct"]
+            )
+        elif label == "IVA":
+            params["iva_pct"] = _pct_excel_a_porcentaje(
+                value, params["iva_pct"]
+            )
+        elif "DESPERDICIO" in label:
+            params["waste_pct"] = _pct_excel_a_porcentaje(
+                value, params["waste_pct"]
+            )
+
+    # Buscar encabezados de la tabla.
+    header_row = None
+    headers = {}
+    for row in range(1, min(ws.max_row, 80) + 1):
+        current = {}
+        for col in range(1, ws.max_column + 1):
+            value = normalizar_texto(ws.cell(row, col).value or "").upper()
+            if value:
+                current[value] = col
+        if "CODIGO" in current and "COSTO BASE UNIT" in current:
+            header_row = row
+            headers = current
+            break
+
+    if header_row is None:
+        return params, control_rows
+
+    def col(*names):
+        for name in names:
+            if name in headers:
+                return headers[name]
+        return None
+
+    c_code = col("CODIGO")
+    c_title = col("TITULO COMERCIAL")
+    c_cost = col("COSTO BASE UNIT")
+    c_mat = col("MATERIALES EST UNIT")
+    c_labor = col("M O EST UNIT")
+    c_other = col("OTROS INTEGRADO EST UNIT")
+    c_waste = col("DESPERDICIO MATERIALES REF")
+    c_order = None
+
+    for row in range(header_row + 1, ws.max_row + 1):
+        code = str(ws.cell(row, c_code).value or "").strip() if c_code else ""
+        title = str(ws.cell(row, c_title).value or "").strip() if c_title else ""
+        cost = _valor_float_excel(ws.cell(row, c_cost).value) if c_cost else 0.0
+
+        if not code and not title and cost == 0:
+            continue
+
+        control_rows.append(
+            {
+                "code": code,
+                "title": title,
+                "unit_cost": cost,
+                "material_unit": (
+                    _valor_float_excel(ws.cell(row, c_mat).value)
+                    if c_mat else 0.0
+                ),
+                "labor_unit": (
+                    _valor_float_excel(ws.cell(row, c_labor).value)
+                    if c_labor else 0.0
+                ),
+                "other_unit": (
+                    _valor_float_excel(ws.cell(row, c_other).value)
+                    if c_other else 0.0
+                ),
+                "waste_pct": (
+                    _pct_excel_a_porcentaje(ws.cell(row, c_waste).value, 0.0)
+                    if c_waste else 0.0
+                ),
+                "execution_order": c_order,
+            }
+        )
+
+    return params, control_rows
+
+
+def _leer_metadatos_excel(ws, fallback_name: str = "") -> dict:
+    """
+    Lee el encabezado propio de la app cuando está disponible.
+
+    Si el archivo es un presupuesto anterior o externo cuya primera fila ya es
+    la tabla de conceptos, NO interpreta las primeras actividades como nombre,
+    tipo de obra o ubicación.
+    """
+    safe_name = Path(str(fallback_name or "")).stem.strip() or "Proyecto importado"
+
+    project_type = "Remodelación interior general"
+    budget_level = "Medio-alto"
+    location = "Ubicación por confirmar"
+    project_code = "IMPORTADO"
+    version = 1
+    name = safe_name
+
+    first_cell = normalizar_texto(ws["A1"].value or "").upper()
+    meta = str(ws["A3"].value or "").strip()
+
+    # Solo interpretar A2/A3 como metadatos si realmente existe el encabezado
+    # producido por esta aplicación.
+    has_app_header = (
+        first_cell == "PRESUPUESTO"
+        and "·" in meta
+    )
+
+    if has_app_header:
+        name = str(ws["A2"].value or safe_name).strip() or safe_name
+        parts = [x.strip() for x in meta.split("·") if x.strip()]
+
+        if len(parts) >= 1:
+            project_type = parts[0]
+        if len(parts) >= 2 and parts[1] in NIVELES_PRESUPUESTO:
+            budget_level = parts[1]
+
+        version_index = None
+        for idx, value in enumerate(parts):
+            match = re.fullmatch(r"V(\d+)", value, flags=re.I)
+            if match:
+                version_index = idx
+                version = max(int(match.group(1)), 1)
+                if idx >= 1:
+                    project_code = parts[idx - 1]
+                break
+
+        if version_index is not None:
+            start_location = (
+                2
+                if len(parts) >= 2 and parts[1] in NIVELES_PRESUPUESTO
+                else 1
+            )
+            end_location = max(version_index - 1, start_location)
+            location_parts = parts[start_location:end_location]
+            if location_parts:
+                location = " · ".join(location_parts)
+        elif len(parts) >= 3:
+            location = parts[2]
+
+    return {
+        "name": name,
+        "project_type": project_type,
+        "budget_level": budget_level,
+        "location": location,
+        "project_code": project_code,
+        "version": version,
+    }
+
+
+def importar_presupuesto_excel(
+    excel_bytes: bytes,
+    fallback_params: dict,
+    file_name: str = "",
+) -> dict:
+    """
+    Reconstruye un presupuesto editable desde un .xlsx.
+
+    Prioridades:
+    1. 01 Presupuesto = alcance, cantidades e importes vigentes.
+    2. 02 Control Interno = costos internos y parámetros, si existe.
+    3. Si Control Interno no existe, se reconstruye el costo base a partir del
+       importe interno y los porcentajes actuales.
+    """
+    if not excel_bytes:
+        raise RuntimeError("El archivo está vacío.")
+
+    try:
+        wb_values = load_workbook(
+            filename=BytesIO(excel_bytes),
+            data_only=True,
+            read_only=False,
+        )
+    except Exception as exc:
+        raise RuntimeError("No fue posible leer el archivo Excel.") from exc
+
+    ws, header_row = _buscar_hoja_presupuesto(wb_values)
+    columns = _mapear_columnas_excel(ws, header_row)
+    metadata = _leer_metadatos_excel(
+        ws,
+        fallback_name=file_name,
+    )
+
+    params, control_rows = _leer_parametros_control(
+        wb_values,
+        fallback_params,
+    )
+
+    raw_rows = []
+    blank_streak = 0
+
+    for row in range(header_row + 1, ws.max_row + 1):
+        part_raw = ws.cell(row, columns["partida"]).value
+        sub_raw = ws.cell(row, columns["subpartida"]).value
+        desc_raw = ws.cell(row, columns["description"]).value
+        unit_raw = ws.cell(row, columns["unit"]).value
+
+        part_text = str(part_raw or "").strip()
+        if "PRESUPUESTO INTERNO" in normalizar_texto(part_text).upper():
+            break
+
+        has_content = any(
+            str(value or "").strip()
+            for value in (part_raw, sub_raw, desc_raw, unit_raw)
+        )
+        if not has_content:
+            blank_streak += 1
+            if blank_streak >= 3 and raw_rows:
+                break
+            continue
+        blank_streak = 0
+
+        description = str(desc_raw or "").strip()
+        unit = str(unit_raw or "").strip().upper()
+        if not description or not unit:
+            continue
+
+        quantity = (
+            _valor_float_excel(ws.cell(row, columns["quantity"]).value, 1.0)
+            if columns.get("quantity")
+            else 1.0
+        )
+        quantity = max(quantity, 0.0)
+
+        amount = (
+            _valor_float_excel(ws.cell(row, columns["amount"]).value, 0.0)
+            if columns.get("amount")
+            else 0.0
+        )
+        unit_price = (
+            _valor_float_excel(ws.cell(row, columns["unit_price"]).value, 0.0)
+            if columns.get("unit_price")
+            else 0.0
+        )
+
+        if amount <= 0 and unit_price > 0 and quantity > 0:
+            amount = unit_price * quantity
+        if unit_price <= 0 and amount > 0 and quantity > 0:
+            unit_price = amount / quantity
+
+        raw_rows.append(
+            {
+                "category": normalizar_seccion_comercial(
+                    _quitar_numeracion_excel(part_raw)
+                ),
+                "subcategory": _quitar_numeracion_excel(sub_raw),
+                "description": description,
+                "unit": unit,
+                "quantity": quantity,
+                "unit_sale": unit_price,
+                "sale_amount": amount,
+            }
+        )
+
+    if not raw_rows:
+        raise RuntimeError(
+            "No encontré conceptos utilizables dentro de la tabla del presupuesto."
+        )
+
+    # Descripción reconstruida: no inventa información; simplemente convierte
+    # los renglones actuales en contexto para los ajustes posteriores con Gemini.
+    description_lines = ["PRESUPUESTO RECARGADO DESDE EXCEL."]
+    for row in raw_rows:
+        description_lines.append(
+            f"- [{row['category']} / {row['subcategory']}] "
+            f"{row['description']} | {row['quantity']:g} {row['unit']}"
+        )
+
+    if metadata["project_code"] == "IMPORTADO":
+        metadata["project_code"] = (
+            f"{abreviar_cliente(metadata['name'])}-IMP-0001"
+        )
+
+    project_data = {
+        "name": metadata["name"],
+        "project_type": metadata["project_type"],
+        "budget_level": metadata["budget_level"],
+        "location": metadata["location"],
+        "dimension_mode": "Recuperadas de Excel",
+        "dimensions_text": "",
+        "description": "\n".join(description_lines),
+        "guide_text": DEFAULT_GUIDE_TEXT,
+    }
+
+    factor = (
+        (1.0 + float(params["indirect_pct"]) / 100.0)
+        * (1.0 + float(params["profit_pct"]) / 100.0)
+    )
+    if factor <= 0:
+        factor = 1.0
+
+    items = []
+    for idx, row in enumerate(raw_rows):
+        control = control_rows[idx] if idx < len(control_rows) else {}
+
+        quantity = float(row["quantity"])
+        sale_amount = float(row["sale_amount"])
+        commercial_unit = (
+            sale_amount / quantity
+            if quantity > 0
+            else float(row["unit_sale"] or 0.0)
+        )
+
+        unit_cost = float(control.get("unit_cost") or 0.0)
+        if unit_cost <= 0:
+            unit_cost = commercial_unit / factor if factor else commercial_unit
+
+        code = str(control.get("code") or "").strip()
+        if not code:
+            code = f"IMP-{idx + 1:03d}"
+
+        title = str(control.get("title") or "").strip()
+        if not title:
+            title = row["subcategory"] or re.split(
+                r"[.;:]",
+                row["description"],
+                maxsplit=1,
+            )[0][:80]
+
+        direct_amount = quantity * unit_cost
+        indirect_unit = unit_cost * params["indirect_pct"] / 100.0
+        profit_unit = (
+            unit_cost + indirect_unit
+        ) * params["profit_pct"] / 100.0
+
+        material_unit = float(control.get("material_unit") or 0.0)
+        labor_unit = float(control.get("labor_unit") or 0.0)
+        other_unit = float(control.get("other_unit") or 0.0)
+        split_total = material_unit + labor_unit + other_unit
+
+        if split_total > 0 and unit_cost > 0:
+            material_share = material_unit / split_total * 100.0
+            labor_share = labor_unit / split_total * 100.0
+            other_share = other_unit / split_total * 100.0
+        else:
+            material_share = 0.0
+            labor_share = 0.0
+            other_share = 100.0
+
+        benefit_amount = sale_amount - direct_amount
+        margin = (
+            benefit_amount / sale_amount * 100.0
+            if sale_amount else 0.0
+        )
+
+        item = {
+            "concept_id": None,
+            "category": row["category"],
+            "subcategory": row["subcategory"],
+            "code": limpiar_codigo(code, f"IMP-{idx + 1:03d}"),
+            "execution_order": (idx + 1) * 10,
+            "commercial_title": title,
+            "description": row["description"],
+            "unit": row["unit"],
+            "quantity": quantity,
+            "unit_cost": unit_cost,
+            "direct_amount": direct_amount,
+            "unit_indirect": indirect_unit,
+            "unit_profit": profit_unit,
+            "unit_sale": commercial_unit,
+            "sale_amount": sale_amount,
+            "benefit_amount": benefit_amount,
+            "sale_margin_pct": margin,
+            "price_source": "EXCEL_IMPORTADO",
+            "price_source_detail": (
+                "Precio recuperado del archivo Excel cargado por el usuario."
+            ),
+            "price_status": "IMPORTADO",
+            "price_confidence": "Media",
+            "material_share_pct": material_share,
+            "labor_share_pct": labor_share,
+            "other_share_pct": other_share,
+            "waste_reference_pct": float(control.get("waste_pct") or 0.0),
+            "quantity_confidence": "Alta",
+            "quantity_criterion": "Cantidad recuperada del archivo Excel.",
+            "inclusion_basis": "Concepto existente en el presupuesto importado.",
+            "considerations": "",
+        }
+        item = aplicar_composicion_costo(item)
+        items.append(item)
+
+    items = recalcular_areas_items(project_data, items)
+
+    activities = [item_a_actividad(item) for item in items]
+    result = PresupuestoIA(
+        nombre_proyecto=project_data["name"],
+        actividad_principal=project_data["project_type"],
+        alcance_resumido=(
+            "Presupuesto reconstruido desde el archivo Excel cargado. "
+            "Los conceptos existentes se conservan como alcance vigente."
+        ),
+        consideraciones_generales=[
+            "Presupuesto recargado desde Excel para continuar con modificaciones."
+        ],
+        datos_faltantes=[],
+        actividades=activities,
+    )
+
+    financials = calcular_financieros(items, params)
+
+    excel_bytes_rebuilt = crear_excel(
+        project_code=metadata["project_code"],
+        project_data=project_data,
+        result=result,
+        items=items,
+        params=params,
+        version=metadata["version"],
+    )
+
+    return {
+        "project_code": metadata["project_code"],
+        "version": metadata["version"],
+        "project_data": project_data,
+        "params": params,
+        "result": result,
+        "items": items,
+        "financials": financials,
+        "excel_bytes": excel_bytes_rebuilt,
     }
 
 
@@ -5510,6 +6109,60 @@ if "generated" not in st.session_state:
     if "guide_text" not in st.session_state:
         st.session_state["guide_text"] = DEFAULT_GUIDE_TEXT
 
+    # -----------------------------------------------------
+    # RECARGAR PRESUPUESTO EXISTENTE
+    # -----------------------------------------------------
+    uploaded_budget = st.file_uploader(
+        "Cargar presupuesto Excel",
+        type=["xlsx"],
+        key="reload_budget_excel",
+    )
+
+    if uploaded_budget is not None:
+        if st.button(
+            "Cargar y continuar editando",
+            type="primary",
+            use_container_width=True,
+            key="load_existing_budget",
+        ):
+            fallback_params = {
+                "indirect_pct": float(indirect_pct),
+                "profit_pct": float(profit_pct),
+                "iva_pct": float(iva_pct),
+                "waste_pct": float(waste_pct),
+            }
+
+            with st.spinner("Leyendo presupuesto..."):
+                try:
+                    imported = importar_presupuesto_excel(
+                        uploaded_budget.getvalue(),
+                        fallback_params=fallback_params,
+                        file_name=uploaded_budget.name,
+                    )
+
+                    st.session_state["generated"] = {
+                        "project_id": None,
+                        "budget_id": None,
+                        "saved": False,
+                        "pending_revision": False,
+                        "project_code": imported["project_code"],
+                        "version": imported["version"],
+                        "project_data": imported["project_data"],
+                        "params": imported["params"],
+                        "result": imported["result"].model_dump(),
+                        "items": imported["items"],
+                        "financials": imported["financials"],
+                        "excel_bytes": imported["excel_bytes"],
+                        "revision_history": [],
+                        "pending_revision_notes": [],
+                        "imported_from_excel": True,
+                    }
+                    st.rerun()
+                except Exception as exc:
+                    st.exception(exc)
+
+    st.divider()
+
     with st.form("form_proyecto"):
         f1, f2 = st.columns(2)
         with f1:
@@ -5670,6 +6323,8 @@ else:
         st.caption(f"Guardado · V{version:02d}")
     elif g.get("project_id"):
         st.caption(f"Cambios sin guardar · próxima versión V{version:02d}")
+    elif g.get("imported_from_excel"):
+        st.caption("Presupuesto recargado desde Excel · cambios sin guardar")
     else:
         st.caption("Borrador sin guardar")
 
