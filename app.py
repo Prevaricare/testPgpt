@@ -61,8 +61,21 @@ def get_secret(nombre: str, default=None):
     return os.getenv(nombre, default)
 
 
-def normalizar_texto(texto: str) -> str:
-    texto = (texto or "").strip().lower()
+def normalizar_texto(texto) -> str:
+    """
+    Normaliza cualquier valor recibido, no solamente cadenas.
+
+    Al leer archivos Excel antiguos pueden aparecer números, booleanos, fechas,
+    resultados de fórmulas o valores vacíos en las mismas filas que se recorren
+    buscando encabezados. Convertir primero a texto evita errores como:
+    AttributeError: 'float' object has no attribute 'strip'
+    """
+    if texto is None:
+        texto = ""
+    elif not isinstance(texto, str):
+        texto = str(texto)
+
+    texto = texto.strip().lower()
     texto = "".join(
         c for c in unicodedata.normalize("NFD", texto)
         if unicodedata.category(c) != "Mn"
@@ -2443,7 +2456,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-09-01-v14.1-recargar-excel"
+DATABASE_CACHE_VERSION = "2026-09-01-v14.2-excel-antiguo-robusto"
 
 
 @st.cache_resource(show_spinner=False)
@@ -3644,7 +3657,7 @@ def _buscar_encabezado_presupuesto(ws) -> int | None:
 
     for row in range(1, min(ws.max_row, 150) + 1):
         values = {
-            normalizar_texto(ws.cell(row, col).value or "").upper()
+            normalizar_texto(ws.cell(row, col).value).upper()
             for col in range(1, min(ws.max_column, 12) + 1)
         }
         if expected.issubset(values):
@@ -3702,7 +3715,7 @@ def _mapear_columnas_excel(ws, header_row: int) -> dict:
 
     mapping = {}
     for col in range(1, ws.max_column + 1):
-        key = normalizar_texto(ws.cell(header_row, col).value or "").upper()
+        key = normalizar_texto(ws.cell(header_row, col).value).upper()
         for field, options in aliases.items():
             if key in options and field not in mapping:
                 mapping[field] = col
@@ -3733,7 +3746,7 @@ def _leer_parametros_control(workbook, fallback_params: dict) -> tuple[dict, lis
 
     # Parámetros por etiqueta, no por número de fila.
     for row in range(1, min(ws.max_row, 30) + 1):
-        label = normalizar_texto(ws.cell(row, 1).value or "").upper()
+        label = normalizar_texto(ws.cell(row, 1).value).upper()
         value = ws.cell(row, 2).value
 
         if label == "INDIRECTOS":
@@ -3759,7 +3772,7 @@ def _leer_parametros_control(workbook, fallback_params: dict) -> tuple[dict, lis
     for row in range(1, min(ws.max_row, 80) + 1):
         current = {}
         for col in range(1, ws.max_column + 1):
-            value = normalizar_texto(ws.cell(row, col).value or "").upper()
+            value = normalizar_texto(ws.cell(row, col).value).upper()
             if value:
                 current[value] = col
         if "CODIGO" in current and "COSTO BASE UNIT" in current:
