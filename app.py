@@ -2,6 +2,7 @@ import os
 import re
 import json
 import sqlite3
+import statistics
 import unicodedata
 import uuid
 import zipfile
@@ -403,15 +404,31 @@ BRAND_MARKUP_PCT = 30.0
 
 
 PATRONES_AREAS_EXPLICITAS = [
-    r"\broof\s*garden\b",
+    # Espacios con calificadores: primero los patrones más específicos.
+    r"\bmedio\s+bañ[oó](?:\s+(?:de|en)\s+planta\s+baja)?\b",
+    r"\bbañ[oó]\s+de\s+visita(?:s)?\b",
+    r"\bbañ[oó]\s+principal\b",
+    r"\bbañ[oó]\s+secundari[oa]\b",
+    r"\bbañ[oó]\s+social\b",
+    r"\bbañ[oó]\s+[1-9]\b",
+    r"\bbañ[oó]s?\b",
+    r"\brec[aá]mara\s+principal\b",
+    r"\brec[aá]mara\s+secundaria\b",
+    r"\brec[aá]mara\s+[1-9]\b",
+    r"\brec[aá]mara\b",
+    r"\bhabitaci[oó]n\s+principal\b",
+    r"\bhabitaci[oó]n\s+secundaria\b",
+    r"\bhabitaci[oó]n\s+[1-9]\b",
+    r"\bhabitaci[oó]n\b",
+    r"\broof\s*(?:top|garden)\b",
     r"\b(?:cuarto|área|area)\s+de\s+lavado\b",
     r"\b(?:walk[\s-]*in\s+closet|walking\s+closet|vestidor)\b",
-    r"\bbañ(?:o|os)(?:\s+(?:principal|de\s+visitas|visitas|social|secundario|[1-9]))?\b",
+    r"\bcl[oó]set\s+de\s+blancos\b",
+    r"\bdespacho\b",
+    r"\boficina\b",
     r"\bcocina\b",
     r"\bsala(?:\s*(?:/|y)\s*comedor)?\b",
     r"\bcomedor\b",
-    r"\brec[aá]mara(?:\s+(?:principal|secundaria|[1-9]))?\b",
-    r"\bhabitaci[oó]n(?:\s+(?:principal|secundaria|[1-9]))?\b",
     r"\bestudio(?:\s+[1-9])?\b",
     r"\bpatio(?:\s+(?:trasero|posterior|frontal|delantero))?\b",
     r"\bazotea\b",
@@ -467,6 +484,9 @@ def tipo_base_area(area: str) -> str:
         ("WALKING CLOSET", "VESTIDOR"), ("VESTIDOR", "VESTIDOR"),
         ("ESTACIONAMIENTO", "ESTACIONAMIENTO"), ("COCHERA", "ESTACIONAMIENTO"),
         ("JARDIN", "JARDIN"), ("PASILLO", "PASILLO"),
+        ("MEDIO BANO", "BANO"), ("DESPACHO", "DESPACHO"),
+        ("OFICINA", "DESPACHO"), ("CLOSET DE BLANCOS", "CLOSET"),
+        ("ROOF TOP", "ROOF TOP"),
     ]
     for prefix, base in equivalencias:
         if key.startswith(prefix):
@@ -695,25 +715,46 @@ def descripcion_areas_item(item: dict) -> str:
     return " · ".join(x["area"] for x in obtener_asignaciones_area_item(item))
 
 
-def validar_area_actividad(project_data: dict, area: str) -> str:
-    candidate = normalizar_nombre_area(area)
-    if candidate == AREA_GENERAL:
-        return AREA_GENERAL
+def _detectar_areas_en_texto(texto: str) -> list[str]:
+    """Extrae áreas explícitas de cualquier texto técnico/comercial."""
+    pseudo = {"description": str(texto or "")}
+    return detectar_areas_explicitas(pseudo)
 
-    explicit = detectar_areas_explicitas(project_data)
-    if not explicit:
-        return AREA_GENERAL
 
-    candidate_key = normalizar_texto(candidate).upper()
-    for known in explicit:
-        if normalizar_texto(known).upper() == candidate_key:
+def resolver_area_actividad(project_data: dict, area_propuesta: str, titulo: str = "", descripcion: str = "", subpartida: str = "") -> str:
+    allowed=areas_validas_proyecto(project_data)
+    specific=[x for x in allowed if x!=AREA_GENERAL]
+    proposed=normalizar_nombre_area(area_propuesta)
+    pkey=normalizar_texto(proposed).upper()
+    for known in specific:
+        if normalizar_texto(known).upper()==pkey:
             return known
-
-    base = tipo_base_area(candidate)
-    same_type = [x for x in explicit if tipo_base_area(x) == base]
-    if len(same_type) == 1:
-        return same_type[0]
+    if proposed!=AREA_GENERAL:
+        base=tipo_base_area(proposed)
+        matches=[x for x in specific if tipo_base_area(x)==base]
+        if len(matches)==1: return matches[0]
+    activity=normalizar_texto(" ".join(str(x or "") for x in (titulo,descripcion,subpartida))).upper()
+    exact=[]
+    for known in specific:
+        k=normalizar_texto(known).upper()
+        if k and k in activity: exact.append(known)
+    if len(exact)==1: return exact[0]
+    type_matches=[]
+    for known in specific:
+        base=tipo_base_area(known)
+        aliases={"BANO":("BANO",),"DORMITORIO":("RECAMARA","HABITACION"),"LAVADO":("LAVADO","LAVANDERIA"),"ESTACIONAMIENTO":("ESTACIONAMIENTO","COCHERA"),"VESTIDOR":("VESTIDOR","CLOSET")}.get(base,(base,))
+        if any(token in activity for token in aliases): type_matches.append(known)
+    unique=[]
+    for x in type_matches:
+        if x not in unique: unique.append(x)
+    if len(unique)==1: return unique[0]
     return AREA_GENERAL
+
+
+
+def validar_area_actividad(project_data: dict, area: str) -> str:
+    """Compatibilidad con llamadas antiguas."""
+    return resolver_area_actividad(project_data, area)
 
 
 def area_item(item: dict) -> str:
@@ -737,11 +778,78 @@ def item_included(item: dict) -> bool:
     return bool(value)
 
 
+def confianza_cantidad_verificada(item: dict) -> str:
+    """
+    Evita que una cantidad estimada aparezca como Alta solo porque Gemini lo dijo.
+    Alta se reserva a cantidades directamente respaldadas por datos explícitos.
+    """
+    criterion = normalizar_texto(item.get("quantity_criterion") or "").upper()
+    raw = normalizar_texto(item.get("quantity_confidence") or "Media").upper()
+
+    uncertainty_terms = (
+        "ESTIM", "APROX", "SUPUEST", "PROMED", "PROPORC",
+        "REFERENCIA", "POR CONFIRMAR", "A CONFIRMAR",
+    )
+    explicit_terms = (
+        "ESPECIFICAD", "INDICAD", "REPORTAD", "PROPORCIONAD",
+        "LONGITUD", "SUPERFICIE", "DIMENSION", "MEDIDA",
+        "CANTIDAD SOLICITADA",
+    )
+
+    if any(term in criterion for term in uncertainty_terms):
+        return "Baja" if "SUPUEST" in criterion or "POR CONFIRMAR" in criterion else "Media"
+
+    has_number = bool(re.search(r"\\d", criterion))
+    has_explicit_basis = any(term in criterion for term in explicit_terms)
+
+    if raw == "ALTA" and not (has_number or has_explicit_basis):
+        return "Media"
+
+    if raw == "BAJA":
+        return "Baja"
+    if raw == "ALTA":
+        return "Alta"
+    return "Media"
+
+
+def confianza_precio_verificada(item: dict) -> str:
+    """
+    La fuente del precio manda sobre la autoevaluación de Gemini.
+
+    Una estimación pura de IA nunca se presenta como confianza Alta.
+    """
+    source = normalizar_texto(item.get("price_source") or "").upper()
+    declared = normalizar_texto(item.get("price_confidence") or "Media").upper()
+
+    if source == "IA ESTIMADO":
+        return "Baja"
+
+    if source == "HISTORICO IA":
+        return "Media" if declared == "ALTA" else (
+            "Baja" if declared == "BAJA" else "Media"
+        )
+
+    if source in {"REFERENCIA CDMX", "HISTORICO EXTERNO"}:
+        return "Alta" if declared == "ALTA" else "Media"
+
+    if source == "BASE INTERNA":
+        return "Alta" if declared == "ALTA" else "Media"
+
+    if source == "EXCEL IMPORTADO":
+        return "Media"
+
+    return "Baja" if declared == "BAJA" else "Media"
+
+
 def confianza_general_item(item: dict) -> str:
     rank = {"BAJA": 0, "MEDIA": 1, "ALTA": 2}
     reverse = {0: "Baja", 1: "Media", 2: "Alta"}
-    q = rank.get(normalizar_texto(item.get("quantity_confidence") or "Media").upper(), 1)
-    p = rank.get(normalizar_texto(item.get("price_confidence") or "Media").upper(), 1)
+    q = rank[normalizar_texto(confianza_cantidad_verificada(item)).upper()]
+    if item.get("price_evidence_score") is not None:
+        p_label = etiqueta_confianza_score(float(item["price_evidence_score"]))
+    else:
+        p_label = confianza_precio_verificada(item)
+    p = rank[normalizar_texto(p_label).upper()]
     return reverse[min(q, p)]
 
 
@@ -757,6 +865,9 @@ def consideraciones_consolidadas_item(item: dict) -> str:
         parts.append(f"Inclusión: {inclusion}")
     if considerations:
         parts.append(considerations)
+    evidence_score = item.get("price_evidence_score")
+    if evidence_score is not None:
+        parts.append(f"Evidencia de precio: {int(round(float(evidence_score)))} / 100")
     return " | ".join(parts)
 
 
@@ -765,6 +876,136 @@ def original_unit_sale_item(item: dict) -> float:
     if value is None:
         value = item.get("unit_sale")
     return float(value or 0.0)
+
+
+MODELOS_GEMINI_V16 = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+]
+
+
+def modelos_gemini(model_name: str | None = None) -> list[str]:
+    modelos = []
+    for model in [model_name, *MODELOS_GEMINI_V16]:
+        if model and model not in modelos:
+            modelos.append(model)
+    return modelos
+
+
+def normalizar_lista_areas(values) -> list[str]:
+    areas, seen = [], set()
+    for raw in values or []:
+        area = normalizar_nombre_area(raw)
+        key = normalizar_texto(area).upper()
+        if not key or key == "GENERAL":
+            continue
+        if key not in seen:
+            seen.add(key)
+            areas.append(area)
+    return [AREA_GENERAL] + areas
+
+
+def areas_validas_proyecto(project_data: dict) -> list[str]:
+    detected = project_data.get("areas_detectadas")
+    if detected:
+        return normalizar_lista_areas(detected)
+    return normalizar_lista_areas(detectar_areas_explicitas(project_data))
+
+
+def score_confianza_precio(source: str, detail: str = "", refs_count: int = 0) -> int:
+    source_n = normalizar_texto(source).upper()
+    detail_n = normalizar_texto(detail).upper()
+    if source_n == "BASE INTERNA":
+        if any(x in detail_n for x in ("COSTO REAL", "COTIZADO", "VALIDADO")):
+            return 98
+        return 92
+    if source_n == "REFERENCIA CDMX":
+        return 85
+    if source_n == "WEB FUNDAMENTADO":
+        if refs_count >= 4: return 86
+        if refs_count == 3: return 82
+        if refs_count == 2: return 72
+        return 55
+    if source_n == "HISTORICO EXTERNO": return 72
+    if source_n == "HISTORICO IA": return 50
+    if source_n == "EXCEL IMPORTADO": return 65
+    if source_n == "IA ESTIMADO": return 30
+    return 50
+
+
+def etiqueta_confianza_score(score: float) -> str:
+    if score >= 85: return "Alta"
+    if score >= 65: return "Media"
+    return "Baja"
+
+
+def extraer_formula_geometrica(texto: str, unit: str) -> float | None:
+    raw = str(texto or "").replace(",", ".")
+    normalized_unit = normalizar_unidad(unit)
+    if normalized_unit == "M2":
+        m = re.search(r"(\d+(?:\.\d+)?)\s*(?:m)?\s*[x×]\s*(\d+(?:\.\d+)?)\s*(?:m)?", raw, flags=re.I)
+        if m:
+            return float(m.group(1))*float(m.group(2))
+    if normalized_unit == "M3":
+        m = re.search(r"(\d+(?:\.\d+)?)\s*(?:m)?\s*[x×]\s*(\d+(?:\.\d+)?)\s*(?:m)?\s*[x×]\s*(\d+(?:\.\d+)?)\s*(?:m)?", raw, flags=re.I)
+        if m:
+            return float(m.group(1))*float(m.group(2))*float(m.group(3))
+    return None
+
+
+def verificar_cantidades_python(result: PresupuestoIA) -> PresupuestoIA:
+    corrected=[]
+    for act in result.actividades:
+        formula_text = " ".join([str(act.criterio_cantidad or ""), str(act.descripcion_tecnica or "")])
+        calculated = extraer_formula_geometrica(formula_text, act.unidad)
+        if calculated is not None and calculated > 0:
+            current=float(act.cantidad or 0.0)
+            if current <= 0 or abs(calculated-current)/max(calculated,1e-9)>0.03:
+                act=act.model_copy(update={
+                    "cantidad": round(calculated,4),
+                    "criterio_cantidad": f"{act.criterio_cantidad} | Verificación Python: {calculated:.4f} {act.unidad}",
+                })
+        corrected.append(act)
+    return result.model_copy(update={"actividades": corrected})
+
+
+def _median_filter(values: list[float]) -> list[float]:
+    clean=[float(x) for x in values if x is not None and float(x)>0]
+    if len(clean)<=2: return clean
+    med=statistics.median(clean)
+    filtered=[x for x in clean if med*0.45 <= x <= med*2.20]
+    return filtered if len(filtered)>=2 else clean
+
+
+def calcular_precio_web(investigation: InvestigacionPrecioWebIA, actividad: ActividadIA, params: dict) -> dict | None:
+    unit=normalizar_unidad(actividad.unidad)
+    refs=[]
+    for ref in investigation.referencias:
+        if not ref.compatible or ref.precio_unitario<=0: continue
+        if normalizar_unidad(ref.unidad)!=unit: continue
+        if normalizar_texto(ref.tipo_precio).upper()=="MATERIAL SOLO": continue
+        refs.append(ref)
+    if not refs: return None
+    prices=_median_filter([r.precio_unitario for r in refs])
+    if not prices: return None
+    market_median=statistics.median(prices)
+    direct_refs=[r.precio_unitario for r in refs if normalizar_texto(r.tipo_precio).upper()=="SUBCONTRATISTA"]
+    if direct_refs:
+        unit_cost=statistics.median(_median_filter(direct_refs))
+        note="referencia explícita de subcontratista"
+    else:
+        factor=(1+params["indirect_pct"]/100.0)*(1+params["profit_pct"]/100.0)
+        unit_cost=market_median/factor if factor>0 else market_median
+        note="mediana de mercado instalado convertida a costo base equivalente"
+    source_lines=[]
+    for ref in refs[:5]:
+        source_lines.append(f"{ref.fuente_nombre}: ${ref.precio_unitario:,.2f}/{ref.unidad} ({ref.fuente_url})")
+    detail=f"{len(prices)} referencias web compatibles | mediana ${market_median:,.2f}/{actividad.unidad} | {note} | " + " ; ".join(source_lines)
+    score=score_confianza_precio("WEB_FUNDAMENTADO",detail,refs_count=len(prices))
+    return {"unit_cost":float(unit_cost),"source":"WEB_FUNDAMENTADO","source_detail":detail,"status":"REFERENCIA_WEB","confidence":etiqueta_confianza_score(score),"evidence_score":score,"references_count":len(prices)}
 
 
 NIVELES_PRESUPUESTO = ["Económico", "Medio", "Medio-alto", "Alto"]
@@ -1342,6 +1583,7 @@ class Database:
             "included",
             "original_unit_sale",
             "package_group",
+            "price_evidence_score",
         }
         if table not in allowed_tables or column not in allowed_columns:
             raise ValueError("Migración de columna no permitida.")
@@ -1492,6 +1734,7 @@ class Database:
                 included INTEGER,
                 original_unit_sale REAL,
                 package_group TEXT,
+                price_evidence_score REAL,
                 quantity_criterion TEXT,
                 inclusion_basis TEXT,
                 considerations TEXT,
@@ -1556,6 +1799,7 @@ class Database:
         self._ensure_column("budget_items", "included", "INTEGER")
         self._ensure_column("budget_items", "original_unit_sale", "REAL")
         self._ensure_column("budget_items", "package_group", "TEXT")
+        self._ensure_column("budget_items", "price_evidence_score", "REAL")
 
     def stats(self) -> dict:
         return {
@@ -2009,9 +2253,9 @@ class Database:
                     price_source_detail, price_confidence,
                     material_share_pct, labor_share_pct, other_share_pct, waste_reference_pct,
                     execution_order, area_allocations_json, area, included,
-                    original_unit_sale, package_group, quantity_criterion,
-                    inclusion_basis, considerations, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    original_unit_sale, package_group, price_evidence_score,
+                    quantity_criterion, inclusion_basis, considerations, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -2049,6 +2293,7 @@ class Database:
                     1 if item_included(item) else 0,
                     original_unit_sale_item(item),
                     str(item.get("package_group") or ""),
+                    float(item.get("price_evidence_score") or 0.0),
                     item["quantity_criterion"],
                     item["inclusion_basis"],
                     item["considerations"],
@@ -2192,9 +2437,9 @@ class Database:
                     price_source_detail, price_confidence,
                     material_share_pct, labor_share_pct, other_share_pct, waste_reference_pct,
                     execution_order, area_allocations_json, area, included,
-                    original_unit_sale, package_group, quantity_criterion,
-                    inclusion_basis, considerations, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    original_unit_sale, package_group, price_evidence_score,
+                    quantity_criterion, inclusion_basis, considerations, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -2232,6 +2477,7 @@ class Database:
                     1 if item_included(item) else 0,
                     original_unit_sale_item(item),
                     str(item.get("package_group") or ""),
+                    float(item.get("price_evidence_score") or 0.0),
                     item["quantity_criterion"],
                     item["inclusion_basis"],
                     item["considerations"],
@@ -2551,7 +2797,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-09-03-v15-dos-hojas-area-directa"
+DATABASE_CACHE_VERSION = "2026-09-03-v16-multipass-precios-evidencia"
 
 
 @st.cache_resource(show_spinner=False)
@@ -2574,6 +2820,36 @@ def get_database(database_url: str | None, cache_version: str):
 # =========================================================
 # MODELOS DE RESPUESTA ESTRUCTURADA
 # =========================================================
+
+
+class AreasProyectoIA(BaseModel):
+    areas: list[str] = Field(
+        description=(
+            "Lista cerrada de espacios físicos o funcionales del proyecto. "
+            "Debe contener General y después las áreas específicas."
+        )
+    )
+
+
+class ReferenciaPrecioWebIA(BaseModel):
+    precio_unitario: float = Field(ge=0)
+    unidad: str
+    tipo_precio: str = Field(
+        description=(
+            "SUBCONTRATISTA, SUMINISTRO_INSTALACION, PRECIO_PUBLICO_INSTALADO "
+            "o MATERIAL_SOLO"
+        )
+    )
+    descripcion_referencia: str
+    fuente_nombre: str
+    fuente_url: str
+    fecha_referencia: str = ""
+    compatible: bool = True
+
+
+class InvestigacionPrecioWebIA(BaseModel):
+    referencias: list[ReferenciaPrecioWebIA]
+    observaciones: str = ""
 
 
 class ActividadIA(BaseModel):
@@ -2678,6 +2954,42 @@ def get_api_key() -> str | None:
     return get_secret("GEMINI_API_KEY")
 
 
+
+def detectar_areas_proyecto_ia(api_key: str, model_name: str, project_data: dict) -> list[str]:
+    """PASS 1 V16: crea una lista cerrada de espacios antes de generar actividades."""
+    client=genai.Client(api_key=api_key)
+    prompt=f"""
+Actúa como ANALISTA DE ALCANCE DE REMODELACIÓN.
+
+DESCRIPCIÓN
+{project_data['description']}
+
+Devuelve una lista de ÁREAS FÍSICAS O FUNCIONALES.
+REGLAS
+1. Incluye General.
+2. Después incluye cada espacio específico explícito.
+3. No juntes baños distintos bajo 'Baños' ni recámaras distintas bajo 'Recámaras'.
+4. Conserva calificadores: Baño principal, Baño de visitas, Recámara 1, Cocina, Sala, Roof top, Despacho, etc.
+5. No incluyas oficios como Albañilería, Carpintería o Pintura.
+6. Si dice '3 baños' sin nombres, normaliza Baño 1, Baño 2 y Baño 3.
+7. No inventes espacios ajenos al alcance.
+8. Esta lista será CERRADA para todo el presupuesto.
+"""
+    last=None
+    for model in modelos_gemini(model_name):
+        try:
+            response=client.models.generate_content(model=model,contents=prompt,config=types.GenerateContentConfig(response_mime_type="application/json",response_schema=AreasProyectoIA,temperature=0.1))
+            if response.text:
+                parsed=AreasProyectoIA.model_validate_json(response.text)
+                areas=normalizar_lista_areas(parsed.areas)
+                if areas: return areas
+        except Exception as exc:
+            last=exc
+    fallback=normalizar_lista_areas(detectar_areas_explicitas(project_data))
+    if fallback: return fallback
+    raise RuntimeError(f"No fue posible detectar áreas. Último error: {last}")
+
+
 def generar_presupuesto_ia(
     api_key: str,
     model_name: str,
@@ -2688,6 +3000,8 @@ def generar_presupuesto_ia(
     year = datetime.now().year
     budget_level = project_data.get("budget_level", "Medio-alto")
     level_criterion = criterio_nivel_presupuesto(budget_level)
+    allowed_areas = areas_validas_proyecto(project_data)
+    allowed_areas_text = "\n".join(f"- {x}" for x in allowed_areas)
 
     prompt = f"""
 Actúa como un INGENIERO DE COSTOS SENIOR de una empresa de remodelación de alto
@@ -2715,6 +3029,17 @@ DESCRIPCIÓN DEL USUARIO
 
 TEXTO GUÍA
 {project_data['guide_text'] or 'Sin consideraciones adicionales.'}
+
+ÁREAS VÁLIDAS DEL PROYECTO — LISTA CERRADA
+{allowed_areas_text}
+
+REGLAS DE ÁREA
+- area DEBE ser exactamente uno de los valores anteriores.
+- General NO es el valor predeterminado.
+- Usa General solo para actividades verdaderamente comunes a toda la obra.
+- Si título/descripción dicen Cocina, Baño principal, Recámara 1, etc., area debe ser ese espacio.
+- Antes de asignar General, comprueba que ninguna área específica sea aplicable.
+- En remodelaciones integrales la mayoría de actividades deben quedar en un espacio específico.
 
 REGLA CENTRAL DE GRANULARIDAD
 1. UNA ACTIVIDAD = UN TRABAJO COTIZABLE EN UNA SOLA ÁREA.
@@ -2774,18 +3099,21 @@ CONTROL
 30. Verifica que ninguna actividad mezcle cocina, baños distintos, recámaras
     distintas u otras áreas independientes.
 31. Criterio, fundamento y consideraciones deben ser breves y revisables.
-32. No expongas cadenas de pensamiento.
+32. NIVEL DE CONFIANZA DE CANTIDAD:
+    - Alta: únicamente cuando la cantidad sale directamente de números,
+      dimensiones o conteos explícitos del usuario, sin supuestos relevantes.
+    - Media: cuando parte de datos explícitos pero requiere interpretación,
+      geometría aproximada o una decisión técnica menor.
+    - Baja: cuando la cantidad es estimada, supuesta, promediada, inferida o
+      falta información importante.
+33. NIVEL DE CONFIANZA DE PRECIO:
+    costo_unitario_estimado es una estimación; no uses Alta solo porque el trabajo
+    sea común. La aplicación elevará después la confianza si encuentra una base
+    interna validada o una referencia externa sólida.
+34. No expongas cadenas de pensamiento.
 """
 
-    modelos = []
-    for model in [
-        model_name,
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
-    ]:
-        if model and model not in modelos:
-            modelos.append(model)
+    modelos = modelos_gemini(model_name)
 
     last_error = None
     for model in modelos:
@@ -2844,6 +3172,9 @@ Ubicación: {project_data['location']}
 Descripción original:
 {project_data['description']}
 
+ÁREAS VÁLIDAS — LISTA CERRADA
+{chr(10).join(f"- {x}" for x in areas_validas_proyecto(project_data))}
+
 ACTIVIDADES
 {json.dumps(current, ensure_ascii=False, separators=(',', ':'))}
 
@@ -2856,7 +3187,7 @@ REGLAS
    solo porque sean del mismo oficio.
 4. Carpintería/mobiliario: muebles distintos permanecen separados.
 5. Solo agrupa unidades realmente equivalentes dentro de la misma área.
-6. No inventes áreas; usa espacios explícitos del texto original o General.
+6. area debe ser EXACTAMENTE una de las áreas válidas. General es excepcional; si el concepto reside en un espacio específico, asígnalo a ese espacio.
 7. Si divides una actividad, no dupliques metrajes/cantidades/costos. Si no hay
    datos suficientes para dividir responsablemente, conserva General y explica
    la incertidumbre en consideraciones.
@@ -2870,7 +3201,7 @@ REGLAS
 """
 
     models = []
-    for model in [model_name, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]:
+    for model in modelos_gemini(model_name):
         if model and model not in models:
             models.append(model)
 
@@ -2899,7 +3230,13 @@ REGLAS
                 fixed.append(
                     act.model_copy(
                         update={
-                            "area": validar_area_actividad(project_data, act.area),
+                            "area": resolver_area_actividad(
+                                project_data,
+                                act.area,
+                                act.titulo_comercial,
+                                act.descripcion_tecnica,
+                                act.subpartida,
+                            ),
                             "partida": normalizar_seccion_comercial(act.partida),
                             "codigo_sugerido": code,
                         }
@@ -2910,7 +3247,17 @@ REGLAS
             continue
 
     fallback = [
-        act.model_copy(update={"area": validar_area_actividad(project_data, act.area)})
+        act.model_copy(
+            update={
+                "area": resolver_area_actividad(
+                    project_data,
+                    act.area,
+                    act.titulo_comercial,
+                    act.descripcion_tecnica,
+                    act.subpartida,
+                )
+            }
+        )
         for act in result.actividades
     ]
     return result.model_copy(update={"actividades": fallback})
@@ -3020,15 +3367,7 @@ INSTRUCCIONES
 
 """
 
-    modelos = []
-    for model in [
-        model_name,
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
-    ]:
-        if model and model not in modelos:
-            modelos.append(model)
+    modelos = modelos_gemini(model_name)
 
     last_error = None
     for model in modelos:
@@ -3064,6 +3403,49 @@ INSTRUCCIONES
 # =========================================================
 # MOTOR DE PRECIOS
 # =========================================================
+
+def investigar_precio_web_ia(api_key: str, model_name: str, actividad: ActividadIA, project_data: dict, intento: int = 1) -> InvestigacionPrecioWebIA | None:
+    if not api_key: return None
+    unit=normalizar_unidad(actividad.unidad)
+    if unit in {"","%"}: return None
+    client=genai.Client(api_key=api_key)
+    year=datetime.now().year
+    strategy=("Busca referencias muy comparables de precio unitario en Ciudad de México o zona metropolitana. Prioriza servicios instalados y contratistas." if intento==1 else "Amplía a México, fabricantes, instaladores y catálogos comerciales, manteniendo unidad y alcance técnico.")
+    prompt=f"""
+Investiga el PRECIO UNITARIO ACTUAL de esta actividad.
+Área: {actividad.area}
+Partida: {actividad.partida}
+Título: {actividad.titulo_comercial}
+Descripción: {actividad.descripcion_tecnica}
+Unidad obligatoria: {actividad.unidad}
+Nivel: {project_data.get('budget_level','Medio-alto')}
+Ubicación: Ciudad de México
+Año: {year}
+{strategy}
+REGLAS
+1. Devuelve 2 a 5 referencias cuando existan.
+2. El precio debe corresponder exactamente a {actividad.unidad}.
+3. tipo_precio: SUBCONTRATISTA, SUMINISTRO_INSTALACION, PRECIO_PUBLICO_INSTALADO o MATERIAL_SOLO.
+4. Para servicio integrado no uses material suelto como referencia principal.
+5. Incluye URL pública concreta; no inventes URLs ni precios.
+6. Si no encuentras evidencia útil, referencias=[].
+7. No agregues 30% de franquicia ni IVA.
+"""
+    for model in modelos_gemini(model_name):
+        try:
+            interaction=client.interactions.create(model=model,input=prompt,tools=[{"type":"google_search"}],response_format={"type":"text","mime_type":"application/json","schema":InvestigacionPrecioWebIA.model_json_schema()})
+            raw=getattr(interaction,'output_text',None)
+            if raw: return InvestigacionPrecioWebIA.model_validate_json(raw)
+        except Exception:
+            try:
+                grounding_tool=types.Tool(google_search=types.GoogleSearch())
+                response=client.models.generate_content(model=model,contents=prompt,config=types.GenerateContentConfig(tools=[grounding_tool],response_mime_type="application/json",response_schema=InvestigacionPrecioWebIA,temperature=0.1))
+                if response.text: return InvestigacionPrecioWebIA.model_validate_json(response.text)
+            except Exception:
+                continue
+    return None
+
+
 
 
 def buscar_precio_interno(db: Database, actividad: ActividadIA) -> dict | None:
@@ -3205,106 +3587,54 @@ def resolver_items(
     project_data: dict,
     params: dict,
     force_new_price_codes: set[str] | None = None,
+    api_key: str | None = None,
+    model_name: str = "gemini-3.8-flash",
 ) -> list[dict]:
-    items = []
-    force_new_price_codes = {
-        str(x).strip().upper() for x in (force_new_price_codes or set())
-    }
-
-    for idx, act in enumerate(result.actividades, start=1):
-        requested_code = limpiar_codigo(act.codigo_sugerido, f"CON-{idx:03d}")
-        force_new_price = requested_code.upper() in force_new_price_codes
-
-        internal = None if force_new_price else buscar_precio_interno(db, act)
-        external = None if internal or force_new_price else buscar_precio_externo(
-            db, act, project_data, params
-        )
-
+    """Base interna > CDMX > Google Search > IA último recurso."""
+    items=[]
+    force_new_price_codes={str(x).strip().upper() for x in (force_new_price_codes or set())}
+    for idx,act in enumerate(result.actividades,start=1):
+        requested_code=limpiar_codigo(act.codigo_sugerido,f"CON-{idx:03d}")
+        force_new_price=requested_code.upper() in force_new_price_codes
+        internal=None if force_new_price else buscar_precio_interno(db,act)
+        external=None if internal or force_new_price else buscar_precio_externo(db,act,project_data,params)
+        web_price=None
+        if not internal and not (external and external.get("use_automatically")):
+            inv=investigar_precio_web_ia(api_key or "",model_name,act,project_data,1)
+            if inv: web_price=calcular_precio_web(inv,act,params)
+            if not web_price or web_price.get("evidence_score",0)<65:
+                inv2=investigar_precio_web_ia(api_key or "",model_name,act,project_data,2)
+                if inv2:
+                    cand=calcular_precio_web(inv2,act,params)
+                    if cand and cand.get("evidence_score",0)>(web_price or {}).get("evidence_score",0): web_price=cand
         if internal:
-            unit_cost = float(internal["unit_cost"])
-            concept_id = internal["concept_id"]
-            source = internal["source"]
-            source_detail = internal["source_detail"]
-            price_status = internal["status"]
-            price_confidence = internal["confidence"]
+            unit_cost=float(internal["unit_cost"]); concept_id=internal["concept_id"]; source=internal["source"]; source_detail=internal["source_detail"]; price_status=internal["status"]
+            evidence_score=score_confianza_precio(source,source_detail); price_confidence=etiqueta_confianza_score(evidence_score)
         elif external and external.get("use_automatically"):
-            unit_cost = float(external["unit_cost"])
-            concept_id = None
-            source = "REFERENCIA_CDMX"
-            source_detail = external["source_detail"]
-            price_status = "REFERENCIA_EXTERNA"
-            price_confidence = external.get("confidence", "Media")
+            unit_cost=float(external["unit_cost"]); concept_id=None; source="REFERENCIA_CDMX"; source_detail=external["source_detail"]; price_status="REFERENCIA_EXTERNA"
+            evidence_score=88 if external.get("match_score",0)>=0.92 else 76; price_confidence=etiqueta_confianza_score(evidence_score)
+        elif web_price:
+            unit_cost=float(web_price["unit_cost"]); concept_id=None; source="WEB_FUNDAMENTADO"; source_detail=web_price["source_detail"]; price_status="REFERENCIA_WEB"; evidence_score=int(web_price["evidence_score"]); price_confidence=etiqueta_confianza_score(evidence_score)
+            if external: source_detail += " | CDMX secundario: " + external["source_detail"]
         else:
-            unit_cost = float(act.costo_unitario_estimado)
-            concept_id = None
-            source = "IA_ESTIMADO"
-            source_detail = "Estimación inicial de Gemini; validar con subcontratista."
-            if external:
-                source_detail += " | Referencia CDMX no aplicada: " + external["source_detail"]
-            price_status = "ESTIMADO_IA"
-            price_confidence = act.nivel_confianza_precio
-
-        quantity = max(float(act.cantidad), 0.0)
-        indirect_unit = unit_cost * params["indirect_pct"] / 100.0
-        profit_unit = (unit_cost + indirect_unit) * params["profit_pct"] / 100.0
-        internal_unit = unit_cost + indirect_unit + profit_unit
-
-        contractor_amount = quantity * unit_cost
-        internal_amount = quantity * internal_unit
-        benefit = internal_amount - contractor_amount
-        margin = benefit / internal_amount * 100.0 if internal_amount else 0.0
-
-        considerations = act.consideraciones.strip()
-        if act.requiere_cotizacion:
-            considerations = ((considerations + " | ") if considerations else "") + (
-                "Requiere cotización de subcontratista."
-            )
-
-        area = validar_area_actividad(project_data, act.area)
-
+            unit_cost=float(act.costo_unitario_estimado); concept_id=None; source="IA_ESTIMADO"; source_detail="Último recurso: sin referencia interna, CDMX fuerte ni evidencia web consolidable."; price_status="ESTIMADO_IA"; evidence_score=30; price_confidence="Baja"
+            if external: source_detail += " | CDMX débil: " + external["source_detail"]
+        quantity=max(float(act.cantidad),0.0)
+        indirect_unit=unit_cost*params["indirect_pct"]/100.0
+        profit_unit=(unit_cost+indirect_unit)*params["profit_pct"]/100.0
+        internal_unit=unit_cost+indirect_unit+profit_unit
+        contractor_amount=quantity*unit_cost; internal_amount=quantity*internal_unit
+        benefit=internal_amount-contractor_amount; margin=benefit/internal_amount*100.0 if internal_amount else 0.0
+        considerations=act.consideraciones.strip()
+        if evidence_score<65:
+            considerations=((considerations+" | ") if considerations else "")+"Precio con evidencia insuficiente; recomendable confirmar con proveedor."
+        if act.requiere_cotizacion and evidence_score<85:
+            note="Actividad especializada: conviene cotización directa."
+            if note not in considerations: considerations=((considerations+" | ") if considerations else "")+note
+        area=resolver_area_actividad(project_data,act.area,act.titulo_comercial,act.descripcion_tecnica,act.subpartida)
         items.append({
-            "concept_id": concept_id,
-            "area": area,
-            "included": True,
-            "package_group": "",
-            "category": normalizar_seccion_comercial(act.partida),
-            "subcategory": act.subpartida.strip(),
-            "code": requested_code,
-            "execution_order": int(act.orden_ejecucion),
-            "commercial_title": act.titulo_comercial.strip(),
-            "description": act.descripcion_tecnica.strip(),
-            "unit": act.unidad.strip().upper(),
-            "quantity": quantity,
-            "unit_cost": unit_cost,
-            "direct_amount": contractor_amount,
-            "unit_indirect": indirect_unit,
-            "unit_profit": profit_unit,
-            "unit_sale": internal_unit,
-            "original_unit_sale": internal_unit,
-            "sale_amount": internal_amount,
-            "benefit_amount": benefit,
-            "sale_margin_pct": margin,
-            "price_source": source,
-            "price_source_detail": source_detail,
-            "price_status": price_status,
-            "price_confidence": price_confidence,
-            "quantity_confidence": act.nivel_confianza_cantidad,
-            "quantity_criterion": act.criterio_cantidad.strip(),
-            "inclusion_basis": act.fundamento_inclusion.strip(),
-            "considerations": considerations,
-            "material_share_pct": 0.0,
-            "labor_share_pct": 0.0,
-            "other_share_pct": 100.0,
-            "waste_reference_pct": 0.0,
-            "area_allocations": [{
-                "area": area,
-                "porcentaje": 100.0,
-                "cantidad_referencia": quantity,
-                "criterio": "Área directa V15.",
-                "confianza": "Alta",
-            }],
+            "concept_id":concept_id,"area":area,"included":True,"package_group":"","category":normalizar_seccion_comercial(act.partida),"subcategory":act.subpartida.strip(),"code":requested_code,"execution_order":int(act.orden_ejecucion),"commercial_title":act.titulo_comercial.strip(),"description":act.descripcion_tecnica.strip(),"unit":act.unidad.strip().upper(),"quantity":quantity,"unit_cost":unit_cost,"direct_amount":contractor_amount,"unit_indirect":indirect_unit,"unit_profit":profit_unit,"unit_sale":internal_unit,"original_unit_sale":internal_unit,"sale_amount":internal_amount,"benefit_amount":benefit,"sale_margin_pct":margin,"price_source":source,"price_source_detail":source_detail,"price_status":price_status,"price_confidence":price_confidence,"price_evidence_score":evidence_score,"quantity_confidence":act.nivel_confianza_cantidad,"quantity_criterion":act.criterio_cantidad.strip(),"inclusion_basis":act.fundamento_inclusion.strip(),"considerations":considerations,"material_share_pct":0.0,"labor_share_pct":0.0,"other_share_pct":100.0,"waste_reference_pct":0.0,"area_allocations":[{"area":area,"porcentaje":100.0,"cantidad_referencia":quantity,"criterio":"Área directa V16.","confianza":"Alta"}],
         })
-
     return items
 
 
@@ -3368,6 +3698,8 @@ def aplicar_revision_estructural(
     revision: RevisionPresupuestoIA,
     project_data: dict,
     params: dict,
+    api_key: str | None = None,
+    model_name: str = "gemini-3.8-flash",
 ) -> tuple[PresupuestoIA, list[dict], list[str]]:
     """
     Aplica las operaciones devueltas por Gemini. Las actividades no mencionadas
@@ -3413,11 +3745,8 @@ def aplicar_revision_estructural(
             actividades=activities_to_resolve,
         )
         resolved_changes = resolver_items(
-            db,
-            temp_result,
-            project_data,
-            params,
-            force_new_price_codes=force_codes,
+            db, verificar_cantidades_python(temp_result), project_data, params,
+            force_new_price_codes=force_codes, api_key=api_key, model_name=model_name,
         )
 
     items = [dict(x) for x in current_items]
@@ -3945,6 +4274,12 @@ def importar_presupuesto_excel(
             f"{abreviar_cliente(metadata['name'])}-IMP-0001"
         )
 
+    imported_areas = []
+    for row_data in raw_rows:
+        area = normalizar_nombre_area(row_data.get("area") or AREA_GENERAL)
+        if area != AREA_GENERAL and area not in imported_areas:
+            imported_areas.append(area)
+
     project_data = {
         "name": metadata["name"],
         "project_type": metadata["project_type"],
@@ -3954,6 +4289,7 @@ def importar_presupuesto_excel(
         "dimensions_text": "",
         "description": "\n".join(description_lines),
         "guide_text": DEFAULT_GUIDE_TEXT,
+        "areas_detectadas": [AREA_GENERAL] + imported_areas,
     }
 
     factor = (
@@ -4045,6 +4381,7 @@ def importar_presupuesto_excel(
             ),
             "price_status": "IMPORTADO",
             "price_confidence": "Media",
+            "price_evidence_score": 65,
             "material_share_pct": material_share,
             "labor_share_pct": labor_share,
             "other_share_pct": other_share,
@@ -4108,20 +4445,34 @@ def crear_excel(
     params: dict,
     version: int = 1,
 ) -> bytes:
-    """V15: solamente 01 Presupuesto y 02 Control Interno."""
+    """
+    V15.1: dos hojas.
+
+    01 Presupuesto:
+      Área | Partida | Subpartida | Descripción Técnica | Unidad | Cant. |
+      Precio Unitario | Importe interno | Importe Final | Considerar
+
+    02 Control Interno:
+      conserva Código y Título comercial, además del control de subcontratación,
+      margen, confianza, fuente y consideraciones.
+    """
     wb = Workbook()
     wb.calculation.calcMode = "auto"
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
     wb.calculation.calcOnSave = True
 
-    internal_blue = "355C7D"
-    white = "FFFFFF"
-    gray_light = "F3F3F3"
+    # Paleta recuperada del formato anterior.
     brown = "4A342B"
+    brown_mid = "6A4B3C"
     brown_light = "EDE7E3"
-    editable_fill = "FFF8E7"
+    beige = "F5F0EC"
+    cream = "FFF8E7"
+    gray = "E7E7E7"
+    gray_light = "F5F5F5"
     formula_fill = "F2F2F2"
+    white = "FFFFFF"
+    dark_gray = "555555"
     thin_gray = Side(style="thin", color="D9D9D9")
 
     ordered_items = estructura_partidas_excel(items)
@@ -4131,29 +4482,34 @@ def crear_excel(
         item["package_group"] = str(item.get("package_group") or "")
         item["original_unit_sale"] = original_unit_sale_item(item)
 
-    # ==================== 01 PRESUPUESTO ====================
+    # =====================================================
+    # 01 PRESUPUESTO
+    # =====================================================
     ws = wb.active
     ws.title = "01 Presupuesto"
     ws.sheet_view.showGridLines = False
 
-    ws.merge_cells("A1:L1")
+    # Título como en el formato anterior: fondo blanco + texto café.
+    ws.merge_cells("A1:J1")
     ws["A1"] = "PRESUPUESTO"
-    ws["A1"].font = Font(size=15, bold=True, color=white)
-    ws["A1"].fill = PatternFill("solid", fgColor=internal_blue)
+    ws["A1"].font = Font(size=16, bold=True, color=brown)
 
-    ws.merge_cells("A2:L2")
+    ws.merge_cells("A2:J2")
     ws["A2"] = project_data.get("name") or "Cliente"
+    ws["A2"].font = Font(size=11, bold=True, color=dark_gray)
 
-    ws.merge_cells("A3:L3")
+    ws.merge_cells("A3:J3")
     ws["A3"] = (
         f"{project_data.get('project_type', '')} · "
         f"{project_data.get('budget_level', 'Medio-alto')} · "
         f"{project_data.get('location', '')} · {project_code} · V{version:02d}"
     )
+    ws["A3"].font = Font(size=9, color=dark_gray)
 
+    # ---------------- RESUMEN ----------------
+    ws.merge_cells("A5:I5")
     ws["A5"] = "RESUMEN"
-    ws["A5"].font = Font(bold=True, color=white)
-    ws["A5"].fill = PatternFill("solid", fgColor=internal_blue)
+    ws["A5"].font = Font(bold=True, color=brown)
 
     summary_internal_row = 6
     summary_brand_row = 7
@@ -4161,22 +4517,27 @@ def crear_excel(
     summary_final_row = 9
 
     labels = [
-        (6, "Presupuesto interno considerado (sin 30% / sin IVA)"),
-        (7, f"Presupuesto + {BRAND_MARKUP_PCT:.0f}% marca (sin IVA)"),
-        (8, f"IVA {params['iva_pct']:.0f}%"),
-        (9, "Total final considerado"),
+        (6, "Presupuesto interno considerado (sin 30% / sin IVA)", gray),
+        (7, f"Presupuesto + {BRAND_MARKUP_PCT:.0f}% marca (sin IVA)", beige),
+        (8, f"IVA {params['iva_pct']:.0f}%", gray_light),
+        (9, "Total final considerado", brown_light),
     ]
-    for rr, label in labels:
-        ws.merge_cells(start_row=rr, start_column=1, end_row=rr, end_column=10)
+    for rr, label, fill in labels:
+        ws.merge_cells(start_row=rr, start_column=1, end_row=rr, end_column=8)
         ws.cell(rr, 1, label)
-        ws.cell(rr, 1).font = Font(bold=True)
-        ws.cell(rr, 11).number_format = '$#,##0.00'
+        ws.cell(rr, 1).font = Font(
+            bold=True,
+            color=brown if rr == 9 else dark_gray,
+        )
+        ws.cell(rr, 1).fill = PatternFill("solid", fgColor=fill)
+        ws.cell(rr, 9).fill = PatternFill("solid", fgColor=fill)
+        ws.cell(rr, 9).font = Font(
+            bold=True,
+            color=brown if rr == 9 else dark_gray,
+        )
+        ws.cell(rr, 9).number_format = '$#,##0.00'
 
-    ws.cell(9, 1).fill = PatternFill("solid", fgColor=brown_light)
-    ws.cell(9, 11).fill = PatternFill("solid", fgColor=brown_light)
-    ws.cell(9, 1).font = Font(bold=True, color=brown)
-    ws.cell(9, 11).font = Font(bold=True, color=brown)
-
+    # ---------------- RESUMEN POR ÁREA ----------------
     areas = []
     for item in ordered_items:
         area = area_item(item)
@@ -4187,38 +4548,56 @@ def crear_excel(
     if not areas:
         areas = [AREA_GENERAL]
 
+    ws.merge_cells("A11:C11")
     ws["A11"] = "RESUMEN POR ÁREA"
-    ws["A11"].font = Font(bold=True, color=white)
-    ws["A11"].fill = PatternFill("solid", fgColor=internal_blue)
-    ws["A12"] = "Área"
-    ws["B12"] = "Importe interno considerado"
-    ws["C12"] = "Importe final considerado"
-    for col in range(1, 4):
-        ws.cell(12, col).font = Font(bold=True)
-        ws.cell(12, col).fill = PatternFill("solid", fgColor=gray_light)
+    ws["A11"].font = Font(bold=True, color=brown)
+
+    area_headers = ["Área", "Importe interno considerado", "Importe final considerado"]
+    for col, header in enumerate(area_headers, 1):
+        cell = ws.cell(12, col, header)
+        cell.font = Font(bold=True, color=white)
+        cell.fill = PatternFill("solid", fgColor=brown_mid)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     area_rows = {}
     rr = 13
-    for area in areas:
+    for idx, area in enumerate(areas):
         area_rows[area] = rr
         ws.cell(rr, 1, area)
+        fill = beige if idx % 2 == 0 else gray_light
+        for col in range(1, 4):
+            ws.cell(rr, col).fill = PatternFill("solid", fgColor=fill)
         rr += 1
 
+    # ---------------- TABLA ----------------
     table_header_row = rr + 1
     headers = [
-        "Código", "Área", "Partida", "Subpartida", "Título comercial",
-        "Descripción Técnica", "Unidad", "Cant.", "Precio Unitario (MXN)",
-        "Importe interno (MXN)", "Importe Final (MXN)", "Considerar",
+        "Área",
+        "Partida",
+        "Subpartida",
+        "Descripción Técnica",
+        "Unidad",
+        "Cant.",
+        "Precio Unitario (MXN)",
+        "Importe interno (MXN)",
+        "Importe Final (MXN)",
+        "Considerar",
     ]
+
     for col, header in enumerate(headers, 1):
         cell = ws.cell(table_header_row, col, header)
         cell.font = Font(bold=True, color=white)
-        cell.fill = PatternFill("solid", fgColor=internal_blue)
+        cell.fill = PatternFill("solid", fgColor=brown)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     first_item_row = table_header_row + 1
     commercial_row_map = {}
-    validation = DataValidation(type="list", formula1='"Sí,No"', allow_blank=False)
+
+    validation = DataValidation(
+        type="list",
+        formula1='"Sí,No"',
+        allow_blank=False,
+    )
     ws.add_data_validation(validation)
 
     for offset, item in enumerate(ordered_items):
@@ -4226,36 +4605,43 @@ def crear_excel(
         commercial_row_map[item["code"]] = row
 
         values = [
-            item["code"], area_item(item),
+            area_item(item),
             item.get("partida_excel") or nombre_partida_excel(item.get("category")),
             item.get("subpartida_excel") or nombre_subpartida_excel(item),
-            titulo_comercial_item(item), item["description"], item["unit"],
+            item["description"],
+            item["unit"],
             float(item["quantity"]),
         ]
         for col, value in enumerate(values, 1):
             ws.cell(row, col, value)
 
-        ws.cell(row, 10, float(item.get("sale_amount") or 0.0))
-        ws.cell(row, 9, f'=IF(H{row}=0,0,J{row}/H{row})')
+        # H = Importe interno editable. G = P.U. derivado de H/F.
+        ws.cell(row, 8, float(item.get("sale_amount") or 0.0))
+        ws.cell(row, 7, f'=IF(F{row}=0,0,H{row}/F{row})')
         ws.cell(
-            row, 11,
-            f'=IF(L{row}="Sí",J{row}*(1+{BRAND_MARKUP_PCT / 100.0:.6f})'
-            f'*(1+{params["iva_pct"] / 100.0:.6f}),0)'
+            row,
+            9,
+            f'=IF(J{row}="Sí",H{row}*(1+{BRAND_MARKUP_PCT / 100.0:.6f})'
+            f'*(1+{params["iva_pct"] / 100.0:.6f}),0)',
         )
-        ws.cell(row, 12, "Sí" if item_included(item) else "No")
-        validation.add(ws.cell(row, 12))
+        ws.cell(row, 10, "Sí" if item_included(item) else "No")
+        validation.add(ws.cell(row, 10))
 
-        ws.cell(row, 8).number_format = "0.00"
-        for col in (9, 10, 11):
+        ws.cell(row, 6).number_format = "0.00"
+        for col in (7, 8, 9):
             ws.cell(row, col).number_format = '$#,##0.00'
-        ws.cell(row, 10).fill = PatternFill("solid", fgColor=editable_fill)
-        ws.cell(row, 9).fill = PatternFill("solid", fgColor=formula_fill)
-        ws.cell(row, 11).fill = PatternFill("solid", fgColor=formula_fill)
-        ws.cell(row, 12).fill = PatternFill("solid", fgColor=editable_fill)
 
-        for col in range(1, 13):
+        # Recuperar lectura visual del Excel anterior:
+        # fórmula de P.U. gris, importe editable crema, final beige.
+        ws.cell(row, 7).fill = PatternFill("solid", fgColor=formula_fill)
+        ws.cell(row, 8).fill = PatternFill("solid", fgColor=cream)
+        ws.cell(row, 9).fill = PatternFill("solid", fgColor=beige)
+        ws.cell(row, 10).fill = PatternFill("solid", fgColor=cream)
+
+        for col in range(1, 11):
             ws.cell(row, col).alignment = Alignment(
-                vertical="top", wrap_text=col in {2, 3, 4, 5, 6}
+                vertical="top",
+                wrap_text=col in {1, 2, 3, 4},
             )
             ws.cell(row, col).border = Border(bottom=thin_gray)
 
@@ -4263,64 +4649,103 @@ def crear_excel(
     if not ordered_items:
         last_item_row = first_item_row
 
+    # Resumen general.
     ws.cell(
-        summary_internal_row, 11,
-        f'=SUMIF(L{first_item_row}:L{last_item_row},"Sí",J{first_item_row}:J{last_item_row})'
+        summary_internal_row,
+        9,
+        f'=SUMIF(J{first_item_row}:J{last_item_row},"Sí",H{first_item_row}:H{last_item_row})',
     )
     ws.cell(
-        summary_brand_row, 11,
-        f'=K{summary_internal_row}*(1+{BRAND_MARKUP_PCT / 100.0:.6f})'
+        summary_brand_row,
+        9,
+        f'=I{summary_internal_row}*(1+{BRAND_MARKUP_PCT / 100.0:.6f})',
     )
-    ws.cell(summary_iva_row, 11, f'=K{summary_brand_row}*{params["iva_pct"] / 100.0:.6f}')
-    ws.cell(summary_final_row, 11, f'=K{summary_brand_row}+K{summary_iva_row}')
+    ws.cell(
+        summary_iva_row,
+        9,
+        f'=I{summary_brand_row}*{params["iva_pct"] / 100.0:.6f}',
+    )
+    ws.cell(
+        summary_final_row,
+        9,
+        f'=I{summary_brand_row}+I{summary_iva_row}',
+    )
 
+    # Resumen por área.
     for area, row in area_rows.items():
         safe = str(area).replace('"', '""')
         ws.cell(
-            row, 2,
-            f'=SUMIFS(J{first_item_row}:J{last_item_row},'
-            f'B{first_item_row}:B{last_item_row},"{safe}",'
-            f'L{first_item_row}:L{last_item_row},"Sí")'
+            row,
+            2,
+            f'=SUMIFS(H{first_item_row}:H{last_item_row},'
+            f'A{first_item_row}:A{last_item_row},"{safe}",'
+            f'J{first_item_row}:J{last_item_row},"Sí")',
         )
         ws.cell(
-            row, 3,
-            f'=SUMIFS(K{first_item_row}:K{last_item_row},'
-            f'B{first_item_row}:B{last_item_row},"{safe}",'
-            f'L{first_item_row}:L{last_item_row},"Sí")'
+            row,
+            3,
+            f'=SUMIFS(I{first_item_row}:I{last_item_row},'
+            f'A{first_item_row}:A{last_item_row},"{safe}",'
+            f'J{first_item_row}:J{last_item_row},"Sí")',
         )
         ws.cell(row, 2).number_format = '$#,##0.00'
         ws.cell(row, 3).number_format = '$#,##0.00'
 
-    for col, width in enumerate([15,20,28,22,28,62,10,11,20,21,21,13], 1):
+    widths = [20, 27, 23, 72, 10, 11, 21, 22, 22, 13]
+    for col, width in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(col)].width = width
-    ws.row_dimensions[table_header_row].height = 34
+
+    ws.row_dimensions[table_header_row].height = 32
     if ordered_items:
-        ws.auto_filter.ref = f"A{table_header_row}:L{last_item_row}"
+        ws.auto_filter.ref = f"A{table_header_row}:J{last_item_row}"
+
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
+    ws.page_margins.left = 0.25
+    ws.page_margins.right = 0.25
+    ws.page_margins.top = 0.45
+    ws.page_margins.bottom = 0.45
 
-    # ==================== 02 CONTROL INTERNO ====================
+    # =====================================================
+    # 02 CONTROL INTERNO + TRAZABILIDAD
+    # =====================================================
     wc = wb.create_sheet("02 Control Interno")
     wc.sheet_view.showGridLines = False
+
     wc.merge_cells("A1:U1")
     wc["A1"] = "CONTROL INTERNO Y TRAZABILIDAD"
-    wc["A1"].font = Font(size=15, bold=True, color=white)
-    wc["A1"].fill = PatternFill("solid", fgColor=internal_blue)
+    wc["A1"].font = Font(size=15, bold=True, color=brown)
 
     control_headers = [
-        "Código", "Área", "Partida", "Subpartida", "Título comercial",
-        "Descripción", "Unidad", "Lote / Paquete", "Cant.", "Considerar",
-        "Costo subcontratista unit.", "Costo subcontratista total",
-        "P.U. interno original", "P.U. interno vigente", "Importe interno vigente",
-        "Dif. P.U. vs original", "Beneficio", "Margen %",
-        "Confianza", "Fuente precio", "Consideraciones",
+        "Código",
+        "Área",
+        "Partida",
+        "Subpartida",
+        "Título comercial",
+        "Descripción",
+        "Unidad",
+        "Lote / Paquete",
+        "Cant.",
+        "Considerar",
+        "Costo subcontratista unit.",
+        "Costo subcontratista total",
+        "P.U. interno original",
+        "P.U. interno vigente",
+        "Importe interno vigente",
+        "Dif. P.U. vs original",
+        "Beneficio",
+        "Margen %",
+        "Confianza",
+        "Fuente precio",
+        "Consideraciones",
     ]
+
     header_row = 3
     for col, header in enumerate(control_headers, 1):
         cell = wc.cell(header_row, col, header)
         cell.font = Font(bold=True, color=white)
-        cell.fill = PatternFill("solid", fgColor=internal_blue)
+        cell.fill = PatternFill("solid", fgColor=brown)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     for offset, item in enumerate(ordered_items):
@@ -4328,22 +4753,29 @@ def crear_excel(
         main_row = commercial_row_map[item["code"]]
 
         values = [
-            item["code"], area_item(item),
+            item["code"],
+            area_item(item),
             item.get("partida_excel") or nombre_partida_excel(item.get("category")),
             item.get("subpartida_excel") or nombre_subpartida_excel(item),
-            titulo_comercial_item(item), item["description"], item["unit"],
+            titulo_comercial_item(item),
+            item["description"],
+            item["unit"],
             str(item.get("package_group") or ""),
         ]
         for col, value in enumerate(values, 1):
             wc.cell(row, col, value)
 
-        wc.cell(row, 9, f"='01 Presupuesto'!H{main_row}")
-        wc.cell(row, 10, f"='01 Presupuesto'!L{main_row}")
+        # Enlaces con 01 después de retirar Código/Título de esa hoja.
+        wc.cell(row, 9, f"='01 Presupuesto'!F{main_row}")
+        wc.cell(row, 10, f"='01 Presupuesto'!J{main_row}")
+
+        # Editable para negociación.
         wc.cell(row, 11, float(item.get("unit_cost") or 0.0))
         wc.cell(row, 12, f"=I{row}*K{row}")
+
         wc.cell(row, 13, original_unit_sale_item(item))
-        wc.cell(row, 14, f"='01 Presupuesto'!I{main_row}")
-        wc.cell(row, 15, f"='01 Presupuesto'!J{main_row}")
+        wc.cell(row, 14, f"='01 Presupuesto'!G{main_row}")
+        wc.cell(row, 15, f"='01 Presupuesto'!H{main_row}")
         wc.cell(row, 16, f"=N{row}-M{row}")
         wc.cell(row, 17, f"=O{row}-L{row}")
         wc.cell(row, 18, f'=IF(O{row}=0,0,Q{row}/O{row})')
@@ -4352,27 +4784,50 @@ def crear_excel(
         wc.cell(row, 21, consideraciones_consolidadas_item(item))
 
         wc.cell(row, 9).number_format = "0.00"
-        for col in (11,12,13,14,15,16,17):
+        for col in (11, 12, 13, 14, 15, 16, 17):
             wc.cell(row, col).number_format = '$#,##0.00'
         wc.cell(row, 18).number_format = "0.00%"
-        wc.cell(row, 8).fill = PatternFill("solid", fgColor=editable_fill)
-        wc.cell(row, 11).fill = PatternFill("solid", fgColor=editable_fill)
+
+        # Misma jerarquía visual del presupuesto anterior.
+        wc.cell(row, 8).fill = PatternFill("solid", fgColor=cream)
+        wc.cell(row, 11).fill = PatternFill("solid", fgColor=cream)
+        for col in (12, 14, 15, 16, 17, 18):
+            wc.cell(row, col).fill = PatternFill("solid", fgColor=formula_fill)
+
+        # Confianza con semáforo muy discreto.
+        confidence = confianza_general_item(item)
+        conf_fill = {
+            "Alta": "E8EFE3",
+            "Media": "FFF2CC",
+            "Baja": "F4CCCC",
+        }.get(confidence, gray_light)
+        wc.cell(row, 19).fill = PatternFill("solid", fgColor=conf_fill)
 
         for col in range(1, 22):
             wc.cell(row, col).alignment = Alignment(
-                vertical="top", wrap_text=col in {2,3,4,5,6,8,20,21}
+                vertical="top",
+                wrap_text=col in {2, 3, 4, 5, 6, 8, 20, 21},
             )
             wc.cell(row, col).border = Border(bottom=thin_gray)
 
-    widths = [15,20,28,22,28,58,10,20,11,12,21,22,20,20,21,19,19,14,13,22,70]
+    widths = [
+        15, 20, 28, 22, 28, 58, 10, 20, 11, 12, 21,
+        22, 20, 20, 21, 19, 19, 14, 13, 22, 70,
+    ]
     for col, width in enumerate(widths, 1):
         wc.column_dimensions[get_column_letter(col)].width = width
-    wc.row_dimensions[header_row].height = 36
+
+    wc.row_dimensions[header_row].height = 34
     if ordered_items:
         wc.auto_filter.ref = f"A{header_row}:U{header_row + len(ordered_items)}"
+
     wc.page_setup.orientation = "landscape"
     wc.page_setup.fitToWidth = 1
     wc.page_setup.fitToHeight = 0
+    wc.page_margins.left = 0.2
+    wc.page_margins.right = 0.2
+    wc.page_margins.top = 0.4
+    wc.page_margins.bottom = 0.4
 
     out = BytesIO()
     wb.save(out)
@@ -4384,11 +4839,9 @@ def dataframe_resumen(items: list[dict]) -> pd.DataFrame:
     rows = []
     for x in estructura_partidas_excel(items):
         rows.append({
-            "Código": x["code"],
             "Área": area_item(x),
             "Partida": x["partida_excel"],
             "Subpartida": x["subpartida_excel"],
-            "Título comercial": titulo_comercial_item(x),
             "Unidad": x["unit"],
             "Cant.": x["quantity"],
             "Precio Unitario": x["unit_sale"],
@@ -5632,7 +6085,7 @@ with st.sidebar:
         with st.expander("Configuración"):
             model_name = st.text_input(
                 "Modelo Gemini",
-                value="gemini-3.6-flash",
+                value="gemini-3.8-flash",
                 key="model_name",
             )
 
@@ -5875,19 +6328,19 @@ if "generated" not in st.session_state:
 
         with st.spinner("Generando presupuesto..."):
             try:
+                project_data["areas_detectadas"] = detectar_areas_proyecto_ia(
+                    api_key=api_key, model_name=model_name, project_data=project_data
+                )
                 result = generar_presupuesto_ia(
-                    api_key=api_key,
-                    model_name=model_name,
-                    project_data=project_data,
-                    params=params,
+                    api_key=api_key, model_name=model_name, project_data=project_data, params=params
                 )
                 result = auditar_estructura_presupuesto_ia(
-                    api_key=api_key,
-                    model_name=model_name,
-                    project_data=project_data,
-                    result=result,
+                    api_key=api_key, model_name=model_name, project_data=project_data, result=result
                 )
-                items = resolver_items(db, result, project_data, params)
+                result = verificar_cantidades_python(result)
+                items = resolver_items(
+                    db, result, project_data, params, api_key=api_key, model_name=model_name
+                )
                 if not items:
                     raise RuntimeError("La IA no generó actividades utilizables.")
 
@@ -6093,19 +6546,15 @@ else:
                         )
 
                         revised_result, revised_items, change_log = aplicar_revision_estructural(
-                            db=db,
-                            current_result=result,
-                            current_items=items,
-                            revision=revision,
-                            project_data=g["project_data"],
-                            params=g["params"],
+                            db=db, current_result=result, current_items=items, revision=revision,
+                            project_data=g["project_data"], params=g["params"],
+                            api_key=api_key, model_name=model_name,
                         )
                         revised_result = auditar_estructura_presupuesto_ia(
-                            api_key=api_key,
-                            model_name=model_name,
-                            project_data=g["project_data"],
-                            result=revised_result,
+                            api_key=api_key, model_name=model_name,
+                            project_data=g["project_data"], result=revised_result,
                         )
+                        revised_result = verificar_cantidades_python(revised_result)
                         revised_items = sincronizar_items_con_estructura(
                             revised_result,
                             revised_items,
