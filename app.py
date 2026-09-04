@@ -12,6 +12,7 @@ from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 
 import pandas as pd
@@ -880,13 +881,22 @@ def original_unit_sale_item(item: dict) -> float:
 
 
 MODELOS_GEMINI_V16 = [
-    # Prioridad operativa: modelos estables con menor riesgo de saturación.
+    # Modelos estables para generación estructurada.
+    # 2.5 Flash queda como fallback amplio si un proyecto no tiene acceso a 3.x.
     "gemini-3.6-flash",
     "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-3.7-flash",
-    "gemini-3.8-flash",
+    "gemini-2.5-flash",
 ]
+
+# Google Search grounding tiene disponibilidad distinta a la generación normal.
+# En particular, 2.5 Flash sigue siendo una opción práctica para proyectos sin
+# grounding de Gemini 3.x habilitado. Puede sobrescribirse con GEMINI_SEARCH_MODEL.
+MODELOS_GEMINI_BUSQUEDA = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+
+PRECIO_WEB_MAX_WORKERS = 4
 
 
 def modelos_gemini(model_name: str | None = None) -> list[str]:
@@ -2904,7 +2914,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-09-03-v16.1-gemini-resiliente"
+DATABASE_CACHE_VERSION = "2026-09-03-v17-optimizacion-gemini"
 
 
 @st.cache_resource(show_spinner=False)
@@ -3011,6 +3021,22 @@ class PresupuestoIA(BaseModel):
     actividades: list[ActividadIA]
 
 
+class PresupuestoCompletoIA(BaseModel):
+    """Salida única de la generación inicial: alcance, áreas y actividades."""
+    nombre_proyecto: str
+    actividad_principal: str
+    alcance_resumido: str
+    areas_detectadas: list[str] = Field(
+        description=(
+            "Lista cerrada de áreas físicas explícitas del proyecto. Incluye General "
+            "y después cada espacio específico utilizado por las actividades."
+        )
+    )
+    consideraciones_generales: list[str]
+    datos_faltantes: list[str]
+    actividades: list[ActividadIA]
+
+
 class ClasificacionActividadIA(BaseModel):
     codigo: str = Field(description="Código exacto de la actividad recibida")
     partida: str = Field(description="Partida comercial corregida")
@@ -3097,137 +3123,123 @@ REGLAS
     raise RuntimeError(f"No fue posible detectar áreas. Último error: {last}")
 
 
+def normalizar_presupuesto_generado(
+    project_data: dict,
+    result: PresupuestoIA | PresupuestoCompletoIA,
+) -> PresupuestoIA:
+    """
+    Normalización determinista posterior a Gemini.
+
+    Sustituye la segunda pasada de auditoría para los controles que Python puede
+    resolver sin otra llamada LLM: áreas permitidas, partidas y códigos únicos.
+    """
+    proposed_areas = getattr(result, "areas_detectadas", None) or []
+    if not proposed_areas:
+        proposed_areas = detectar_areas_explicitas(project_data)
+    project_data["areas_detectadas"] = normalizar_lista_areas(proposed_areas)
+
+    fixed = []
+    used_codes = set()
+    for idx, act in enumerate(result.actividades, 1):
+        code = limpiar_codigo(act.codigo_sugerido, f"CON-{idx:03d}")
+        base = code
+        counter = 2
+        while code.upper() in used_codes:
+            code = f"{base}-{counter}"
+            counter += 1
+        used_codes.add(code.upper())
+
+        fixed.append(
+            act.model_copy(
+                update={
+                    "area": resolver_area_actividad(
+                        project_data,
+                        act.area,
+                        act.titulo_comercial,
+                        act.descripcion_tecnica,
+                        act.subpartida,
+                    ),
+                    "partida": normalizar_seccion_comercial(act.partida),
+                    "subpartida": str(act.subpartida or "").strip(),
+                    "codigo_sugerido": code,
+                    "orden_ejecucion": min(max(int(act.orden_ejecucion or 500), 1), 999),
+                }
+            )
+        )
+
+    return PresupuestoIA(
+        nombre_proyecto=result.nombre_proyecto,
+        actividad_principal=result.actividad_principal,
+        alcance_resumido=result.alcance_resumido,
+        consideraciones_generales=list(result.consideraciones_generales),
+        datos_faltantes=list(result.datos_faltantes),
+        actividades=fixed,
+    )
+
+
 def generar_presupuesto_ia(
     api_key: str,
     model_name: str,
     project_data: dict,
     params: dict,
-) -> PresupuestoIA:
+) -> PresupuestoCompletoIA:
+    """Genera áreas + presupuesto completo en una sola llamada estructurada."""
     client = genai.Client(api_key=api_key)
     year = datetime.now().year
     budget_level = project_data.get("budget_level", "Medio-alto")
     level_criterion = criterio_nivel_presupuesto(budget_level)
-    allowed_areas = areas_validas_proyecto(project_data)
-    allowed_areas_text = "\n".join(f"- {x}" for x in allowed_areas)
 
     prompt = f"""
-Actúa como un INGENIERO DE COSTOS SENIOR de una empresa de remodelación de alto
-nivel que opera principalmente en Ciudad de México y SUBCONTRATA prácticamente
-todas las actividades.
+Eres un INGENIERO DE COSTOS SENIOR de una empresa de remodelación en Ciudad de
+México que subcontrata la mayor parte de los trabajos. Convierte el alcance en un
+presupuesto comercial claro, cotizable y revisable.
 
-Tu objetivo es transformar el alcance en ACTIVIDADES COTIZABLES Y NEGOCIABLES.
-
-CONFIGURACIÓN FIJA
-- Referencia de mercado: Ciudad de México, {year}.
-- Nivel comercial: {budget_level}.
-- Criterio del nivel: {level_criterion}
-- costo_unitario_estimado representa el costo integrado estimado del
-  SUBCONTRATISTA para la empresa.
-- No calcules 30% de marca ni IVA. Python/Excel lo harán después.
-
-DATOS DEL PROYECTO
+PROYECTO
 Cliente: {project_data['name']}
-Ubicación: {project_data['location'] or 'No indicada'}
-Tipo de obra: {project_data['project_type']}
-Nivel: {budget_level}
+Ubicación: {project_data['location'] or 'Ciudad de México'}
+Tipo: {project_data['project_type']}
+Nivel: {budget_level} — {level_criterion}
+Año de referencia: {year}
 
-DESCRIPCIÓN DEL USUARIO
+ALCANCE DEL USUARIO
 {project_data['description']}
 
-TEXTO GUÍA
+GUÍA ADICIONAL
 {project_data['guide_text'] or 'Sin consideraciones adicionales.'}
 
-ÁREAS VÁLIDAS DEL PROYECTO — LISTA CERRADA
-{allowed_areas_text}
-
-REGLAS DE ÁREA
-- area DEBE ser exactamente uno de los valores anteriores.
-- General NO es el valor predeterminado.
-- Usa General solo para actividades verdaderamente comunes a toda la obra.
-- Si título/descripción dicen Cocina, Baño principal, Recámara 1, etc., area debe ser ese espacio.
-- Antes de asignar General, comprueba que ninguna área específica sea aplicable.
-- En remodelaciones integrales la mayoría de actividades deben quedar en un espacio específico.
-
-REGLA CENTRAL DE GRANULARIDAD
-1. UNA ACTIVIDAD = UN TRABAJO COTIZABLE EN UNA SOLA ÁREA.
-2. NO agrupes en una actividad trabajos correspondientes a áreas distintas,
-   aunque sean del mismo oficio, misma partida o técnicamente similares.
-3. Si existen Cocina, Baño 1, Baño 2 y Baño 3, sus trabajos deben permanecer
-   separados cuando puedan cotizarse, modificarse, excluirse o contratarse
-   independientemente.
-4. Usa General únicamente para trabajos verdaderamente comunes a toda la obra.
-5. NO inventes áreas. Usa solo espacios explícitos del usuario; si no puedes
-   identificar uno de manera justificada, usa General.
-6. Solo agrupa unidades si son equivalentes: misma área, mismo trabajo, misma
-   especificación, misma unidad y misma base de precio.
-7. Carpintería/mobiliario: muebles de tipo, diseño, función, especificación o
-   dimensiones diferentes SIEMPRE son actividades independientes. Unidades
-   idénticas pueden usar cantidad mayor a 1.
-8. No conviertas el presupuesto en APU: no hagas filas por material, herramienta,
-   cuadrilla o consumible.
-
-ALCANCE
-9. Incluye trabajos explícitos, previos indispensables y complementarios necesarios.
-10. Incluye proyecto/ingenierías/licencias/permisos solo cuando sean previsibles.
-11. No agregues trabajos opcionales ajenos al alcance.
-12. Si una inclusión es inferida, indícalo brevemente.
-
-PARTIDAS
-13. Usa preferentemente:
-   PROYECTO Y TRÁMITES; PRELIMINARES Y PROTECCIONES;
-   DESMONTAJES Y DEMOLICIONES; ALBAÑILERÍA Y ESTRUCTURA;
-   INSTALACIONES ELÉCTRICAS; INSTALACIONES HIDROSANITARIAS;
-   ACABADOS Y RECUBRIMIENTOS; CARPINTERÍA; CANCELERÍA Y HERRERÍA;
-   EXTERIORES Y AMENIDADES; LIMPIEZA Y ENTREGA.
-14. Clasifica por la naturaleza principal del trabajo.
-15. Protecciones temporales son PRELIMINARES; limpieza final es LIMPIEZA Y ENTREGA.
-
-SECUENCIA Y PRESENTACIÓN
-16. orden_ejecucion debe seguir la secuencia constructiva real.
-17. subpartida debe ser corta.
-18. titulo_comercial debe identificar el trabajo sin depender de la descripción.
-19. descripcion_tecnica debe explicar qué se hace, dónde y qué incluye.
-20. codigo_sugerido debe ser único y breve.
-
-CANTIDADES
-21. Calcula M2, ML, M3, PZA u otras cantidades cuando los datos lo permitan.
-22. Si faltan dimensiones, usa PZA/LOTE/JGO cuando sea más profesional que inventar.
-23. Si un mismo trabajo aparece en varias áreas, cuantifica cada área por separado.
-
-COSTOS
-24. costo_unitario_estimado es el costo integrado esperado del subcontratista.
-25. Debe ser razonable para CDMX {year} y el nivel {budget_level}.
-26. Si es variable/especializado, requiere_cotizacion=True.
-27. No desarrolles materiales/mano de obra/otros/desperdicio por separado.
-28. No calcules indirectos, utilidad, precio final, margen, 30% de marca ni IVA.
-
-CONTROL
-29. No dupliques actividades equivalentes dentro de la misma área.
-30. Verifica que ninguna actividad mezcle cocina, baños distintos, recámaras
-    distintas u otras áreas independientes.
-31. Criterio, fundamento y consideraciones deben ser breves y revisables.
-32. NIVEL DE CONFIANZA DE CANTIDAD:
-    - Alta: únicamente cuando la cantidad sale directamente de números,
-      dimensiones o conteos explícitos del usuario, sin supuestos relevantes.
-    - Media: cuando parte de datos explícitos pero requiere interpretación,
-      geometría aproximada o una decisión técnica menor.
-    - Baja: cuando la cantidad es estimada, supuesta, promediada, inferida o
-      falta información importante.
-33. NIVEL DE CONFIANZA DE PRECIO:
-    costo_unitario_estimado es una estimación; no uses Alta solo porque el trabajo
-    sea común. La aplicación elevará después la confianza si encuentra una base
-    interna validada o una referencia externa sólida.
-34. No expongas cadenas de pensamiento.
+CRITERIOS
+1. Detecta primero las áreas físicas explícitas y devuélvelas en areas_detectadas.
+   Incluye General, pero úsala solo para trabajos verdaderamente comunes a toda la obra.
+2. Cada actividad pertenece a UNA sola área de areas_detectadas. No mezcles Cocina,
+   baños distintos, recámaras distintas u otros espacios independientes.
+3. Una actividad representa un trabajo cotizable completo, no un APU. No crees filas
+   separadas de materiales, mano de obra, herramienta o consumibles.
+4. Separa trabajos que puedan contratarse, excluirse o modificarse por separado;
+   agrupa únicamente unidades realmente equivalentes dentro de la misma área.
+5. Usa partidas comerciales de obra: preliminares, demoliciones, albañilería/estructura,
+   instalaciones, acabados, carpintería, cancelería/herrería, exteriores y limpieza.
+6. Usa unidades estándar (M2, M3, ML, PZA, PTO, JGO, LOTE, etc.). Calcula cantidades
+   cuando existan datos; si faltan dimensiones, evita inventar precisión falsa.
+7. Incluye trabajos explícitos y complementarios indispensables. No agregues opciones
+   ajenas al alcance; señala brevemente cualquier supuesto relevante.
+8. costo_unitario_estimado es el COSTO DIRECTO INTEGRADO DEL SUBCONTRATISTA para la
+   empresa, razonable para CDMX {year} y nivel {budget_level}. No agregues indirectos,
+   utilidad, marca ni IVA; Python los calcula después.
+9. Marca requiere_cotizacion=True en trabajos especializados o muy variables.
+10. Confianza de cantidad: Alta solo con medidas/conteos explícitos; Media si requiere
+    interpretación menor; Baja si depende de una estimación o falta información.
+11. La confianza del precio generado por IA no debe presentarse como Alta por sí sola.
+12. Códigos únicos, títulos breves, descripciones técnicas concretas y orden de ejecución
+    coherente con la secuencia constructiva.
 """
 
     raw, _used_model = ejecutar_gemini_estructurado(
         client,
         model_name,
         prompt,
-        PresupuestoIA,
+        PresupuestoCompletoIA,
     )
-    return PresupuestoIA.model_validate_json(raw)
-
+    return PresupuestoCompletoIA.model_validate_json(raw)
 
 def auditar_estructura_presupuesto_ia(
     api_key: str,
@@ -3462,49 +3474,80 @@ INSTRUCCIONES
 # MOTOR DE PRECIOS
 # =========================================================
 
-def investigar_precio_web_ia(api_key: str, model_name: str, actividad: ActividadIA, project_data: dict, intento: int = 1) -> InvestigacionPrecioWebIA | None:
-    if not api_key: return None
-    unit=normalizar_unidad(actividad.unidad)
-    if unit in {"","%"}: return None
-    client=genai.Client(api_key=api_key)
-    year=datetime.now().year
-    strategy=("Busca referencias muy comparables de precio unitario en Ciudad de México o zona metropolitana. Prioriza servicios instalados y contratistas." if intento==1 else "Amplía a México, fabricantes, instaladores y catálogos comerciales, manteniendo unidad y alcance técnico.")
-    prompt=f"""
-Investiga el PRECIO UNITARIO ACTUAL de esta actividad.
+def investigar_precio_web_ia(
+    api_key: str,
+    model_name: str,
+    actividad: ActividadIA,
+    project_data: dict,
+    intento: int = 1,
+) -> InvestigacionPrecioWebIA | None:
+    """
+    Busca evidencia web solo cuando no existe una referencia local suficiente.
+
+    La búsqueda usa una lista de modelos separada de la generación normal porque
+    Google Search grounding tiene permisos/cuotas distintos. Se conserva model_name
+    en la firma por compatibilidad con llamadas existentes.
+    """
+    if not api_key:
+        return None
+    unit = normalizar_unidad(actividad.unidad)
+    if unit in {"", "%"}:
+        return None
+
+    client = genai.Client(api_key=api_key)
+    year = datetime.now().year
+    strategy = (
+        "Prioriza referencias comparables en Ciudad de México o zona metropolitana, "
+        "especialmente subcontratistas y servicios instalados."
+        if intento == 1 else
+        "Amplía a México, fabricantes, instaladores y catálogos comerciales, sin cambiar unidad ni alcance."
+    )
+    prompt = f"""
+Investiga un precio unitario actual y verificable para esta actividad de obra.
 Área: {actividad.area}
-Partida: {actividad.partida}
-Título: {actividad.titulo_comercial}
+Trabajo: {actividad.titulo_comercial}
 Descripción: {actividad.descripcion_tecnica}
 Unidad obligatoria: {actividad.unidad}
-Nivel: {project_data.get('budget_level','Medio-alto')}
+Nivel: {project_data.get('budget_level', 'Medio-alto')}
 Ubicación: Ciudad de México
 Año: {year}
 {strategy}
-REGLAS
-1. Devuelve 2 a 5 referencias cuando existan.
-2. El precio debe corresponder exactamente a {actividad.unidad}.
-3. tipo_precio: SUBCONTRATISTA, SUMINISTRO_INSTALACION, PRECIO_PUBLICO_INSTALADO o MATERIAL_SOLO.
-4. Para servicio integrado no uses material suelto como referencia principal.
-5. Incluye URL pública concreta; no inventes URLs ni precios.
-6. Si no encuentras evidencia útil, referencias=[].
-7. No agregues 30% de franquicia ni IVA.
+
+Devuelve de 2 a 5 referencias si existen. Prioriza SUBCONTRATISTA,
+SUMINISTRO_INSTALACION o PRECIO_PUBLICO_INSTALADO; MATERIAL_SOLO no debe ser la
+referencia principal para un servicio integrado. No inventes precios ni URLs. Si
+no hay evidencia compatible, devuelve referencias=[]. No agregues marca ni IVA.
 """
-    for model in modelos_gemini(model_name):
+
+    configured = str(get_secret("GEMINI_SEARCH_MODEL", "") or "").strip()
+    search_models = []
+    for model in [configured, *MODELOS_GEMINI_BUSQUEDA]:
+        if model and model not in search_models:
+            search_models.append(model)
+
+    grounding_tool = types.Tool(google_search=types.GoogleSearch())
+    for model in search_models:
         try:
-            interaction=client.interactions.create(model=model,input=prompt,tools=[{"type":"google_search"}],response_format={"type":"text","mime_type":"application/json","schema":InvestigacionPrecioWebIA.model_json_schema()})
-            raw=getattr(interaction,'output_text',None)
-            if raw: return InvestigacionPrecioWebIA.model_validate_json(raw)
-        except Exception:
-            try:
-                grounding_tool=types.Tool(google_search=types.GoogleSearch())
-                response=client.models.generate_content(model=model,contents=prompt,config=types.GenerateContentConfig(tools=[grounding_tool],response_mime_type="application/json",response_schema=InvestigacionPrecioWebIA,temperature=0.1))
-                if response.text: return InvestigacionPrecioWebIA.model_validate_json(response.text)
-            except Exception:
+            # Con 2.5 usamos grounding sin response_schema: la combinación de
+            # herramientas + structured outputs estrictos está reservada a Gemini 3.
+            # El prompt exige JSON y Pydantic valida el resultado después.
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt + "\nDevuelve SOLO JSON válido conforme al esquema solicitado, sin Markdown.",
+                config=types.GenerateContentConfig(tools=[grounding_tool]),
+            )
+            raw = str(response.text or "").strip()
+            if not raw:
                 continue
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
+            raw = re.sub(r"\s*```$", "", raw)
+            first, last = raw.find("{"), raw.rfind("}")
+            if first >= 0 and last > first:
+                raw = raw[first:last + 1]
+            return InvestigacionPrecioWebIA.model_validate_json(raw)
+        except Exception:
+            continue
     return None
-
-
-
 
 def buscar_precio_interno(db: Database, actividad: ActividadIA) -> dict | None:
     candidatos = db.price_candidates(actividad.unidad)
@@ -3639,6 +3682,84 @@ def buscar_precio_externo(
     }
 
 
+def resolver_precio_actividad(
+    index: int,
+    act: ActividadIA,
+    db: Database,
+    project_data: dict,
+    params: dict,
+    api_key: str,
+    model_name: str,
+    force_codes: set[str],
+) -> dict:
+    """Resuelve únicamente la fuente/costo de una actividad; apta para ejecutarse en hilo."""
+    requested_code = limpiar_codigo(act.codigo_sugerido, f"CON-{index:03d}")
+    force_new_price = requested_code.upper() in force_codes
+
+    # En una revisión con recalcular_precio=True se evita reutilizar referencias
+    # anteriores: se pide una nueva evidencia web o se conserva la estimación IA.
+    internal = None if force_new_price else buscar_precio_interno(db, act)
+    external = None if (internal or force_new_price) else buscar_precio_externo(
+        db, act, project_data, params
+    )
+
+    web_price = None
+    if not internal and not (external and external.get("use_automatically")):
+        inv = investigar_precio_web_ia(
+            api_key, model_name, act, project_data, intento=1
+        )
+        if inv:
+            web_price = calcular_precio_web(inv, act, params)
+
+    if internal:
+        unit_cost = float(internal["unit_cost"])
+        concept_id = internal["concept_id"]
+        source = internal["source"]
+        source_detail = internal["source_detail"]
+        price_status = internal["status"]
+        evidence_score = score_confianza_precio(source, source_detail)
+    elif external and external.get("use_automatically"):
+        unit_cost = float(external["unit_cost"])
+        concept_id = None
+        source = "REFERENCIA_CDMX"
+        source_detail = external["source_detail"]
+        price_status = "REFERENCIA_EXTERNA"
+        evidence_score = 88 if external.get("match_score", 0) >= 0.92 else 76
+    elif web_price:
+        unit_cost = float(web_price["unit_cost"])
+        concept_id = None
+        source = "WEB_FUNDAMENTADO"
+        source_detail = web_price["source_detail"]
+        price_status = "REFERENCIA_WEB"
+        evidence_score = int(web_price["evidence_score"])
+        if external:
+            source_detail += " | CDMX secundario: " + external["source_detail"]
+    else:
+        unit_cost = float(act.costo_unitario_estimado)
+        concept_id = None
+        source = "IA_ESTIMADO"
+        source_detail = (
+            "Último recurso: sin referencia interna, CDMX fuerte ni evidencia web consolidable."
+        )
+        price_status = "ESTIMADO_IA"
+        evidence_score = 30
+        if external:
+            source_detail += " | CDMX débil: " + external["source_detail"]
+
+    return {
+        "index": index,
+        "act": act,
+        "requested_code": requested_code,
+        "unit_cost": unit_cost,
+        "concept_id": concept_id,
+        "source": source,
+        "source_detail": source_detail,
+        "price_status": price_status,
+        "evidence_score": evidence_score,
+        "price_confidence": etiqueta_confianza_score(evidence_score),
+    }
+
+
 def resolver_items(
     db: Database,
     result: PresupuestoIA,
@@ -3648,53 +3769,116 @@ def resolver_items(
     api_key: str | None = None,
     model_name: str = "gemini-3.6-flash",
 ) -> list[dict]:
-    """Base interna > CDMX > Google Search > IA último recurso."""
-    items=[]
-    force_new_price_codes={str(x).strip().upper() for x in (force_new_price_codes or set())}
-    for idx,act in enumerate(result.actividades,start=1):
-        requested_code=limpiar_codigo(act.codigo_sugerido,f"CON-{idx:03d}")
-        force_new_price=requested_code.upper() in force_new_price_codes
-        internal=None if force_new_price else buscar_precio_interno(db,act)
-        external=None if internal or force_new_price else buscar_precio_externo(db,act,project_data,params)
-        web_price=None
-        if not internal and not (external and external.get("use_automatically")):
-            inv=investigar_precio_web_ia(api_key or "",model_name,act,project_data,1)
-            if inv: web_price=calcular_precio_web(inv,act,params)
-            if not web_price or web_price.get("evidence_score",0)<65:
-                inv2=investigar_precio_web_ia(api_key or "",model_name,act,project_data,2)
-                if inv2:
-                    cand=calcular_precio_web(inv2,act,params)
-                    if cand and cand.get("evidence_score",0)>(web_price or {}).get("evidence_score",0): web_price=cand
-        if internal:
-            unit_cost=float(internal["unit_cost"]); concept_id=internal["concept_id"]; source=internal["source"]; source_detail=internal["source_detail"]; price_status=internal["status"]
-            evidence_score=score_confianza_precio(source,source_detail); price_confidence=etiqueta_confianza_score(evidence_score)
-        elif external and external.get("use_automatically"):
-            unit_cost=float(external["unit_cost"]); concept_id=None; source="REFERENCIA_CDMX"; source_detail=external["source_detail"]; price_status="REFERENCIA_EXTERNA"
-            evidence_score=88 if external.get("match_score",0)>=0.92 else 76; price_confidence=etiqueta_confianza_score(evidence_score)
-        elif web_price:
-            unit_cost=float(web_price["unit_cost"]); concept_id=None; source="WEB_FUNDAMENTADO"; source_detail=web_price["source_detail"]; price_status="REFERENCIA_WEB"; evidence_score=int(web_price["evidence_score"]); price_confidence=etiqueta_confianza_score(evidence_score)
-            if external: source_detail += " | CDMX secundario: " + external["source_detail"]
-        else:
-            unit_cost=float(act.costo_unitario_estimado); concept_id=None; source="IA_ESTIMADO"; source_detail="Último recurso: sin referencia interna, CDMX fuerte ni evidencia web consolidable."; price_status="ESTIMADO_IA"; evidence_score=30; price_confidence="Baja"
-            if external: source_detail += " | CDMX débil: " + external["source_detail"]
-        quantity=max(float(act.cantidad),0.0)
-        indirect_unit=unit_cost*params["indirect_pct"]/100.0
-        profit_unit=(unit_cost+indirect_unit)*params["profit_pct"]/100.0
-        internal_unit=unit_cost+indirect_unit+profit_unit
-        contractor_amount=quantity*unit_cost; internal_amount=quantity*internal_unit
-        benefit=internal_amount-contractor_amount; margin=benefit/internal_amount*100.0 if internal_amount else 0.0
-        considerations=act.consideraciones.strip()
-        if evidence_score<65:
-            considerations=((considerations+" | ") if considerations else "")+"Precio con evidencia insuficiente; recomendable confirmar con proveedor."
-        if act.requiere_cotizacion and evidence_score<85:
-            note="Actividad especializada: conviene cotización directa."
-            if note not in considerations: considerations=((considerations+" | ") if considerations else "")+note
-        area=resolver_area_actividad(project_data,act.area,act.titulo_comercial,act.descripcion_tecnica,act.subpartida)
+    """
+    Base interna > CDMX > Google Search > IA último recurso.
+
+    Las resoluciones independientes se ejecutan concurrentemente. La segunda
+    búsqueda web por actividad se eliminó: si la primera no aporta evidencia útil,
+    se usa la estimación base de la generación y se marca para confirmar.
+    """
+    activities = list(result.actividades)
+    if not activities:
+        return []
+
+    force_codes = {
+        str(x).strip().upper() for x in (force_new_price_codes or set())
+    }
+    max_workers = max(1, min(PRECIO_WEB_MAX_WORKERS, len(activities)))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        resolved_prices = list(
+            executor.map(
+                lambda pair: resolver_precio_actividad(
+                    pair[0], pair[1], db, project_data, params,
+                    api_key or "", model_name, force_codes,
+                ),
+                enumerate(activities, start=1),
+            )
+        )
+
+    items = []
+    for resolved in resolved_prices:
+        act = resolved["act"]
+        requested_code = resolved["requested_code"]
+        unit_cost = float(resolved["unit_cost"])
+        concept_id = resolved["concept_id"]
+        source = resolved["source"]
+        source_detail = resolved["source_detail"]
+        price_status = resolved["price_status"]
+        evidence_score = int(resolved["evidence_score"])
+        price_confidence = resolved["price_confidence"]
+
+        quantity = max(float(act.cantidad), 0.0)
+        indirect_unit = unit_cost * params["indirect_pct"] / 100.0
+        profit_unit = (unit_cost + indirect_unit) * params["profit_pct"] / 100.0
+        internal_unit = unit_cost + indirect_unit + profit_unit
+        contractor_amount = quantity * unit_cost
+        internal_amount = quantity * internal_unit
+        benefit = internal_amount - contractor_amount
+        margin = benefit / internal_amount * 100.0 if internal_amount else 0.0
+
+        considerations = act.consideraciones.strip()
+        if evidence_score < 65:
+            considerations = (
+                ((considerations + " | ") if considerations else "")
+                + "Precio con evidencia insuficiente; recomendable confirmar con proveedor."
+            )
+        if act.requiere_cotizacion and evidence_score < 85:
+            note = "Actividad especializada: conviene cotización directa."
+            if note not in considerations:
+                considerations = ((considerations + " | ") if considerations else "") + note
+
+        area = resolver_area_actividad(
+            project_data,
+            act.area,
+            act.titulo_comercial,
+            act.descripcion_tecnica,
+            act.subpartida,
+        )
         items.append({
-            "concept_id":concept_id,"area":area,"included":True,"package_group":"","category":normalizar_seccion_comercial(act.partida),"subcategory":act.subpartida.strip(),"code":requested_code,"execution_order":int(act.orden_ejecucion),"commercial_title":act.titulo_comercial.strip(),"description":act.descripcion_tecnica.strip(),"unit":act.unidad.strip().upper(),"quantity":quantity,"unit_cost":unit_cost,"direct_amount":contractor_amount,"unit_indirect":indirect_unit,"unit_profit":profit_unit,"unit_sale":internal_unit,"original_unit_sale":internal_unit,"sale_amount":internal_amount,"benefit_amount":benefit,"sale_margin_pct":margin,"price_source":source,"price_source_detail":source_detail,"price_status":price_status,"price_confidence":price_confidence,"price_evidence_score":evidence_score,"quantity_confidence":act.nivel_confianza_cantidad,"quantity_criterion":act.criterio_cantidad.strip(),"inclusion_basis":act.fundamento_inclusion.strip(),"considerations":considerations,"material_share_pct":0.0,"labor_share_pct":0.0,"other_share_pct":100.0,"waste_reference_pct":0.0,"area_allocations":[{"area":area,"porcentaje":100.0,"cantidad_referencia":quantity,"criterio":"Área directa V16.","confianza":"Alta"}],
+            "concept_id": concept_id,
+            "area": area,
+            "included": True,
+            "package_group": "",
+            "category": normalizar_seccion_comercial(act.partida),
+            "subcategory": act.subpartida.strip(),
+            "code": requested_code,
+            "execution_order": int(act.orden_ejecucion),
+            "commercial_title": act.titulo_comercial.strip(),
+            "description": act.descripcion_tecnica.strip(),
+            "unit": act.unidad.strip().upper(),
+            "quantity": quantity,
+            "unit_cost": unit_cost,
+            "direct_amount": contractor_amount,
+            "unit_indirect": indirect_unit,
+            "unit_profit": profit_unit,
+            "unit_sale": internal_unit,
+            "original_unit_sale": internal_unit,
+            "sale_amount": internal_amount,
+            "benefit_amount": benefit,
+            "sale_margin_pct": margin,
+            "price_source": source,
+            "price_source_detail": source_detail,
+            "price_status": price_status,
+            "price_confidence": price_confidence,
+            "price_evidence_score": evidence_score,
+            "quantity_confidence": act.nivel_confianza_cantidad,
+            "quantity_criterion": act.criterio_cantidad.strip(),
+            "inclusion_basis": act.fundamento_inclusion.strip(),
+            "considerations": considerations,
+            "material_share_pct": 0.0,
+            "labor_share_pct": 0.0,
+            "other_share_pct": 100.0,
+            "waste_reference_pct": 0.0,
+            "area_allocations": [{
+                "area": area,
+                "porcentaje": 100.0,
+                "cantidad_referencia": quantity,
+                "criterio": "Área directa V17.",
+                "confianza": "Alta",
+            }],
         })
     return items
-
 
 def recalcular_item_financiero(item: dict, params: dict) -> dict:
     out = dict(item)
@@ -6386,15 +6570,10 @@ if "generated" not in st.session_state:
 
         with st.spinner("Generando presupuesto..."):
             try:
-                project_data["areas_detectadas"] = detectar_areas_proyecto_ia(
-                    api_key=api_key, model_name=model_name, project_data=project_data
-                )
-                result = generar_presupuesto_ia(
+                generated = generar_presupuesto_ia(
                     api_key=api_key, model_name=model_name, project_data=project_data, params=params
                 )
-                result = auditar_estructura_presupuesto_ia(
-                    api_key=api_key, model_name=model_name, project_data=project_data, result=result
-                )
+                result = normalizar_presupuesto_generado(project_data, generated)
                 result = verificar_cantidades_python(result)
                 items = resolver_items(
                     db, result, project_data, params, api_key=api_key, model_name=model_name
@@ -6608,9 +6787,8 @@ else:
                             project_data=g["project_data"], params=g["params"],
                             api_key=api_key, model_name=model_name,
                         )
-                        revised_result = auditar_estructura_presupuesto_ia(
-                            api_key=api_key, model_name=model_name,
-                            project_data=g["project_data"], result=revised_result,
+                        revised_result = normalizar_presupuesto_generado(
+                            g["project_data"], revised_result
                         )
                         revised_result = verificar_cantidades_python(revised_result)
                         revised_items = sincronizar_items_con_estructura(
