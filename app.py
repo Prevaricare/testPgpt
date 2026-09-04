@@ -3,6 +3,7 @@ import re
 import json
 import sqlite3
 import statistics
+import time
 import unicodedata
 import uuid
 import zipfile
@@ -879,11 +880,12 @@ def original_unit_sale_item(item: dict) -> float:
 
 
 MODELOS_GEMINI_V16 = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
+    # Prioridad operativa: modelos estables con menor riesgo de saturación.
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
 ]
 
 
@@ -893,6 +895,111 @@ def modelos_gemini(model_name: str | None = None) -> list[str]:
         if model and model not in modelos:
             modelos.append(model)
     return modelos
+
+
+
+def clasificar_error_gemini(exc: Exception) -> dict:
+    """Clasifica errores para decidir retry, fallback o detención."""
+    msg = str(exc).lower()
+
+    def has(code: int) -> bool:
+        return str(code) in msg
+
+    if has(429) or has(500) or has(503) or has(504) \
+            or "high demand" in msg or "unavailable" in msg:
+        return {"kind": "transient", "retry": True, "next": True}
+
+    if has(403) or "permission_denied" in msg:
+        return {"kind": "permission", "retry": False, "next": True}
+
+    if has(404) or "model_not_found" in msg \
+            or "no longer available" in msg:
+        return {"kind": "model", "retry": False, "next": True}
+
+    if has(401) or "unauthorized" in msg \
+            or "invalid api key" in msg:
+        return {"kind": "auth", "retry": False, "next": False}
+
+    return {"kind": "fatal", "retry": False, "next": False}
+
+
+def ejecutar_gemini_estructurado(
+    client,
+    model_name: str,
+    prompt: str,
+    response_schema,
+    *,
+    max_retries_per_model: int = 2,
+):
+    """
+    Llamada resistente:
+    - 503/429/500/504: retry mismo modelo con backoff y luego fallback.
+    - 403: no insiste en ese modelo; prueba el siguiente.
+    - 404: prueba el siguiente.
+    - 401: se detiene con mensaje claro.
+    """
+    attempts = []
+    permission_count = 0
+    models = modelos_gemini(model_name)
+
+    for model in models:
+        retry_number = 0
+
+        while True:
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=response_schema,
+                    ),
+                )
+                if not response.text:
+                    raise RuntimeError(
+                        f"Gemini ({model}) devolvió una respuesta vacía."
+                    )
+                return response.text, model
+
+            except Exception as exc:
+                info = clasificar_error_gemini(exc)
+                attempts.append((model, info["kind"]))
+
+                if info["kind"] == "permission":
+                    permission_count += 1
+                    break
+
+                if info["retry"] and retry_number < max_retries_per_model:
+                    delay = 1.5 * (2 ** retry_number)  # 1.5 s, 3 s
+                    time.sleep(delay)
+                    retry_number += 1
+                    continue
+
+                if info["next"]:
+                    break
+
+                if info["kind"] == "auth":
+                    raise RuntimeError(
+                        "La GEMINI_API_KEY no fue aceptada. Revisa la clave "
+                        "configurada en Streamlit Secrets."
+                    ) from exc
+
+                raise RuntimeError(
+                    f"Gemini devolvió un error no recuperable: {exc}"
+                ) from exc
+
+    if permission_count == len(models):
+        raise RuntimeError(
+            "Todos los modelos Gemini disponibles respondieron 403 "
+            "PERMISSION_DENIED. Esto indica un problema de permisos de la "
+            "API key/proyecto, no del contenido del presupuesto."
+        )
+
+    summary = " | ".join(f"{m}:{k}" for m, k in attempts[-8:])
+    raise RuntimeError(
+        "Gemini no respondió después de reintentos y modelos alternativos. "
+        f"Intentos: {summary}"
+    )
 
 
 def normalizar_lista_areas(values) -> list[str]:
@@ -2797,7 +2904,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-09-03-v16-multipass-precios-evidencia"
+DATABASE_CACHE_VERSION = "2026-09-03-v16.1-gemini-resiliente"
 
 
 @st.cache_resource(show_spinner=False)
@@ -3113,38 +3220,13 @@ CONTROL
 34. No expongas cadenas de pensamiento.
 """
 
-    modelos = modelos_gemini(model_name)
-
-    last_error = None
-    for model in modelos:
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=PresupuestoIA,
-                ),
-            )
-            if not response.text:
-                raise RuntimeError(f"Gemini ({model}) devolvió una respuesta vacía.")
-            return PresupuestoIA.model_validate_json(response.text)
-        except Exception as exc:
-            last_error = exc
-            msg = str(exc).lower()
-            model_error = (
-                "404" in msg
-                or "not_found" in msg
-                or "no longer available" in msg
-                or ("model" in msg and "not available" in msg)
-            )
-            if not model_error:
-                raise
-
-    raise RuntimeError(
-        f"No fue posible usar un modelo Gemini disponible. Último error: {last_error}"
+    raw, _used_model = ejecutar_gemini_estructurado(
+        client,
+        model_name,
+        prompt,
+        PresupuestoIA,
     )
-
+    return PresupuestoIA.model_validate_json(raw)
 
 
 def auditar_estructura_presupuesto_ia(
@@ -3367,37 +3449,13 @@ INSTRUCCIONES
 
 """
 
-    modelos = modelos_gemini(model_name)
-
-    last_error = None
-    for model in modelos:
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=RevisionPresupuestoIA,
-                ),
-            )
-            if not response.text:
-                raise RuntimeError(f"Gemini ({model}) devolvió una revisión vacía.")
-            return RevisionPresupuestoIA.model_validate_json(response.text)
-        except Exception as exc:
-            last_error = exc
-            msg = str(exc).lower()
-            model_error = (
-                "404" in msg
-                or "not_found" in msg
-                or "no longer available" in msg
-                or ("model" in msg and "not available" in msg)
-            )
-            if not model_error:
-                raise
-
-    raise RuntimeError(
-        f"No fue posible usar un modelo Gemini para la revisión. Último error: {last_error}"
+    raw, _used_model = ejecutar_gemini_estructurado(
+        client,
+        model_name,
+        prompt,
+        RevisionPresupuestoIA,
     )
+    return RevisionPresupuestoIA.model_validate_json(raw)
 
 
 # =========================================================
@@ -3588,7 +3646,7 @@ def resolver_items(
     params: dict,
     force_new_price_codes: set[str] | None = None,
     api_key: str | None = None,
-    model_name: str = "gemini-3.8-flash",
+    model_name: str = "gemini-3.6-flash",
 ) -> list[dict]:
     """Base interna > CDMX > Google Search > IA último recurso."""
     items=[]
@@ -3699,7 +3757,7 @@ def aplicar_revision_estructural(
     project_data: dict,
     params: dict,
     api_key: str | None = None,
-    model_name: str = "gemini-3.8-flash",
+    model_name: str = "gemini-3.6-flash",
 ) -> tuple[PresupuestoIA, list[dict], list[str]]:
     """
     Aplica las operaciones devueltas por Gemini. Las actividades no mencionadas
@@ -6085,7 +6143,7 @@ with st.sidebar:
         with st.expander("Configuración"):
             model_name = st.text_input(
                 "Modelo Gemini",
-                value="gemini-3.8-flash",
+                value="gemini-3.6-flash",
                 key="model_name",
             )
 
