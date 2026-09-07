@@ -398,7 +398,6 @@ def descripcion_excel_item(item: dict) -> str:
 
 
 AREA_GENERAL = "General"
-BRAND_MARKUP_PCT = 30.0
 
 
 PATRONES_AREAS_EXPLICITAS = [
@@ -3324,7 +3323,7 @@ def calcular_financieros(items: list[dict], params: dict) -> dict:
     indirect_cost = direct_cost * params["indirect_pct"] / 100.0
     profit = (direct_cost + indirect_cost) * params["profit_pct"] / 100.0
 
-    # El presupuesto interno visible respeta el Importe Total vigente, pero
+    # El presupuesto interno visible respeta el importe vigente, pero
     # solamente suma las actividades marcadas como incluidas.
     sale_before_tax = sum(float(x.get("sale_amount") or 0.0) for x in active_items)
 
@@ -3980,15 +3979,16 @@ def crear_excel(
 
     01 Presupuesto:
       Área | Partida | Subpartida | Descripción Técnica | Unidad | Cant. |
-      Precio Unitario | Importe interno | Importe Final | Considerar
+      Precio Unitario | Importe interno | Considerar
 
-      Importe interno es editable y no incluye el 30 % de marca ni IVA.
+      El único importe comercial mostrado es el Importe interno, que es la base
+      de negociación con subcontrataciones. La marca y el IVA se aplican fuera
+      de este módulo, en la etapa posterior de venta al cliente.
       Considerar permite activar/desactivar cada actividad sin borrar la fila.
-      Los resúmenes y el Importe Final solamente suman filas con "Sí".
 
     02 Control Interno:
-      control editable de costo subcontratado, desglose unitario, precio de venta
-      y rentabilidad real frente al Importe interno de 01 Presupuesto.
+      control editable de costo subcontratado, desglose unitario y precio interno
+      objetivo frente al Importe interno de 01 Presupuesto.
 
     03 Trazabilidad:
       fuentes, criterios y consideraciones.
@@ -4030,15 +4030,15 @@ def crear_excel(
     # -----------------------------------------------------
     ws.sheet_view.showGridLines = False
 
-    ws.merge_cells("A1:J1")
+    ws.merge_cells("A1:I1")
     ws["A1"] = "PRESUPUESTO"
     ws["A1"].font = Font(size=20, bold=True, color=brown)
 
-    ws.merge_cells("A2:J2")
+    ws.merge_cells("A2:I2")
     ws["A2"] = project_data["name"]
     ws["A2"].font = Font(size=12, bold=True, color=brown)
 
-    ws.merge_cells("A3:J3")
+    ws.merge_cells("A3:I3")
     ws["A3"] = (
         f"{project_data['project_type']} · {project_data.get('budget_level', 'Medio-alto')} · "
         f"{project_data['location']} · {project_code} · V{version:02d}"
@@ -4047,9 +4047,9 @@ def crear_excel(
 
     # -----------------------------------------------------
     # RESUMEN POR PARTIDAS
-    # H = importe interno; I = importe final cuando aplica.
+    # H = Importe interno.
     # -----------------------------------------------------
-    ws.merge_cells("A5:J5")
+    ws.merge_cells("A5:I5")
     ws["A5"] = "RESUMEN"
     ws["A5"].font = Font(size=13, bold=True, color=brown)
 
@@ -4073,7 +4073,6 @@ def crear_excel(
         ws.cell(summary_row, 1, f"{section_idx}. {part_name}")
         ws.cell(summary_row, 1).fill = PatternFill("solid", fgColor=gray_light)
         ws.cell(summary_row, 8).fill = PatternFill("solid", fgColor=gray_light)
-        ws.cell(summary_row, 9).fill = PatternFill("solid", fgColor=gray_light)
         summary_map[section] = summary_row
         summary_row += 1
 
@@ -4081,37 +4080,10 @@ def crear_excel(
     ws.merge_cells(
         start_row=summary_row, start_column=1, end_row=summary_row, end_column=7
     )
-    ws.cell(summary_row, 1, "Presupuesto interno (sin IVA / sin 30% marca)")
+    ws.cell(summary_row, 1, "Presupuesto interno (MXN)")
     ws.cell(summary_row, 1).font = Font(bold=True)
     ws.cell(summary_row, 1).fill = PatternFill("solid", fgColor=gray)
     ws.cell(summary_row, 8).fill = PatternFill("solid", fgColor=gray)
-    summary_row += 1
-
-    brand_summary_row = summary_row
-    ws.merge_cells(
-        start_row=summary_row, start_column=1, end_row=summary_row, end_column=7
-    )
-    ws.cell(summary_row, 1, f"Presupuesto + {BRAND_MARKUP_PCT:.0f}% marca (sin IVA)")
-    ws.cell(summary_row, 1).font = Font(bold=True)
-    summary_row += 1
-
-    iva_summary_row = summary_row
-    ws.merge_cells(
-        start_row=summary_row, start_column=1, end_row=summary_row, end_column=7
-    )
-    ws.cell(summary_row, 1, f"IVA {params['iva_pct']:.0f}%")
-    ws.cell(summary_row, 1).font = Font(bold=True)
-    summary_row += 1
-
-    total_summary_row = summary_row
-    ws.merge_cells(
-        start_row=summary_row, start_column=1, end_row=summary_row, end_column=7
-    )
-    ws.cell(summary_row, 1, "Total final con IVA (MXN)")
-    ws.cell(summary_row, 1).font = Font(size=11, bold=True, color=brown)
-    ws.cell(summary_row, 9).font = Font(size=11, bold=True, color=brown)
-    ws.cell(summary_row, 1).fill = PatternFill("solid", fgColor=brown_light)
-    ws.cell(summary_row, 9).fill = PatternFill("solid", fgColor=brown_light)
 
     # -----------------------------------------------------
     # TABLA DE PARTIDAS Y SUBPARTIDAS
@@ -4126,7 +4098,6 @@ def crear_excel(
         "Cant.",
         "Precio Unitario (MXN)",
         "Importe interno (MXN)",
-        "Importe Final (MXN)",
         "Considerar",
     ]
 
@@ -4154,45 +4125,37 @@ def crear_excel(
         ws.cell(row, 5, item["unit"])
         ws.cell(row, 6, float(item["quantity"]))
 
-        # H es el importe interno editable: no incluye ni el 30 % de marca
-        # de franquicia ni el IVA. Mantiene el comportamiento de edición manual.
+        # H es el Importe interno editable que se utilizará para negociación
+        # con el equipo de subcontrataciones.
         ws.cell(row, 8, float(item["sale_amount"]))
 
-        # G se deriva del importe interno / cantidad.
+        # G se deriva del Importe interno / cantidad.
         ws.cell(row, 7, f"=IF(F{row}=0,0,H{row}/F{row})")
 
-        # J controla si la actividad participa o no en el presupuesto. H conserva
+        # I controla si la actividad participa o no en el presupuesto. H conserva
         # el valor para poder reactivarla sin perder el precio capturado.
-        ws.cell(row, 10, "Sí" if item_esta_incluido(item) else "No")
-
-        # I refleja el total final únicamente cuando la actividad está activa.
-        ws.cell(
-            row,
-            9,
-            f"=IF(J{row}=\"Sí\",H{row}*(1+{BRAND_MARKUP_PCT / 100.0:.6f})*(1+'02 Control Interno'!$B$5),0)",
-        )
+        ws.cell(row, 9, "Sí" if item_esta_incluido(item) else "No")
 
         ws.cell(row, 6).number_format = "0.00"
-        for col in (7, 8, 9):
+        for col in (7, 8):
             ws.cell(row, col).number_format = '$#,##0.00'
 
-        for col in range(1, 11):
+        for col in range(1, 10):
             cell = ws.cell(row, col)
             cell.alignment = Alignment(
                 vertical="top",
                 wrap_text=col in {1, 2, 3, 4},
-                horizontal="center" if col in {5, 6, 10} else "left",
+                horizontal="center" if col in {5, 6, 9} else "left",
             )
             cell.border = Border(bottom=thin_gray)
 
-        for col in (7, 8, 9):
+        for col in (7, 8):
             ws.cell(row, col).alignment = Alignment(horizontal="right")
 
-        # H y J son controles editables; G e I son fórmulas.
+        # H y I son controles editables; G es fórmula.
         ws.cell(row, 8).fill = PatternFill("solid", fgColor=editable_fill)
-        ws.cell(row, 10).fill = PatternFill("solid", fgColor=editable_fill)
+        ws.cell(row, 9).fill = PatternFill("solid", fgColor=editable_fill)
         ws.cell(row, 7).fill = PatternFill("solid", fgColor=formula_fill)
-        ws.cell(row, 9).fill = PatternFill("solid", fgColor=formula_fill)
 
         ws.row_dimensions[row].height = max(
             34,
@@ -4216,16 +4179,16 @@ def crear_excel(
         include_validation.error = 'Selecciona únicamente Sí o No.'
         include_validation.errorTitle = 'Valor no válido'
         ws.add_data_validation(include_validation)
-        include_validation.add(f"J{first_item_row}:J{last_item_row}")
+        include_validation.add(f"I{first_item_row}:I{last_item_row}")
 
         # Una actividad desactivada sigue visible, pero se atenúa para que sea
         # evidente que ya no participa en los totales.
         inactive_fill = PatternFill("solid", fgColor="E7E6E6")
         inactive_font = Font(color="7F7F7F")
         ws.conditional_formatting.add(
-            f"A{first_item_row}:J{last_item_row}",
+            f"A{first_item_row}:I{last_item_row}",
             FormulaRule(
-                formula=[f'$J{first_item_row}="No"'],
+                formula=[f'$I{first_item_row}="No"'],
                 fill=inactive_fill,
                 font=inactive_font,
             ),
@@ -4237,60 +4200,42 @@ def crear_excel(
     row += 1
     internal_detail_row = row
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
-    ws.cell(row, 1, "Presupuesto interno (sin IVA / sin 30% marca)")
+    ws.cell(row, 1, "Presupuesto interno (MXN)")
     ws.cell(row, 1).font = Font(bold=True)
     ws.cell(
         row,
         8,
-        f'=SUMIF(J{table_header_row + 1}:J{row - 2},"Sí",H{table_header_row + 1}:H{row - 2})',
+        f'=SUMIF(I{table_header_row + 1}:I{row - 2},"Sí",H{table_header_row + 1}:H{row - 2})',
     )
-    ws.cell(row, 9, f"=SUM(I{table_header_row + 1}:I{row - 2})")
-    for col in (8, 9):
-        ws.cell(row, col).number_format = '$#,##0.00'
-        ws.cell(row, col).font = Font(bold=True)
-        ws.cell(row, col).fill = PatternFill("solid", fgColor=gray)
+    ws.cell(row, 8).number_format = '$#,##0.00'
+    ws.cell(row, 8).font = Font(bold=True)
+    ws.cell(row, 8).fill = PatternFill("solid", fgColor=gray)
     ws.cell(row, 1).fill = PatternFill("solid", fgColor=gray)
 
-    # Resumen superior: subtotal interno y subtotal final por partida.
+    # Resumen superior: subtotal interno por partida.
     for section in sections:
         amount_rows = section_amount_rows.get(section) or []
         internal_formula = (
-            "+".join(f'IF(J{r}="Sí",H{r},0)' for r in amount_rows)
+            "+".join(f'IF(I{r}="Sí",H{r},0)' for r in amount_rows)
             if amount_rows else "0"
         )
-        final_formula = "+".join(f"I{r}" for r in amount_rows) if amount_rows else "0"
         sr = summary_map[section]
         ws.cell(sr, 8, f"={internal_formula}")
-        ws.cell(sr, 9, f"={final_formula}")
-        for col in (8, 9):
-            ws.cell(sr, col).number_format = '$#,##0.00'
-            ws.cell(sr, col).alignment = Alignment(horizontal="right")
+        ws.cell(sr, 8).number_format = '$#,##0.00'
+        ws.cell(sr, 8).alignment = Alignment(horizontal="right")
 
     ws.cell(internal_summary_row, 8, f"=H{internal_detail_row}")
     ws.cell(internal_summary_row, 8).number_format = '$#,##0.00'
 
-    ws.cell(
-        brand_summary_row,
-        9,
-        f"=H{internal_summary_row}*(1+{BRAND_MARKUP_PCT / 100.0:.6f})",
-    )
-    ws.cell(brand_summary_row, 9).number_format = '$#,##0.00'
 
-    ws.cell(iva_summary_row, 9, f"=I{brand_summary_row}*'02 Control Interno'!$B$5")
-    ws.cell(iva_summary_row, 9).number_format = '$#,##0.00'
-
-    ws.cell(total_summary_row, 9, f"=I{brand_summary_row}+I{iva_summary_row}")
-    ws.cell(total_summary_row, 9).number_format = '$#,##0.00'
-
-    widths = [18, 23, 25, 68, 11, 11, 21, 22, 22, 13]
+    widths = [18, 23, 25, 68, 11, 11, 21, 22, 13]
     for col, width in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(col)].width = width
 
     ws.row_dimensions[table_header_row].height = 32
     ws.auto_filter.ref = (
-        f"A{table_header_row}:J{table_header_row + len(structured_items)}"
+        f"A{table_header_row}:I{table_header_row + len(structured_items)}"
     )
-    ws.freeze_panes = f"A{table_header_row + 1}"
 
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.orientation = "landscape"
@@ -4308,7 +4253,7 @@ def crear_excel(
     wc.sheet_view.showGridLines = False
 
     # Paleta por bloques para que la hoja pueda leerse de izquierda a derecha:
-    # alcance -> desglose -> subcontratación -> venta -> rentabilidad.
+    # alcance -> desglose -> subcontratación -> presupuesto interno.
     cost_blue = "5B9BD5"
     cost_blue_light = "DDEBF7"
     subcontract_gold = "BF9000"
@@ -4318,7 +4263,7 @@ def crear_excel(
     profit_green = "375623"
     profit_green_light = "E2F0D9"
 
-    wc.merge_cells("A1:W1")
+    wc.merge_cells("A1:S1")
     wc["A1"] = "CONTROL INTERNO DEL PRESUPUESTO"
     wc["A1"].font = Font(size=15, bold=True, color=white)
     wc["A1"].fill = PatternFill("solid", fgColor=internal_blue)
@@ -4345,17 +4290,15 @@ def crear_excel(
     # Resumen ejecutivo de negociación. Se completa después de crear las filas
     # para que responda tanto al precio subcontratado como al selector Sí/No de 01.
     wc.merge_cells("D2:F2")
-    wc["D2"] = "RESUMEN DE NEGOCIACIÓN"
+    wc["D2"] = "RESUMEN DE SUBCONTRATACIÓN"
     wc["D2"].font = Font(bold=True, color=white)
     wc["D2"].fill = PatternFill("solid", fgColor=profit_green)
     for col in range(5, 7):
         wc.cell(2, col).fill = PatternFill("solid", fgColor=profit_green)
     summary_labels = [
         "Costo subcontratado activo",
-        "Venta interna activa",
-        "Beneficio bruto activo",
-        "Margen venta activo",
-        "Utilidad sobre costo activa",
+        "Importe interno activo",
+        "Diferencia vs interno",
     ]
     for rr, label in enumerate(summary_labels, start=3):
         wc.cell(rr, 4, label)
@@ -4370,8 +4313,7 @@ def crear_excel(
         (1, 9, "IDENTIFICACIÓN Y ALCANCE", internal_blue),
         (10, 14, "DESGLOSE DE COSTO UNITARIO", cost_blue),
         (15, 16, "SUBCONTRATACIÓN", subcontract_gold),
-        (17, 19, "PRECIO DE VENTA", sale_green),
-        (20, 23, "RENTABILIDAD", profit_green),
+        (17, 19, "PRESUPUESTO INTERNO", sale_green),
     ]
     for start_col, end_col, label, color in groups:
         wc.merge_cells(
@@ -4404,13 +4346,9 @@ def crear_excel(
         "Desperdicio ref. unit.",
         "Precio subcontratista unit.",
         "Importe subcontratista",
-        "P.U. venta calculado",
-        "P.U. venta actual",
-        "Importe interno venta",
-        "Beneficio (MXN)",
-        "Margen venta %",
-        "Utilidad sobre costo %",
-        "Dif. P.U. venta vs calculado",
+        "P.U. interno calculado",
+        "P.U. interno vigente",
+        "Importe interno",
     ]
 
     group_fills = {
@@ -4418,7 +4356,6 @@ def crear_excel(
         **{col: cost_blue for col in range(10, 15)},
         **{col: subcontract_gold for col in range(15, 17)},
         **{col: sale_green for col in range(17, 20)},
-        **{col: profit_green for col in range(20, 24)},
     }
     for col, header in enumerate(headers, 1):
         c = wc.cell(header_row, col, header)
@@ -4441,8 +4378,7 @@ def crear_excel(
         for col, val in enumerate(values, 1):
             wc.cell(idx, col, val)
 
-        # Cantidad y ventas actuales provienen de 01 Presupuesto. Así, cualquier
-        # cambio manual en el importe de venta se refleja inmediatamente aquí.
+        # Cantidad e Importe interno vigentes provienen de 01 Presupuesto.
         if commercial_row:
             wc.cell(idx, 9, f"='01 Presupuesto'!F{commercial_row}")
         else:
@@ -4461,8 +4397,7 @@ def crear_excel(
         wc.cell(idx, 15, float(item["unit_cost"]))
         wc.cell(idx, 16, f"=I{idx}*O{idx}")
 
-        # Precio objetivo conforme a los parámetros internos y precio de venta
-        # realmente vigente en 01 Presupuesto.
+        # Precio interno objetivo: costo del subcontratista más indirectos y utilidad.
         wc.cell(idx, 17, f"=O{idx}*(1+$B$3)*(1+$B$4)")
         if commercial_row:
             wc.cell(idx, 18, f"='01 Presupuesto'!G{commercial_row}")
@@ -4471,19 +4406,11 @@ def crear_excel(
             wc.cell(idx, 18, float(item["unit_sale"]))
             wc.cell(idx, 19, float(item["sale_amount"]))
 
-        # Rentabilidad frente al precio real negociado con el subcontratista.
-        wc.cell(idx, 20, f"=S{idx}-P{idx}")
-        wc.cell(idx, 21, f'=IF(S{idx}=0,0,T{idx}/S{idx})')
-        wc.cell(idx, 22, f'=IF(P{idx}=0,0,T{idx}/P{idx})')
-        wc.cell(idx, 23, f"=R{idx}-Q{idx}")
-
         wc.cell(idx, 9).number_format = "0.00"
-        for col in [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 23]:
+        for col in [10, 11, 12, 13, 14, 15, 16, 17, 18, 19]:
             wc.cell(idx, col).number_format = '$#,##0.00'
-        for col in (21, 22):
-            wc.cell(idx, col).number_format = "0.00%"
 
-        for col in range(1, 24):
+        for col in range(1, 20):
             cell = wc.cell(idx, col)
             cell.alignment = Alignment(
                 vertical="top",
@@ -4492,7 +4419,7 @@ def crear_excel(
             )
             cell.border = Border(bottom=thin_gray)
 
-        for col in range(10, 24):
+        for col in range(10, 20):
             wc.cell(idx, col).alignment = Alignment(horizontal="right", vertical="top")
 
         # Colores de captura y lectura rápida.
@@ -4504,8 +4431,6 @@ def crear_excel(
         wc.cell(idx, 16).fill = PatternFill("solid", fgColor=subcontract_light)
         for col in (17, 18, 19):
             wc.cell(idx, col).fill = PatternFill("solid", fgColor=sale_green_light)
-        for col in (20, 21, 22, 23):
-            wc.cell(idx, col).fill = PatternFill("solid", fgColor=profit_green_light)
 
     # Totales de negociación activos: consideran únicamente filas con Sí en 01.
     active_cost_terms = []
@@ -4513,33 +4438,26 @@ def crear_excel(
         commercial_row = commercial_row_map.get(item["code"])
         if commercial_row:
             active_cost_terms.append(
-                f"IF('01 Presupuesto'!J{commercial_row}=\"Sí\",P{control_row},0)"
+                f"IF('01 Presupuesto'!I{commercial_row}=\"Sí\",P{control_row},0)"
             )
     active_cost_formula = "+".join(active_cost_terms) if active_cost_terms else "0"
     wc["E3"] = f"={active_cost_formula}"
     wc["E4"] = f"='01 Presupuesto'!H{internal_detail_row}"
     wc["E5"] = "=E4-E3"
-    wc["E6"] = "=IF(E4=0,0,E5/E4)"
-    wc["E7"] = "=IF(E3=0,0,E5/E3)"
     for cell in ("E3", "E4", "E5"):
         wc[cell].number_format = '$#,##0.00'
-        wc[cell].font = Font(bold=True)
-    for cell in ("E6", "E7"):
-        wc[cell].number_format = "0.00%"
         wc[cell].font = Font(bold=True)
 
     widths = [
         14, 18, 26, 22, 30, 56, 10, 10, 10,
-        18, 18, 21, 20, 19, 22, 21, 19, 19, 21,
-        18, 16, 19, 22,
+        18, 18, 21, 20, 19, 22, 21, 19, 19,
     ]
     for col, width in enumerate(widths, 1):
         wc.column_dimensions[get_column_letter(col)].width = width
 
     wc.row_dimensions[group_row].height = 22
     wc.row_dimensions[header_row].height = 40
-    wc.auto_filter.ref = f"A{header_row}:W{header_row + len(ordered_items)}"
-    wc.freeze_panes = f"A{header_row + 1}"
+    wc.auto_filter.ref = f"A{header_row}:S{header_row + len(ordered_items)}"
 
     # -----------------------------------------------------
     # 03 TRAZABILIDAD
@@ -4679,7 +4597,7 @@ def crear_excel(
                 wa.cell(
                     current_row,
                     3,
-                    f"=IF('01 Presupuesto'!J{commercial_row}=\"Sí\",'01 Presupuesto'!H{commercial_row}*{float(allocation['porcentaje']) / 100.0:.8f},0)",
+                    f"=IF('01 Presupuesto'!I{commercial_row}=\"Sí\",'01 Presupuesto'!H{commercial_row}*{float(allocation['porcentaje']) / 100.0:.8f},0)",
                 )
                 wa.cell(current_row, 3).number_format = '$#,##0.00'
                 for col in range(1, 4):
@@ -4738,7 +4656,7 @@ def dataframe_resumen(items: list[dict]) -> pd.DataFrame:
                 "Unidad": x["unit"],
                 "Cant.": x["quantity"],
                 "Precio Unitario": x["unit_sale"],
-                "Importe Total": x["sale_amount"],
+                "Importe interno": x["sale_amount"],
             }
         )
     return pd.DataFrame(rows)
@@ -5396,8 +5314,7 @@ def render_admin_database(db: Database):
                             "Versión": b.get("version"),
                             "Estado": b.get("status"),
                             "Costo directo": b.get("direct_cost"),
-                            "Venta sin IVA": b.get("sale_before_tax"),
-                            "Total": b.get("total"),
+                            "Importe interno": b.get("sale_before_tax"),
                             "Fecha": b.get("created_at"),
                         }
                         for b in project_budgets
@@ -5408,8 +5325,7 @@ def render_admin_database(db: Database):
                         hide_index=True,
                         column_config={
                             "Costo directo": st.column_config.NumberColumn(format="$ %.2f"),
-                            "Venta sin IVA": st.column_config.NumberColumn(format="$ %.2f"),
-                            "Total": st.column_config.NumberColumn(format="$ %.2f"),
+                            "Importe interno": st.column_config.NumberColumn(format="$ %.2f"),
                         },
                     )
 
@@ -5554,8 +5470,7 @@ def render_admin_database(db: Database):
                     "Costo directo": b.get("direct_cost"),
                     "Indirectos": b.get("indirect_cost"),
                     "Utilidad": b.get("profit"),
-                    "Venta sin IVA": b.get("sale_before_tax"),
-                    "Total": b.get("total"),
+                    "Importe interno": b.get("sale_before_tax"),
                     "Fecha": b.get("created_at") or "",
                 }
                 for b in budgets
@@ -5568,8 +5483,7 @@ def render_admin_database(db: Database):
                     "Costo directo": st.column_config.NumberColumn(format="$ %.2f"),
                     "Indirectos": st.column_config.NumberColumn(format="$ %.2f"),
                     "Utilidad": st.column_config.NumberColumn(format="$ %.2f"),
-                    "Venta sin IVA": st.column_config.NumberColumn(format="$ %.2f"),
-                    "Total": st.column_config.NumberColumn(format="$ %.2f"),
+                    "Importe interno": st.column_config.NumberColumn(format="$ %.2f"),
                 },
             )
 
@@ -5577,7 +5491,7 @@ def render_admin_database(db: Database):
                 b["id"]: (
                     f"{b.get('project_code') or ''} — "
                     f"{b.get('project_name') or ''} — "
-                    f"{formato_moneda(float(b.get('total') or 0))}"
+                    f"{formato_moneda(float(b.get('sale_before_tax') or 0))}"
                 )
                 for b in budgets
             }
@@ -5601,12 +5515,11 @@ def render_admin_database(db: Database):
                     bm1.metric("Costo directo", formato_moneda(float(budget.get("direct_cost") or 0)))
                     bm2.metric("Indirectos", formato_moneda(float(budget.get("indirect_cost") or 0)))
                     bm3.metric("Utilidad", formato_moneda(float(budget.get("profit") or 0)))
-                    bm4.metric("Total", formato_moneda(float(budget.get("total") or 0)))
+                    bm4.metric("Importe interno", formato_moneda(float(budget.get("sale_before_tax") or 0)))
 
                     st.caption(
                         f"Indirectos: {float(budget.get('indirect_pct') or 0):.2f}% · "
                         f"Utilidad: {float(budget.get('profit_pct') or 0):.2f}% · "
-                        f"IVA: {float(budget.get('iva_pct') or 0):.2f}% · "
                         f"Estado: {budget.get('status') or ''}"
                     )
 
@@ -5621,8 +5534,8 @@ def render_admin_database(db: Database):
                             "Unidad": i.get("unit") or "",
                             "Cantidad": i.get("quantity"),
                             "Costo unitario": i.get("unit_cost"),
-                            "Venta unitaria": i.get("unit_sale"),
-                            "Venta": i.get("sale_amount"),
+                            "P.U. interno": i.get("unit_sale"),
+                            "Importe interno": i.get("sale_amount"),
                             "Fuente": friendly_source(i.get("price_source")),
                         }
                         for i in items
@@ -5633,8 +5546,8 @@ def render_admin_database(db: Database):
                         hide_index=True,
                         column_config={
                             "Costo unitario": st.column_config.NumberColumn(format="$ %.2f"),
-                            "Venta unitaria": st.column_config.NumberColumn(format="$ %.2f"),
-                            "Venta": st.column_config.NumberColumn(format="$ %.2f"),
+                            "P.U. interno": st.column_config.NumberColumn(format="$ %.2f"),
+                            "Importe interno": st.column_config.NumberColumn(format="$ %.2f"),
                         },
                     )
                 else:
@@ -5902,7 +5815,7 @@ with st.sidebar:
             "Indirectos (%)",
             min_value=0.0,
             max_value=100.0,
-            value=12.0,
+            value=10.0,
             step=0.5,
             key="indirect_pct",
         )
@@ -5910,25 +5823,27 @@ with st.sidebar:
             "Utilidad (%)",
             min_value=0.0,
             max_value=100.0,
-            value=10.0,
+            value=18.0,
             step=0.5,
             key="profit_pct",
         )
         iva_pct = st.number_input(
-            "IVA (%)",
+            "IVA (%) · referencia posterior",
             min_value=0.0,
             max_value=100.0,
             value=16.0,
             step=1.0,
             key="iva_pct",
+            disabled=True,
         )
         waste_pct = st.number_input(
-            "Desperdicio (%)",
+            "Desperdicio (%) · referencia sin aplicación",
             min_value=0.0,
             max_value=50.0,
-            value=5.0,
+            value=4.0,
             step=0.5,
             key="waste_pct",
+            disabled=True,
         )
 
         with st.expander("Configuración"):
@@ -6468,28 +6383,13 @@ else:
         key=f"locked_guide_{version}_{saved}",
     )
 
-    # Resumen comercial igual al utilizado en 01 Presupuesto:
-    # 1) presupuesto interno;
-    # 2) presupuesto con 30 % de marca;
-    # 3) total final después de aplicar IVA al presupuesto con marca.
+    # Este módulo termina en el Importe interno. La marca y el IVA se agregan
+    # posteriormente, fuera de este presupuesto de negociación con subcontratistas.
     presupuesto_interno = float(financials["sale_before_tax"])
-    presupuesto_con_marca = presupuesto_interno * (1.0 + BRAND_MARKUP_PCT / 100.0)
-    presupuesto_final_iva = presupuesto_con_marca * (
-        1.0 + float(g["params"]["iva_pct"]) / 100.0
-    )
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric(
+    st.metric(
         "Presupuesto interno",
         formato_moneda(presupuesto_interno),
-    )
-    m2.metric(
-        f"Presupuesto + {BRAND_MARKUP_PCT:.0f}% marca",
-        formato_moneda(presupuesto_con_marca),
-    )
-    m3.metric(
-        "Presupuesto final con IVA",
-        formato_moneda(presupuesto_final_iva),
     )
 
     with st.expander("Detalle interno"):
@@ -6506,7 +6406,7 @@ else:
         column_config={
             "Cant.": st.column_config.NumberColumn(format="%.2f"),
             "Precio Unitario": st.column_config.NumberColumn(format="$ %.2f"),
-            "Importe Total": st.column_config.NumberColumn(format="$ %.2f"),
+            "Importe interno": st.column_config.NumberColumn(format="$ %.2f"),
         },
     )
 
