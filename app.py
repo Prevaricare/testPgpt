@@ -3965,6 +3965,135 @@ def importar_presupuesto_excel(
     }
 
 
+
+def preparar_items_desde_editor_excel(
+    editor_df: pd.DataFrame,
+    current_items: list[dict],
+    params: dict,
+    project_data: dict,
+) -> list[dict]:
+    """Aplica cambios hechos en el editor rápido de Excel sin usar Gemini."""
+    required = [
+        "Área", "Partida", "Subpartida", "Descripción Técnica",
+        "Unidad", "Cant.", "Precio Unitario (MXN)",
+    ]
+    if not isinstance(editor_df, pd.DataFrame):
+        raise ValueError("El editor no devolvió una tabla válida.")
+    for col in required:
+        if col not in editor_df.columns:
+            raise ValueError(f"Falta la columna requerida: {col}")
+
+    def num(value, default=0.0):
+        try:
+            if pd.isna(value):
+                return float(default)
+        except Exception:
+            pass
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    factor = ((1.0 + float(params.get("indirect_pct", 0.0)) / 100.0)
+              * (1.0 + float(params.get("profit_pct", 0.0)) / 100.0))
+    if factor <= 0:
+        factor = 1.0
+
+    updated = []
+    used_codes = {str(item.get("code") or "").strip().upper() for item in current_items}
+
+    for position, (_, row) in enumerate(editor_df.iterrows()):
+        area = normalizar_nombre_area(str(row.get("Área") or "").strip())
+        category = str(row.get("Partida") or "").strip()
+        subcategory = str(row.get("Subpartida") or "").strip()
+        description = str(row.get("Descripción Técnica") or "").strip()
+        unit = str(row.get("Unidad") or "").strip().upper()
+        quantity = max(num(row.get("Cant."), 0.0), 0.0)
+        unit_sale = max(num(row.get("Precio Unitario (MXN)"), 0.0), 0.0)
+
+        if not any((area, category, subcategory, description, unit)) and quantity == 0 and unit_sale == 0:
+            continue
+        if not description or not unit:
+            raise ValueError(f"La fila {position + 1} necesita Descripción Técnica y Unidad.")
+        if quantity <= 0:
+            raise ValueError(f"La fila {position + 1} debe tener una Cantidad mayor a 0.")
+
+        if position < len(current_items):
+            item = dict(current_items[position])
+        else:
+            idx = 1
+            while f"MAN-{idx:03d}" in used_codes:
+                idx += 1
+            code = f"MAN-{idx:03d}"
+            used_codes.add(code)
+            unit_cost = unit_sale / factor if factor else unit_sale
+            indirect_unit = unit_cost * float(params.get("indirect_pct", 0.0)) / 100.0
+            profit_unit = (unit_cost + indirect_unit) * float(params.get("profit_pct", 0.0)) / 100.0
+            item = {
+                "concept_id": None,
+                "area_hint": area,
+                "category": category or "General",
+                "subcategory": subcategory or description[:80],
+                "code": code,
+                "execution_order": (len(current_items) + len(updated) + 1) * 10,
+                "commercial_title": subcategory or description[:80],
+                "concepto_base": description,
+                "description": description,
+                "unit": unit,
+                "quantity": quantity,
+                "unit_cost": unit_cost,
+                "direct_amount": quantity * unit_cost,
+                "unit_indirect": indirect_unit,
+                "unit_profit": profit_unit,
+                "unit_sale": unit_sale,
+                "sale_amount": quantity * unit_sale,
+                "benefit_amount": quantity * (unit_sale - unit_cost),
+                "sale_margin_pct": ((unit_sale - unit_cost) / unit_sale * 100.0) if unit_sale else 0.0,
+                "price_source": "EDITOR_EXCEL",
+                "price_source_detail": "Actividad agregada manualmente desde el editor de Excel.",
+                "price_status": "AGREGADO_MANUAL",
+                "price_confidence": "Alta",
+                "material_share_pct": 0.0,
+                "labor_share_pct": 0.0,
+                "other_share_pct": 100.0,
+                "waste_reference_pct": 0.0,
+                "included": True,
+                "contract_lot": "1",
+                "quantity_confidence": "Alta",
+                "quantity_criterion": "Cantidad capturada manualmente en el editor de Excel.",
+                "inclusion_basis": "Actividad agregada manualmente en el editor de Excel.",
+                "considerations": "",
+            }
+
+        item["area_hint"] = area
+        item["category"] = category or item.get("category") or "General"
+        item["subcategory"] = subcategory or item.get("subcategory") or description[:80]
+        item["description"] = description
+        item["unit"] = unit
+        item["quantity"] = quantity
+        item["unit_sale"] = unit_sale
+        item["sale_amount"] = quantity * unit_sale
+
+        # El precio unitario capturado por el usuario es el precio interno de salida.
+        # Solo reconstruimos el desglose oculto necesario para que el resto del app siga consistente.
+        recalculated = recalcular_item_financiero(item, params)
+        recalculated["unit_sale"] = unit_sale
+        recalculated["sale_amount"] = quantity * unit_sale
+        recalculated["benefit_amount"] = recalculated["sale_amount"] - float(recalculated.get("direct_amount") or 0.0)
+        recalculated["sale_margin_pct"] = (
+            recalculated["benefit_amount"] / recalculated["sale_amount"] * 100.0
+            if recalculated["sale_amount"] else 0.0
+        )
+        recalculated["price_source"] = "EDITOR_EXCEL"
+        recalculated["price_source_detail"] = "Precio actualizado manualmente desde el editor de Excel."
+        recalculated["price_status"] = "EDITADO_MANUAL"
+        updated.append(recalculated)
+
+    if not updated:
+        raise ValueError("El editor no contiene actividades con información válida.")
+    return recalcular_areas_items(project_data, updated)
+
+
 # =========================================================
 # EXCEL
 # =========================================================
@@ -5779,299 +5908,6 @@ def render_admin_database(db: Database):
 
 
 # =========================================================
-# EDITOR MANUAL DE EXCEL
-# =========================================================
-
-MANUAL_EDITOR_COLUMNS = [
-    "Área",
-    "Partida",
-    "Subpartida",
-    "Descripción Técnica",
-    "Unidad",
-    "Cant.",
-    "Precio Unitario (MXN)",
-]
-
-
-def _manual_editor_rows_from_items(items: list[dict]) -> list[dict]:
-    rows = []
-    for item in ordenar_items_comercialmente(items):
-        rows.append({
-            "Área": area_excel_item(item),
-            "Partida": nombre_partida_excel(item.get("category")),
-            "Subpartida": item.get("subcategory") or nombre_subpartida_excel(item),
-            "Descripción Técnica": item.get("description") or "",
-            "Unidad": item.get("unit") or "",
-            "Cant.": float(item.get("quantity") or 0.0),
-            "Precio Unitario (MXN)": float(item.get("unit_sale") or 0.0),
-        })
-    return rows
-
-
-def _manual_editor_items(rows: list[dict], params: dict) -> list[dict]:
-    """Convierte la tabla manual en items compatibles con el generador Excel."""
-    factor = (
-        (1.0 + float(params.get("indirect_pct") or 0.0) / 100.0)
-        * (1.0 + float(params.get("profit_pct") or 0.0) / 100.0)
-    )
-    factor = factor if factor > 0 else 1.0
-
-    items = []
-    for idx, raw in enumerate(rows, start=1):
-        description = str(raw.get("Descripción Técnica") or "").strip()
-        unit = str(raw.get("Unidad") or "").strip().upper()
-        category_raw = str(raw.get("Partida") or "").strip()
-        subcategory = str(raw.get("Subpartida") or "").strip()
-        area = normalizar_nombre_area(raw.get("Área")) if str(raw.get("Área") or "").strip() else AREA_GENERAL
-        quantity = max(float(raw.get("Cant.") or 0.0), 0.0)
-        unit_sale = max(float(raw.get("Precio Unitario (MXN)") or 0.0), 0.0)
-
-        if not description or not unit:
-            continue
-        if quantity <= 0 and unit_sale <= 0:
-            continue
-
-        category = normalizar_seccion_comercial(category_raw or "OTROS TRABAJOS")
-        if not subcategory:
-            subcategory = description[:60]
-        if not category:
-            category = "OTROS TRABAJOS"
-
-        # El editor trabaja directamente con el Precio Unitario interno.
-        # Para mantener coherentes las hojas de control, reconstruimos detrás
-        # el costo base que, con 10 % de indirectos y 18 % de utilidad, produce
-        # exactamente el Precio Unitario escrito por el usuario.
-        unit_cost = unit_sale / factor if factor else unit_sale
-        item = {
-            "concept_id": None,
-            "area_hint": area,
-            "category": category,
-            "subcategory": subcategory,
-            "code": f"MAN-{idx:03d}",
-            "execution_order": idx * 10,
-            "commercial_title": subcategory,
-            "concepto_base": description,
-            "description": description,
-            "unit": unit,
-            "quantity": quantity,
-            "unit_cost": unit_cost,
-            "unit_sale": unit_sale,
-            "sale_amount": quantity * unit_sale,
-            "direct_amount": quantity * unit_cost,
-            "unit_indirect": unit_cost * float(params.get("indirect_pct") or 0.0) / 100.0,
-            "unit_profit": (
-                unit_cost
-                + unit_cost * float(params.get("indirect_pct") or 0.0) / 100.0
-            ) * float(params.get("profit_pct") or 0.0) / 100.0,
-            "benefit_amount": quantity * unit_sale - quantity * unit_cost,
-            "sale_margin_pct": (
-                (unit_sale - unit_cost) / unit_sale * 100.0
-                if unit_sale else 0.0
-            ),
-            "price_source": "MANUAL",
-            "price_source_detail": "Actividad capturada directamente en el editor manual, sin Gemini.",
-            "price_status": "MANUAL",
-            "price_confidence": "Alta",
-            "material_share_pct": 0.0,
-            "labor_share_pct": 0.0,
-            "other_share_pct": 100.0,
-            "waste_reference_pct": float(params.get("waste_pct") or 0.0),
-            "included": True,
-            "contract_lot": "1",
-            "quantity_confidence": "Alta",
-            "quantity_criterion": "Cantidad capturada manualmente por el usuario.",
-            "inclusion_basis": "Actividad capturada manualmente en el editor.",
-            "considerations": "",
-        }
-        item = aplicar_composicion_costo(item)
-        items.append(item)
-
-    return items
-
-
-def render_editor_manual():
-    st.header("Editor manual de presupuesto")
-    st.caption(
-        "Agrega o modifica actividades directamente en una tabla y genera el mismo Excel del sistema, "
-        "sin enviar la información a Gemini. Esta función no sustituye la generación asistida por IA."
-    )
-
-    generated = st.session_state.get("generated") or {}
-    existing_items = generated.get("items") or []
-
-    # Datos de encabezado: toma el presupuesto actual cuando existe.
-    default_name = ((generated.get("project_data") or {}).get("name") or st.session_state.get("client_name") or "").strip()
-    default_location = ((generated.get("project_data") or {}).get("location") or st.session_state.get("project_location") or "").strip()
-    default_type = ((generated.get("project_data") or {}).get("project_type") or st.session_state.get("project_type") or "Remodelación interior general")
-    default_level = ((generated.get("project_data") or {}).get("budget_level") or st.session_state.get("budget_level") or "Medio-alto")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        manual_client = st.text_input("Cliente", value=default_name, key="manual_editor_client")
-    with c2:
-        manual_location = st.text_input("Ubicación", value=default_location, key="manual_editor_location")
-
-    c3, c4 = st.columns(2)
-    with c3:
-        manual_type = st.selectbox(
-            "Tipo de obra",
-            NIVELES_PRESUPUESTO if False else [
-                "Remodelación interior general", "Baño", "Cocina", "Recámara",
-                "Sala / comedor", "Local comercial", "Oficina", "Caseta / acceso", "Otro",
-            ],
-            index=(
-                [
-                    "Remodelación interior general", "Baño", "Cocina", "Recámara",
-                    "Sala / comedor", "Local comercial", "Oficina", "Caseta / acceso", "Otro",
-                ].index(default_type)
-                if default_type in {
-                    "Remodelación interior general", "Baño", "Cocina", "Recámara",
-                    "Sala / comedor", "Local comercial", "Oficina", "Caseta / acceso", "Otro",
-                }
-                else 0
-            ),
-            key="manual_editor_type",
-        )
-    with c4:
-        manual_level = st.selectbox(
-            "Nivel de presupuesto",
-            NIVELES_PRESUPUESTO,
-            index=NIVELES_PRESUPUESTO.index(default_level) if default_level in NIVELES_PRESUPUESTO else 2,
-            key="manual_editor_level",
-        )
-
-    params = {
-        "indirect_pct": float(st.session_state.get("indirect_pct", 10.0)),
-        "profit_pct": float(st.session_state.get("profit_pct", 18.0)),
-        "iva_pct": float(st.session_state.get("iva_pct", 16.0)),
-        "waste_pct": float(st.session_state.get("waste_pct", 4.0)),
-    }
-
-    if "manual_editor_rows" not in st.session_state:
-        st.session_state["manual_editor_rows"] = _manual_editor_rows_from_items(existing_items) if existing_items else [
-            {
-                "Área": "",
-                "Partida": "",
-                "Subpartida": "",
-                "Descripción Técnica": "",
-                "Unidad": "",
-                "Cant.": 1.0,
-                "Precio Unitario (MXN)": 0.0,
-            }
-        ]
-
-    st.markdown("#### Actividades")
-    st.caption("Puedes cambiar el precio unitario directamente; el Excel calculará Importe interno = Cant. × Precio Unitario.")
-
-    edited = st.data_editor(
-        pd.DataFrame(st.session_state["manual_editor_rows"], columns=MANUAL_EDITOR_COLUMNS),
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        key="manual_editor_table",
-        column_config={
-            "Área": st.column_config.TextColumn("Área", width="medium"),
-            "Partida": st.column_config.TextColumn("Partida", width="medium"),
-            "Subpartida": st.column_config.TextColumn("Subpartida", width="medium"),
-            "Descripción Técnica": st.column_config.TextColumn("Descripción Técnica", width="large"),
-            "Unidad": st.column_config.TextColumn("Unidad", width="small"),
-            "Cant.": st.column_config.NumberColumn("Cant.", min_value=0.0, step=0.01, format="%.2f"),
-            "Precio Unitario (MXN)": st.column_config.NumberColumn("Precio Unitario (MXN)", min_value=0.0, step=100.0, format="$ %.2f"),
-        },
-    )
-    st.session_state["manual_editor_rows"] = edited.to_dict("records")
-
-    valid_rows = []
-    skipped = 0
-    for raw in st.session_state["manual_editor_rows"]:
-        desc = str(raw.get("Descripción Técnica") or "").strip()
-        unit = str(raw.get("Unidad") or "").strip()
-        if not desc and not unit:
-            continue
-        if not desc or not unit:
-            skipped += 1
-            continue
-        valid_rows.append(raw)
-
-    if skipped:
-        st.warning(f"Hay {skipped} fila(s) incompleta(s); se ignorarán al generar el Excel.")
-
-    items = _manual_editor_items(valid_rows, params)
-    financials = calcular_financieros(items, params) if items else {
-        "direct_cost": 0.0, "indirect_cost": 0.0, "profit": 0.0,
-        "sale_before_tax": 0.0, "iva_amount": 0.0, "total": 0.0,
-    }
-
-    st.metric("Importe interno", formato_moneda(financials["sale_before_tax"]))
-
-    b1, b2 = st.columns(2)
-    with b1:
-        if st.button("Vaciar editor", use_container_width=True, key="manual_editor_clear"):
-            st.session_state["manual_editor_rows"] = [{
-                "Área": "", "Partida": "", "Subpartida": "",
-                "Descripción Técnica": "", "Unidad": "", "Cant.": 1.0,
-                "Precio Unitario (MXN)": 0.0,
-            }]
-            st.rerun()
-    with b2:
-        build_manual = st.button("Generar Excel sin Gemini", type="primary", use_container_width=True, key="manual_editor_build")
-
-    if build_manual:
-        if not manual_client.strip():
-            st.error("Ingrese el nombre del cliente.")
-        elif not manual_location.strip():
-            st.error("Ingrese la ubicación.")
-        elif not items:
-            st.error("Agregue al menos una actividad completa.")
-        else:
-            project_data = {
-                "name": manual_client.strip(),
-                "project_type": manual_type,
-                "budget_level": manual_level,
-                "location": manual_location.strip(),
-                "dimension_mode": "Captura manual",
-                "dimensions_text": "",
-                "description": "Presupuesto armado directamente desde el editor manual.",
-                "guide_text": "",
-            }
-            project_code = generated.get("project_code") or f"{abreviar_cliente(manual_client)}-MAN-0001"
-            version = int(generated.get("version") or 1)
-            result = PresupuestoIA(
-                nombre_proyecto=manual_client.strip(),
-                actividad_principal=manual_type,
-                alcance_resumido="Presupuesto capturado y editado manualmente sin Gemini.",
-                consideraciones_generales=[
-                    "Actividades capturadas directamente por el usuario en el editor manual."
-                ],
-                datos_faltantes=[],
-                actividades=[item_a_actividad(item) for item in items],
-            )
-            excel_bytes = crear_excel(
-                project_code=project_code,
-                project_data=project_data,
-                result=result,
-                items=items,
-                params=params,
-                version=version,
-            )
-            st.session_state["manual_editor_excel"] = excel_bytes
-            st.session_state["manual_editor_filename"] = f"{project_code}-V{version:02d}_Presupuesto.xlsx"
-            st.session_state["manual_editor_items"] = items
-            st.session_state["manual_editor_financials"] = financials
-            st.success("Excel preparado. No se realizó ninguna solicitud a Gemini.")
-
-    if st.session_state.get("manual_editor_excel"):
-        st.download_button(
-            "Descargar Excel corregido",
-            data=st.session_state["manual_editor_excel"],
-            file_name=st.session_state.get("manual_editor_filename", "Presupuesto_manual.xlsx"),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="manual_editor_download",
-        )
-
-
-# =========================================================
 # ESTADO DE APLICACIÓN
 # =========================================================
 
@@ -6101,7 +5937,7 @@ with st.sidebar:
     st.header("Navegación")
     section = st.radio(
         "Sección",
-        ["Generar presupuesto", "Editor manual", "Catálogo e historial"],
+        ["Generar presupuesto", "Catálogo e historial"],
         key="main_section",
         label_visibility="collapsed",
     )
@@ -6160,11 +5996,6 @@ with st.sidebar:
 # =========================================================
 # BASE INTERNA
 # =========================================================
-
-
-if section == "Editor manual":
-    render_editor_manual()
-    st.stop()
 
 
 if section == "Catálogo e historial":
@@ -6841,6 +6672,93 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+
+    # -----------------------------------------------------
+    # EDITOR RÁPIDO DEL EXCEL IMPORTADO (SIN IA)
+    # -----------------------------------------------------
+    if g.get("imported_from_excel"):
+        st.divider()
+        st.subheader("Editar Excel sin IA")
+        st.caption(
+            "Agrega o modifica actividades directamente. Los cambios se aplican al mismo formato "
+            "de Excel y no hacen ninguna solicitud a Gemini."
+        )
+
+        editor_columns = [
+            "Área", "Partida", "Subpartida", "Descripción Técnica",
+            "Unidad", "Cant.", "Precio Unitario (MXN)",
+        ]
+        editor_rows = [
+            {
+                "Área": area_excel_item(item),
+                "Partida": item.get("category") or "",
+                "Subpartida": item.get("subcategory") or "",
+                "Descripción Técnica": item.get("description") or "",
+                "Unidad": item.get("unit") or "",
+                "Cant.": float(item.get("quantity") or 0.0),
+                "Precio Unitario (MXN)": float(item.get("unit_sale") or 0.0),
+            }
+            for item in items
+        ]
+        editor_df = pd.DataFrame(editor_rows, columns=editor_columns)
+        edited_df = st.data_editor(
+            editor_df,
+            key=f"excel_editor_{g['project_code']}_{version}",
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_order=editor_columns,
+            column_config={
+                "Área": st.column_config.TextColumn("Área", width="small"),
+                "Partida": st.column_config.TextColumn("Partida", width="medium"),
+                "Subpartida": st.column_config.TextColumn("Subpartida", width="medium"),
+                "Descripción Técnica": st.column_config.TextColumn("Descripción Técnica", width="large"),
+                "Unidad": st.column_config.TextColumn("Unidad", width="small"),
+                "Cant.": st.column_config.NumberColumn("Cant.", min_value=0.0, step=0.01, format="%.2f"),
+                "Precio Unitario (MXN)": st.column_config.NumberColumn(
+                    "Precio Unitario (MXN)", min_value=0.0, step=0.01, format="$ %.2f"
+                ),
+            },
+        )
+
+        if st.button(
+            "Aplicar cambios y actualizar Excel (sin IA)",
+            type="primary",
+            use_container_width=True,
+            key=f"apply_excel_editor_{g['project_code']}_{version}",
+        ):
+            try:
+                revised_items = preparar_items_desde_editor_excel(
+                    edited_df, items, g["params"], g["project_data"]
+                )
+                revised_result = PresupuestoIA(
+                    nombre_proyecto=g["project_data"]["name"],
+                    actividad_principal=g["project_data"]["project_type"],
+                    alcance_resumido="Presupuesto editado manualmente desde el editor de Excel, sin usar Gemini.",
+                    consideraciones_generales=["Cambios aplicados mediante editor manual de Excel."],
+                    datos_faltantes=[],
+                    actividades=[item_a_actividad(item) for item in revised_items],
+                )
+                revised_financials = calcular_financieros(revised_items, g["params"])
+                revised_excel = crear_excel(
+                    project_code=g["project_code"],
+                    project_data=g["project_data"],
+                    result=revised_result,
+                    items=revised_items,
+                    params=g["params"],
+                    version=version,
+                )
+                g.update({
+                    "saved": False,
+                    "result": revised_result.model_dump(),
+                    "items": revised_items,
+                    "financials": revised_financials,
+                    "excel_bytes": revised_excel,
+                })
+                st.session_state["generated"] = g
+                st.rerun()
+            except Exception as exc:
+                st.error(f"No fue posible aplicar los cambios: {exc}")
 
     # -----------------------------------------------------
     # Ajuste sencillo con IA
