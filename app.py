@@ -2088,8 +2088,8 @@ def error_gemini_transitorio(exc: Exception) -> bool:
     ))
 
 
-MAX_REINTENTOS_GEMINI = 50
-DELAY_REINTENTO_GEMINI_SEG = 10
+MAX_REINTENTOS_GEMINI = 20
+DELAY_REINTENTO_GEMINI_SEG = 30
 
 
 def generar_con_gemini_resistente(
