@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import time
+import random
 import sqlite3
 import unicodedata
 import uuid
@@ -2506,7 +2508,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-09-06-v17-valoracion-ia"
+DATABASE_CACHE_VERSION = "2026-09-07-v18-qol"
 
 
 @st.cache_resource(show_spinner=False)
@@ -2686,11 +2688,68 @@ def get_api_key() -> str | None:
     return get_secret("GEMINI_API_KEY")
 
 
+def actualizar_progreso(progress_callback, porcentaje: int, mensaje: str):
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(max(0, min(int(porcentaje), 100)), str(mensaje))
+    except Exception:
+        pass
+
+
+def error_gemini_transitorio(exc: Exception) -> bool:
+    msg = str(exc).upper()
+    transient_markers = (
+        "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
+        "500", "INTERNAL", "502", "BAD GATEWAY", "504", "GATEWAY TIMEOUT",
+        "TIMEOUT", "DEADLINE_EXCEEDED",
+    )
+    return any(marker in msg for marker in transient_markers)
+
+
+def generar_con_gemini_resistente(
+    client,
+    model: str,
+    contents: str,
+    config,
+    progress_callback=None,
+    etapa: str = "Procesando",
+    max_reintentos_transitorios: int = 3,
+):
+    """Una llamada Gemini con reintentos controlados para saturación y errores temporales."""
+    ultimo_error = None
+    for intento in range(1, max_reintentos_transitorios + 1):
+        try:
+            actualizar_progreso(
+                progress_callback,
+                0,
+                f"{etapa} · modelo {model} · intento {intento}/{max_reintentos_transitorios}",
+            )
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as exc:
+            ultimo_error = exc
+            if not error_gemini_transitorio(exc) or intento >= max_reintentos_transitorios:
+                raise
+            espera = min(12.0, 1.8 * (2 ** (intento - 1)) + random.uniform(0.0, 0.8))
+            actualizar_progreso(
+                progress_callback,
+                0,
+                f"{etapa} · Gemini está saturado; reintentando en {espera:.1f} s...",
+            )
+            time.sleep(espera)
+    raise ultimo_error if ultimo_error else RuntimeError("Error desconocido de Gemini.")
+
+
 def generar_presupuesto_ia(
     api_key: str,
     model_name: str,
     project_data: dict,
     params: dict,
+    progress_callback=None,
 ) -> PresupuestoIA:
     client = genai.Client(api_key=api_key)
     year = datetime.now().year
@@ -2903,28 +2962,23 @@ CONTROL DE CALIDAD
     last_error = None
     for model in modelos:
         try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
+            response = generar_con_gemini_resistente(
+                client=client, model=model, contents=prompt,
                 config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=PresupuestoIA,
+                    response_mime_type="application/json", response_schema=PresupuestoIA
                 ),
+                progress_callback=progress_callback,
+                etapa="1/4 · Generación del presupuesto",
             )
             if not response.text:
                 raise RuntimeError(f"Gemini ({model}) devolvió una respuesta vacía.")
             return PresupuestoIA.model_validate_json(response.text)
         except Exception as exc:
             last_error = exc
-            msg = str(exc).lower()
-            model_error = (
-                "404" in msg
-                or "not_found" in msg
-                or "no longer available" in msg
-                or ("model" in msg and "not available" in msg)
-            )
-            if not model_error:
-                raise
+            model_error = error_gemini_modelo_no_disponible(exc)
+            if model_error or error_gemini_transitorio(exc):
+                continue
+            raise
 
     raise RuntimeError(
         f"No fue posible usar un modelo Gemini disponible. Último error: {last_error}"
@@ -2937,6 +2991,7 @@ def auditar_estructura_presupuesto_ia(
     model_name: str,
     project_data: dict,
     result: PresupuestoIA,
+    progress_callback=None,
 ) -> PresupuestoIA:
     """
     Segunda pasada de Gemini dedicada solamente a partida, subpartida y secuencia.
@@ -3017,13 +3072,13 @@ No incluyas explicaciones adicionales.
 
     for model in models:
         try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
+            response = generar_con_gemini_resistente(
+                client=client, model=model, contents=prompt,
                 config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=AuditoriaEstructuraIA,
+                    response_mime_type="application/json", response_schema=AuditoriaEstructuraIA
                 ),
+                progress_callback=progress_callback,
+                etapa="2/4 · Auditoría de estructura",
             )
             if not response.text:
                 continue
@@ -3444,6 +3499,7 @@ def valorar_precios_ia(
     params: dict,
     result: PresupuestoIA,
     reference_packets: list[dict],
+    progress_callback=None,
 ) -> ValuacionPreciosIA:
     """Segunda etapa: Gemini fija el costo final recomendado de subcontratación."""
     client = genai.Client(api_key=api_key)
@@ -3532,13 +3588,13 @@ referencia genérica representa un trabajo especial.
     last_error = None
     for model in models:
         try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
+            response = generar_con_gemini_resistente(
+                client=client, model=model, contents=prompt,
                 config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ValuacionPreciosIA,
+                    response_mime_type="application/json", response_schema=ValuacionPreciosIA
                 ),
+                progress_callback=progress_callback,
+                etapa="4/4 · Valuación final de precios",
             )
             if not response.text:
                 raise RuntimeError(f"Gemini ({model}) devolvió una respuesta vacía.")
@@ -3553,15 +3609,10 @@ referencia genérica representa un trabajo especial.
             return valuation
         except Exception as exc:
             last_error = exc
-            msg = str(exc).lower()
-            model_error = (
-                "404" in msg
-                or "not_found" in msg
-                or "no longer available" in msg
-                or ("model" in msg and "not available" in msg)
-            )
-            if not model_error:
-                raise
+            model_error = error_gemini_modelo_no_disponible(exc)
+            if model_error or error_gemini_transitorio(exc):
+                continue
+            raise
 
     raise RuntimeError(
         f"No fue posible usar un modelo Gemini disponible para la valuación. Último error: {last_error}"
@@ -3576,6 +3627,7 @@ def resolver_items(
     force_new_price_codes: set[str] | None = None,
     api_key: str | None = None,
     model_name: str | None = None,
+    progress_callback=None,
 ) -> list[dict]:
     """Resuelve actividades en dos etapas: referencias Python + precio final Gemini."""
     if not api_key:
@@ -3584,9 +3636,11 @@ def resolver_items(
         raise RuntimeError("Falta GEMINI_API_KEY para finalizar la valuación de precios.")
     model_name = model_name or "gemini-3.6-flash"
 
+    actualizar_progreso(progress_callback, 52, "3/4 · Consultando historial interno y referencias CDMX")
     reference_packets, refs_by_code = _preparar_referencias_para_valuacion(
         db, result, project_data, params, force_new_price_codes=force_new_price_codes
     )
+    actualizar_progreso(progress_callback, 62, "3/4 · Referencias listas; preparando valuación final")
     valuation = valorar_precios_ia(
         api_key=api_key,
         model_name=model_name,
@@ -3594,6 +3648,10 @@ def resolver_items(
         params=params,
         result=result,
         reference_packets=reference_packets,
+        progress_callback=(
+            (lambda _pct, msg: actualizar_progreso(progress_callback, 72, msg))
+            if progress_callback is not None else None
+        ),
     )
     valuations = {
         x.codigo.strip().upper(): x for x in valuation.valuaciones
@@ -6839,59 +6897,104 @@ if "generated" not in st.session_state:
             "guide_text": guide_text.strip(),
         }
 
-        with st.spinner("Generando presupuesto..."):
-            try:
-                result = generar_presupuesto_ia(
-                    api_key=api_key,
-                    model_name=model_name,
-                    project_data=project_data,
-                    params=params,
-                )
-                result = auditar_estructura_presupuesto_ia(
-                    api_key=api_key,
-                    model_name=model_name,
-                    project_data=project_data,
-                    result=result,
-                )
-                items = resolver_items(
-                    db, result, project_data, params, api_key=api_key, model_name=model_name
-                )
-                if not items:
-                    raise RuntimeError("La IA no generó actividades utilizables.")
+        if st.session_state.get("generation_in_progress", False):
+            st.warning("Ya hay una generación en curso. Espera a que termine.")
+            st.stop()
 
-                financials = calcular_financieros(items, params)
-                provisional_code = db.next_project_code(
-                    project_data["name"],
-                    project_data["location"],
-                )
-                excel_bytes = crear_excel(
-                    project_code=provisional_code,
-                    project_data=project_data,
-                    result=result,
-                    items=items,
-                    params=params,
-                    version=1,
-                )
+        st.session_state["generation_in_progress"] = True
+        overlay = st.empty()
+        overlay.markdown(
+            """
+            <style>
+            div[data-testid="stAppViewContainer"]::before {
+                content: "Generando presupuesto...";
+                position: fixed;
+                inset: 0;
+                background: rgba(255,255,255,0.78);
+                z-index: 999999;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 1.15rem;
+                font-weight: 600;
+                color: #222;
+                pointer-events: all;
+                cursor: wait;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        progress_bar = st.progress(0)
+        progress_text = st.empty()
 
-                st.session_state["generated"] = {
-                    "project_id": None,
-                    "budget_id": None,
-                    "saved": False,
-                    "pending_revision": False,
-                    "project_code": provisional_code,
-                    "version": 1,
-                    "project_data": project_data,
-                    "params": params,
-                    "result": result.model_dump(),
-                    "items": items,
-                    "financials": financials,
-                    "excel_bytes": excel_bytes,
-                    "revision_history": [],
-                    "pending_revision_notes": [],
-                }
-                st.rerun()
-            except Exception as exc:
-                st.exception(exc)
+        def ui_progress(pct: int, message: str):
+            # La UI principal conserva solo una barra: la información de estado va debajo.
+            progress_bar.progress(max(0, min(int(pct), 100)))
+            progress_text.markdown(f"**{pct}%** · {message}")
+
+        try:
+            ui_progress(3, "Validando datos y preparando el proyecto")
+            ui_progress(8, "1/4 · Enviando el alcance completo a Gemini")
+            result = generar_presupuesto_ia(
+                api_key=api_key,
+                model_name=model_name,
+                project_data=project_data,
+                params=params,
+                progress_callback=lambda _pct, msg: ui_progress(10, msg),
+            )
+
+            ui_progress(38, "2/4 · Revisando partidas, subpartidas y secuencia de obra")
+            result = auditar_estructura_presupuesto_ia(
+                api_key=api_key,
+                model_name=model_name,
+                project_data=project_data,
+                result=result,
+                progress_callback=lambda _pct, msg: ui_progress(40, msg),
+            )
+
+            ui_progress(52, "3/4 · Buscando precios históricos y referencias CDMX")
+            items = resolver_items(
+                db, result, project_data, params,
+                api_key=api_key,
+                model_name=model_name,
+                progress_callback=lambda pct, msg: ui_progress(max(52, min(pct, 92)), msg),
+            )
+            if not items:
+                raise RuntimeError("La IA no generó actividades utilizables.")
+
+            ui_progress(93, "Calculando importes y preparando el Excel")
+            financials = calcular_financieros(items, params)
+            provisional_code = db.next_project_code(
+                project_data["name"], project_data["location"]
+            )
+            excel_bytes = crear_excel(
+                project_code=provisional_code, project_data=project_data, result=result,
+                items=items, params=params, version=1,
+            )
+
+            ui_progress(100, "Presupuesto terminado")
+            st.session_state["generated"] = {
+                "project_id": None, "budget_id": None, "saved": False,
+                "pending_revision": False, "project_code": provisional_code, "version": 1,
+                "project_data": project_data, "params": params,
+                "result": result.model_dump(), "items": items, "financials": financials,
+                "excel_bytes": excel_bytes, "revision_history": [], "pending_revision_notes": [],
+            }
+            st.session_state["generation_in_progress"] = False
+            st.rerun()
+        except Exception as exc:
+            st.session_state["generation_in_progress"] = False
+            overlay.empty()
+            progress_text.empty()
+            progress_bar.empty()
+            if error_gemini_transitorio(exc):
+                st.error(
+                    "Gemini sigue saturado después de varios reintentos. "
+                    "Espera un momento y vuelve a intentarlo; no se creó un presupuesto incompleto."
+                )
+            else:
+                st.error(f"No fue posible generar el presupuesto: {exc}")
 
 
 # =========================================================
