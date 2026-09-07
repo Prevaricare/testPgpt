@@ -2697,14 +2697,28 @@ def actualizar_progreso(progress_callback, porcentaje: int, mensaje: str):
         pass
 
 
-def error_gemini_transitorio(exc: Exception) -> bool:
+def error_gemini_modelo_no_disponible(exc: Exception) -> bool:
+    """Detecta errores que indican que el modelo solicitado no está disponible."""
     msg = str(exc).upper()
-    transient_markers = (
-        "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
-        "500", "INTERNAL", "502", "BAD GATEWAY", "504", "GATEWAY TIMEOUT",
-        "TIMEOUT", "DEADLINE_EXCEEDED",
-    )
-    return any(marker in msg for marker in transient_markers)
+    return any(marker in msg for marker in (
+        "404", "NOT_FOUND", "MODEL_NOT_FOUND", "MODEL IS NOT AVAILABLE",
+        "MODEL NOT AVAILABLE", "NO LONGER AVAILABLE", "UNKNOWN MODEL",
+    ))
+
+
+def error_gemini_transitorio(exc: Exception) -> bool:
+    """Indica que conviene repetir la misma solicitud Gemini."""
+    msg = str(exc).upper()
+    return any(marker in msg for marker in (
+        "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL",
+        "502", "BAD GATEWAY", "504", "GATEWAY TIMEOUT", "TIMEOUT",
+        "DEADLINE_EXCEEDED", "SERVICE UNAVAILABLE", "TEMPORARILY UNAVAILABLE",
+        "HIGH DEMAND",
+    ))
+
+
+MAX_REINTENTOS_GEMINI = 12
+DELAY_REINTENTO_GEMINI_SEG = 10
 
 
 def generar_con_gemini_resistente(
@@ -2714,33 +2728,50 @@ def generar_con_gemini_resistente(
     config,
     progress_callback=None,
     etapa: str = "Procesando",
-    max_reintentos_transitorios: int = 3,
+    max_reintentos_transitorios: int = MAX_REINTENTOS_GEMINI,
 ):
-    """Una llamada Gemini con reintentos controlados para saturación y errores temporales."""
+    """
+    Ejecuta una etapa Gemini sin abandonarla por saturación temporal.
+
+    Política: hasta 12 intentos para errores transitorios, esperando 10 s entre
+    cada intento. Los errores de modelo inexistente (404/NOT_FOUND) se propagan
+    inmediatamente para que el nivel superior pruebe otro modelo.
+    """
     ultimo_error = None
+
     for intento in range(1, max_reintentos_transitorios + 1):
         try:
             actualizar_progreso(
                 progress_callback,
                 0,
-                f"{etapa} · modelo {model} · intento {intento}/{max_reintentos_transitorios}",
+                f"{etapa} · {model} · intento {intento}/{max_reintentos_transitorios}",
             )
-            return client.models.generate_content(
-                model=model,
-                contents=contents,
-                config=config,
+            response = client.models.generate_content(
+                model=model, contents=contents, config=config
             )
+            if not getattr(response, "text", None):
+                raise RuntimeError(
+                    f"Gemini ({model}) devolvió una respuesta vacía."
+                )
+            return response
         except Exception as exc:
             ultimo_error = exc
-            if not error_gemini_transitorio(exc) or intento >= max_reintentos_transitorios:
+            if error_gemini_modelo_no_disponible(exc) or not error_gemini_transitorio(exc):
                 raise
-            espera = min(12.0, 1.8 * (2 ** (intento - 1)) + random.uniform(0.0, 0.8))
+            if intento >= max_reintentos_transitorios:
+                raise
+            siguiente = intento + 1
             actualizar_progreso(
                 progress_callback,
                 0,
-                f"{etapa} · Gemini está saturado; reintentando en {espera:.1f} s...",
+                (
+                    f"{etapa} · Gemini no respondió correctamente. "
+                    f"Esperando {DELAY_REINTENTO_GEMINI_SEG} s antes del intento "
+                    f"{siguiente}/{max_reintentos_transitorios}..."
+                ),
             )
-            time.sleep(espera)
+            time.sleep(DELAY_REINTENTO_GEMINI_SEG)
+
     raise ultimo_error if ultimo_error else RuntimeError("Error desconocido de Gemini.")
 
 
@@ -3147,6 +3178,7 @@ def revisar_presupuesto_ia(
     current_result: PresupuestoIA,
     current_items: list[dict],
     revision_request: str,
+    progress_callback=None,
 ) -> RevisionPresupuestoIA:
     """
     Ajusta el presupuesto vigente sin regenerarlo por completo.
@@ -3264,16 +3296,17 @@ INSTRUCCIONES
     last_error = None
     for model in modelos:
         try:
-            response = client.models.generate_content(
+            response = generar_con_gemini_resistente(
+                client=client,
                 model=model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=RevisionPresupuestoIA,
                 ),
+                progress_callback=progress_callback,
+                etapa="2/4 · Auditoría de estructura",
             )
-            if not response.text:
-                raise RuntimeError(f"Gemini ({model}) devolvió una revisión vacía.")
             return RevisionPresupuestoIA.model_validate_json(response.text)
         except Exception as exc:
             last_error = exc
@@ -6934,6 +6967,14 @@ if "generated" not in st.session_state:
             progress_text.markdown(f"**{pct}%** · {message}")
 
         try:
+            # Reinicia el checkpoint de esta corrida. Los resultados completos de
+            # cada etapa se conservan en session_state para que un fallo posterior
+            # no borre lo que ya se alcanzó a generar.
+            st.session_state["generation_checkpoint"] = {
+                "stage": 0,
+                "status": "iniciando",
+            }
+
             ui_progress(3, "Validando datos y preparando el proyecto")
             ui_progress(8, "1/4 · Enviando el alcance completo a Gemini")
             result = generar_presupuesto_ia(
@@ -6943,6 +6984,11 @@ if "generated" not in st.session_state:
                 params=params,
                 progress_callback=lambda _pct, msg: ui_progress(10, msg),
             )
+            st.session_state["generation_checkpoint"] = {
+                "stage": 1,
+                "status": "completada",
+                "result": result.model_dump(),
+            }
 
             ui_progress(38, "2/4 · Revisando partidas, subpartidas y secuencia de obra")
             result = auditar_estructura_presupuesto_ia(
@@ -6952,6 +6998,11 @@ if "generated" not in st.session_state:
                 result=result,
                 progress_callback=lambda _pct, msg: ui_progress(40, msg),
             )
+            st.session_state["generation_checkpoint"] = {
+                "stage": 2,
+                "status": "completada",
+                "result": result.model_dump(),
+            }
 
             ui_progress(52, "3/4 · Buscando precios históricos y referencias CDMX")
             items = resolver_items(
@@ -6962,6 +7013,12 @@ if "generated" not in st.session_state:
             )
             if not items:
                 raise RuntimeError("La IA no generó actividades utilizables.")
+            st.session_state["generation_checkpoint"] = {
+                "stage": 3,
+                "status": "completada",
+                "result": result.model_dump(),
+                "items": items,
+            }
 
             ui_progress(93, "Calculando importes y preparando el Excel")
             financials = calcular_financieros(items, params)
@@ -6985,16 +7042,23 @@ if "generated" not in st.session_state:
             st.rerun()
         except Exception as exc:
             st.session_state["generation_in_progress"] = False
+            checkpoint = st.session_state.get("generation_checkpoint") or {}
+            st.session_state["generation_last_error"] = str(exc)
             overlay.empty()
             progress_text.empty()
             progress_bar.empty()
+            stage = int(checkpoint.get("stage") or 0)
             if error_gemini_transitorio(exc):
                 st.error(
-                    "Gemini sigue saturado después de varios reintentos. "
-                    "Espera un momento y vuelve a intentarlo; no se creó un presupuesto incompleto."
+                    "Gemini no respondió después de los reintentos configurados. "
+                    f"Se conservó el avance hasta la etapa {stage}/4. "
+                    "Puedes volver a ejecutar la generación sin perder ese checkpoint."
                 )
             else:
-                st.error(f"No fue posible generar el presupuesto: {exc}")
+                st.error(
+                    "No fue posible completar la generación. "
+                    f"Se conservó el avance hasta la etapa {stage}/4. Detalle: {exc}"
+                )
 
 
 # =========================================================
