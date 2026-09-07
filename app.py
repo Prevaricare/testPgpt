@@ -2089,8 +2089,25 @@ def error_gemini_transitorio(exc: Exception) -> bool:
     ))
 
 
-MAX_REINTENTOS_GEMINI = 50
-DELAY_REINTENTO_GEMINI_SEG = 10
+MAX_REINTENTOS_GEMINI = 10
+DELAY_REINTENTO_GEMINI_SEG = 30
+
+# Modelos priorizados para reducir costo, latencia y consumo de TPM.
+# Gemini 3.1 Flash-Lite es el modelo principal recomendado para tareas de alto volumen.
+GEMINI_MODELOS_PRIORIDAD = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash",
+]
+GEMINI_MODELO_DEFAULT = GEMINI_MODELOS_PRIORIDAD[0]
+
+
+def generar_config_json(schema):
+    """Configuración compacta para salidas JSON y razonamiento mínimo."""
+    return types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=schema,
+        thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+    )
 
 
 def generar_con_gemini_resistente(
@@ -2105,7 +2122,7 @@ def generar_con_gemini_resistente(
     """
     Ejecuta una etapa Gemini sin abandonarla por saturación temporal.
 
-    Política: hasta 50 intentos para errores transitorios, esperando 10 s entre
+    Política: hasta 10 intentos para errores transitorios, esperando 30 s entre
     cada intento. Los errores de modelo inexistente (404/NOT_FOUND) se propagan
     inmediatamente para que el nivel superior pruebe otro modelo.
 
@@ -2164,209 +2181,49 @@ def generar_presupuesto_ia(
     level_criterion = criterio_nivel_presupuesto(budget_level)
 
     prompt = f"""
-Actúa como un INGENIERO DE COSTOS SENIOR de una empresa de remodelación de alto
-nivel, con experiencia en presupuestos residenciales y comerciales. La empresa
-opera principalmente en Ciudad de México y SUBCONTRATA prácticamente todas las
-actividades.
+Genera un presupuesto profesional de remodelación/interiorismo para CDMX.
+Actúa como ingeniero de costos. Convierte el alcance del cliente en actividades contratables.
 
-No te limites a copiar la lista del usuario. Interpreta el alcance como un
-profesional de costos, detecta trabajos indispensables y conviértelos en
-conceptos comerciales claros.
-
-CONFIGURACIÓN FIJA DE LA EMPRESA
-- Referencia de mercado: Ciudad de México, {year}.
-- Nivel comercial seleccionado: {budget_level}.
-- Criterio del nivel: {level_criterion}
-- El nivel afecta especificaciones, calidad y solución constructiva; NO apliques
-  un multiplicador arbitrario a todos los precios.
-- Cuando el alcance lo haga razonablemente necesario, contempla proyecto
-  ejecutivo, ingenierías, licencias, permisos o trámites aplicables.
-- Después de esta etapa Python buscará referencias históricas internas. Las referencias
-  internas validadas se usarán como anclas de máxima prioridad y se entregarán a una segunda
-  etapa de Gemini para la valuación final.
-- Los conceptos deben poder presentarse al cliente y servir para solicitar
-  cotizaciones a subcontratistas.
-
-DATOS DEL PROYECTO
+PROYECTO
 Cliente: {project_data['name']}
 Ubicación: {project_data['location'] or 'No indicada'}
-Tipo de obra: {project_data['project_type']}
-Nivel de presupuesto: {budget_level}
+Tipo: {project_data['project_type']}
+Nivel: {budget_level}
 
-DESCRIPCIÓN GENERAL DE LOS TRABAJOS
+DESCRIPCIÓN
 {project_data['description']}
 
-CONSIDERACIONES GENERALES DEL PROYECTO
-{project_data['guide_text'] or 'Sin consideraciones adicionales.'}
+GUÍA
+{project_data['guide_text'] or 'Sin guía adicional.'}
 
-PARÁMETROS COMERCIALES
+REGLAS CLAVE
+1. Revisa el alcance completo e incluye trabajos previos indispensables, pero no opciones no solicitadas.
+2. Separa actividades por área física. Usa General solo para trabajos realmente generales.
+3. Carpintería/mobiliario: muebles distintos = actividades distintas; unidades idénticas pueden compartir cantidad.
+4. Usa partidas comerciales amplias y subpartidas cortas. Ordena por secuencia constructiva real.
+5. titulo_comercial: corto y apto para cliente.
+6. concepto_base: nombre MUY genérico y estandarizado para históricos; sin medidas ni áreas. Ejemplos: "Piso de duela", "Mueble de TV carpintería a medida", "Pintura vinílica interior".
+7. descripcion_tecnica: específica, breve y útil para cotizar; indica qué se hace, dónde, especificación principal y qué incluye.
+8. Calcula cantidades cuando existan datos suficientes. No dejes unidad/cantidad vacías.
+9. costo_unitario_estimado: costo integrado de subcontratación en MXN antes de indirectos, utilidad e IVA.
+10. Respeta materiales, acabados, calidad, dimensiones y diseño indicados. Para trabajos variables marca requiere_cotizacion=True.
+11. No calcules indirectos, utilidad ni IVA; Python lo hará.
+12. porcentajes de materiales/mano de obra/otros: composición informativa cercana a 100 %.
+13. Devuelve solo datos necesarios para el esquema solicitado; no expliques tu razonamiento.
+
+PARÁMETROS
 Indirectos: {params['indirect_pct']:.2f}%
 Utilidad: {params['profit_pct']:.2f}%
 IVA: {params['iva_pct']:.2f}%
-Desperdicio general de referencia: {params['waste_pct']:.2f}%
+Desperdicio referencia: {params['waste_pct']:.2f}%
 
-REVISIÓN DEL ALCANCE
-1. Antes de generar conceptos, revisa el proyecto completo y detecta:
-   a) trabajos solicitados explícitamente;
-   b) trabajos previos indispensables;
-   c) trabajos complementarios necesarios para entregar correctamente lo pedido;
-   d) proyecto, ingenierías, licencias o permisos previsibles por el tipo de obra.
-2. DESGLOSA LOS TRABAJOS POR ÁREA Y POR ALCANCE CONTRATABLE. No conviertas el
-   presupuesto en un APU ni generes una fila por material, herramienta o cuadrilla,
-   pero tampoco combines trabajos de espacios distintos solamente porque sean del
-   mismo oficio. Cada actividad debe pertenecer a UNA sola área física específica.
-
-   REGLA OBLIGATORIA DE ÁREAS:
-   - Si existe Cocina, Baño 1, Baño 2 y Baño 3, la albañilería de cada espacio debe
-     aparecer como actividades independientes, aunque técnicamente sea el mismo oficio.
-   - Aplica el mismo criterio a pintura, instalaciones, acabados, demolición, cancelería,
-     carpintería y cualquier otro trabajo cuando el alcance corresponda a áreas distintas.
-   - Usa area="General" únicamente para trabajos que realmente abarcan el proyecto
-     completo o no pertenecen a un espacio particular, por ejemplo protección general,
-     acarreos generales, limpieza final o trámites globales.
-   - No repartas porcentualmente una sola actividad entre varias áreas. Si un trabajo se
-     ejecuta en varias áreas identificables, crea una actividad independiente por área.
-   - Dentro de una misma área puedes mantener integrado un alcance que naturalmente se
-     cotice como un solo servicio, siempre que siga siendo claro qué se está contratando.
-
-   REGLA ADICIONAL — CARPINTERÍA Y MOBILIARIO:
-   Los muebles, módulos o elementos de carpintería DISTINTOS no deben agruparse
-   dentro de una sola actividad únicamente por pertenecer al mismo espacio o al
-   mismo proveedor. Cada tipo, modelo, diseño, función, especificación o dimensión
-   materialmente distinta debe convertirse en una actividad independiente con su
-   propio costo unitario.
-
-   - Si existen varias unidades IDÉNTICAS, pueden mantenerse en una sola actividad
-     usando cantidad mayor a 1.
-   - Si existen unidades diferentes, deben separarse aunque estén en la misma área.
-   - No uses LOTE para mezclar muebles distintos cuando el usuario permita
-     identificar cada mueble o tipo de mueble.
-   - Para mobiliario individual usa preferentemente PZA cuando sea coherente con
-     la forma de cotización.
-   - titulo_comercial y subpartida deben permitir reconocer qué mueble se está
-     cobrando sin tener que leer toda la descripcion_tecnica.
-
-   Ejemplo conceptual: si el alcance indica dos muebles de un tipo y uno de otro
-   tipo, genera dos actividades: una con cantidad 2 para el primer tipo y otra
-   con cantidad 1 para el segundo. No combines ambos tipos en una sola actividad.
-
-3. No omitas un trabajo indispensable solo porque no fue escrito literalmente.
-   Si la inclusión es inferida, indícalo brevemente en fundamento_inclusion o
-   consideraciones.
-4. No agregues trabajos opcionales o decorativos ajenos al alcance.
-
-PARTIDAS Y SUBPARTIDAS
-5. Usa preferentemente, cuando correspondan:
-   - PROYECTO Y TRÁMITES
-   - PRELIMINARES Y PROTECCIONES
-   - DESMONTAJES Y DEMOLICIONES
-   - ALBAÑILERÍA Y ESTRUCTURA
-   - INSTALACIONES ELÉCTRICAS
-   - INSTALACIONES HIDROSANITARIAS
-   - ACABADOS Y RECUBRIMIENTOS
-   - CARPINTERÍA
-   - CANCELERÍA Y HERRERÍA
-   - EXTERIORES Y AMENIDADES
-   - LIMPIEZA Y ENTREGA
-   Puedes crear otras partidas si el proyecto realmente lo requiere.
-   Clasifica cada actividad por la NATURALEZA PRINCIPAL del trabajo y por el
-   elemento o sistema que realmente se entrega. No uses palabras secundarias,
-   propiedades del material o adjetivos técnicos para decidir la partida.
-   PRELIMINARES Y PROTECCIONES se usa únicamente cuando el propósito principal
-   sea preparar o proteger TEMPORALMENTE la obra.
-   LIMPIEZA Y ENTREGA se reserva únicamente para limpieza final y cierre.
-6. orden_ejecucion debe representar la secuencia constructiva real del conjunto.
-   No copies el orden en que el usuario enumeró las tareas. Considera dependencias
-   entre actividades y deja la limpieza/entrega al final.
-7. subpartida se muestra en el Excel. Debe ser corta, legible, sin numeración y
-   normalmente de 1 a 5 palabras. Ejemplos: Licencias, Pisos, Muros, Frentes,
-   Módulo Refri, Barra, Retiros.
-8. titulo_comercial debe ser corto y apto para cliente. Puede repetirse si el
-   mismo tipo de trabajo corresponde a áreas distintas.
-9. area debe identificar exactamente el espacio de ejecución: Cocina, Baño 1,
-   Baño 2, Recámara 1, Fachada, etc. Usa General solo cuando corresponda realmente.
-10. descripcion_tecnica debe indicar qué se hace, dónde, especificación principal
-   y qué incluye, sin volverse excesivamente larga. Menciona el área también dentro
-   de la descripción para que el concepto siga siendo entendible fuera del Excel.
-11. concepto_base DEBE ser un nombre extremadamente simple y genérico para tu base
-   de datos histórica. Evita medidas, colores específicos o áreas. Ejemplos correctos:
-   "Cocina integral acabados premium", "Mueble de TV carpintería a medida",
-   "Pintura vinílica interior".
-12. codigo_sugerido es interno.
-
-CANTIDADES Y METRAJES
-10. Calcula M2, ML, M3, PZA u otras cantidades cuando las dimensiones aportadas
-    permitan hacerlo de forma justificable. En muebles o módulos de carpintería
-    claramente individualizables, conserva por separado cada tipo distinto y usa
-    la cantidad para repetir únicamente unidades realmente equivalentes.
-11. Si el usuario pide "promediar", utiliza una estimación razonable y explica
-    brevemente el criterio.
-12. Si faltan datos, NO dejes vacíos cantidad ni unidad. Analiza el contexto completo
-    del proyecto, del área y de la actividad y completa con una aproximación profesional.
-    Si existe base suficiente usa M2, ML o M3; para elementos individuales usa PZA;
-    para conjuntos coherentes usa JGO; para trabajos globales o imposibles de metrar
-    razonablemente usa LOTE. Indica el criterio y la confianza. No inventes precisión falsa.
-13. Al finalizar, TODA actividad debe tener unidad, cantidad y costo_unitario_estimado
-    mayores o iguales a cero. Un cero solo es válido cuando el alcance o el texto guía
-    lo exige explícitamente, por ejemplo una demolición indicada a costo cero.
-
-ACABADOS Y ESPECIFICACIONES
-14. Los acabados, materiales, herrajes, calidad, dimensiones, diseño y condiciones
-    especiales mencionados por el usuario forman PARTE DEL CONCEPTO que se va a valuar.
-    No los ignores ni los dejes como notas aisladas. La descripcion_tecnica debe incluir
-    las especificaciones que cambian materialmente el costo y costo_unitario_estimado
-    debe reflejar esas especificaciones.
-15. Si un acabado o solución particular eleva o reduce el costo, modifica la estimación
-    de esa actividad, no el presupuesto completo mediante un multiplicador general.
-
-COSTOS Y MERCADO
-16. costo_unitario_estimado es una primera estimación del COSTO integrado de
-    SUBCONTRATACIÓN, antes de indirectos, utilidad e IVA. Debe representar un paquete
-    que razonablemente podría cotizar un proveedor, incluyendo materiales, mano de obra,
-    equipo, desperdicio aplicable, logística y costos normales del servicio cuando correspondan.
-17. Los costos deben ser razonables para el mercado de CDMX en {year} y coherentes con
-    las especificaciones reales del concepto y con el nivel {budget_level}. No uses
-    multiplicadores generales por nivel.
-18. En trabajos especializados o muy variables, usa una estimación prudente,
-    requiere_cotizacion=True y confianza de precio baja.
-19. No calcules indirectos, utilidad, venta, margen ni IVA; Python lo hará.
-
-DESGLOSE INTERNO
-17. porcentaje_materiales, porcentaje_mano_obra y porcentaje_otros son una
-    DESCOMPOSICIÓN ESTIMADA e informativa del costo integrado y deben sumar
-    aproximadamente 100 %. No cambian el costo total.
-18. En servicios profesionales, trámites o paquetes donde no sea razonable
-    separar materiales y mano de obra, asigna la mayor parte a porcentaje_otros
-    en vez de inventar una división.
-19. desperdicio_materiales_pct es una referencia sobre materiales. El costo
-    integrado ya debe contemplar desperdicio aplicable; NO se suma nuevamente.
-
-PROYECTO EJECUTIVO Y TRÁMITES
-20. Evalúa automáticamente ampliaciones, modificaciones estructurales, nuevas
-    losas, escaleras, cambios relevantes de fachada, instalaciones mayores y
-    otras obras que razonablemente requieran proyecto, ingenierías o permisos.
-21. Incluye esos conceptos solamente cuando sean previsibles para el alcance.
-    Para una remodelación pequeña no agregues trámites por rutina.
-
-CONTROL DE CALIDAD
-22. No dupliques conceptos dentro de la MISMA área y con el mismo alcance.
-    El mismo oficio en áreas distintas NO es un duplicado y debe permanecer separado.
-23. Para cada actividad da criterio_cantidad y fundamento_inclusion breves.
-24. Concentra incertidumbres en datos_faltantes sin bloquear una estimación útil.
-26. No expongas cadenas de pensamiento ni razonamiento interno.
-27. CONTROL FINAL OBLIGATORIO: antes de responder revisa que no exista ninguna actividad
-    con area vacía, descripcion vacía, unidad vacía, cantidad vacía o costo_unitario_estimado
-    omitido. Si faltan datos, completa con el mejor criterio profesional disponible y
-    documenta brevemente la inferencia en criterio_cantidad o consideraciones.
+Genera todas las actividades necesarias con area, partida, subpartida, codigo_sugerido,
+orden_ejecucion, titulo_comercial, concepto_base, descripcion_tecnica, unidad, cantidad,
+costo_unitario_estimado, composición de costos, criterios, confianza, cotización y consideraciones.
 """
 
     modelos = []
-    for model in [
-        model_name,
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
-    ]:
+    for model in [model_name, *GEMINI_MODELOS_PRIORIDAD]:
         if model and model not in modelos:
             modelos.append(model)
 
@@ -2426,58 +2283,24 @@ def auditar_estructura_presupuesto_ia(
     ]
 
     prompt = f"""
-Actúa como AUDITOR DE PARTIDAS Y SECUENCIA DE OBRA.
-
-Revisa el presupuesto COMPLETO como un conjunto. No cambies actividades,
-cantidades, unidades, descripciones, especificaciones ni precios. Solo corrige:
-- partida;
-- subpartida;
-- orden_ejecucion.
-
-PROYECTO
-Tipo: {project_data['project_type']}
-Ubicación: {project_data['location']}
-Descripción:
-{project_data['description']}
+Audita ÚNICAMENTE la estructura de ejecución del presupuesto.
+No cambies alcance, cantidades, unidades, costos, títulos, concepto_base ni descripciones.
 
 ACTIVIDADES
 {json.dumps(activities, ensure_ascii=False, separators=(',', ':'))}
 
-CRITERIOS
-1. Clasifica por la naturaleza principal del trabajo y por el elemento, sistema
-   u oficio que realmente se entrega.
-2. No clasifiques usando palabras incidentales de la descripción, propiedades
-   del producto, tratamientos, resistencias, garantías o adjetivos técnicos.
-3. PRELIMINARES Y PROTECCIONES se reserva para trabajos temporales de preparación,
-   protección de áreas, trazos o instalaciones provisionales.
-4. LIMPIEZA Y ENTREGA se reserva para limpieza final, retiro de protecciones,
-   puesta a punto y cierre de obra.
-5. Un elemento permanente debe quedar en la partida que mejor represente el
-   trabajo permanente ejecutado.
-6. No copies el orden en que el usuario escribió las tareas. Revisa dependencias
-   constructivas reales entre todas las actividades.
-7. Trabajos previos deben anteceder a lo que depende de ellos; demoliciones a las
-   reconstrucciones; preparaciones e instalaciones ocultas a cierres y acabados;
-   elementos finales a sus soportes terminados; limpieza y entrega al final.
-8. Asigna orden_ejecucion creciente con espacios entre valores (10, 20, 30...).
-9. Actividades del mismo oficio pueden pertenecer a áreas distintas. No las trates
-   como duplicadas ni homogeneices su clasificación de forma que se pierda la
-   distinción entre Cocina, Baño 1, Baño 2, Recámara, etc.
-10. En CARPINTERÍA/MOBILIARIO considera además que actividades separadas pueden
-   representar muebles distintos del mismo espacio. No homogeneices títulos o
-   subpartidas de forma que se pierda la distinción entre esos muebles.
-11. Devuelve exactamente una entrada por cada código recibido y conserva el código.
-
-No incluyas explicaciones adicionales.
+REGLAS
+- Conserva exactamente un registro por codigo.
+- Clasifica partida por la naturaleza principal del trabajo.
+- subpartida: breve y clara.
+- Ordena según secuencia constructiva real: preparación/demolición → instalaciones y bases → acabados → cierre.
+- Separa áreas físicas distintas.
+- Separa muebles distintos aunque estén en la misma área.
+- No uses General salvo actividades realmente generales.
 """
 
     models = []
-    for model in [
-        model_name,
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
-    ]:
+    for model in [model_name, *GEMINI_MODELOS_PRIORIDAD]:
         if model and model not in models:
             models.append(model)
 
@@ -2591,87 +2414,38 @@ def revisar_presupuesto_ia(
     ]
 
     prompt = f"""
-Actúa como revisor técnico y de costos de un presupuesto de remodelación e interiorismo.
-NO vuelvas a generar el presupuesto desde cero. Trabaja únicamente sobre las actividades
-que necesiten cambiar.
+Revisa el presupuesto actual según la solicitud del usuario. No lo regeneres completo.
+Devuelve solo operaciones AGREGAR, MODIFICAR o ELIMINAR necesarias.
 
-DATOS DEL PROYECTO
+PROYECTO
 Cliente: {project_data['name']}
-Ubicación: {project_data['location']}
-Tipo de obra: {project_data['project_type']}
-Nivel de presupuesto: {project_data.get('budget_level', 'Medio-alto')}
+Ubicación: {project_data['location'] or 'No indicada'}
+Tipo: {project_data['project_type']}
+Nivel: {project_data.get('budget_level', 'Medio-alto')}
 
 DESCRIPCIÓN ORIGINAL
 {project_data['description']}
 
-TEXTO GUÍA
-{project_data['guide_text'] or 'Sin texto guía adicional.'}
+SOLICITUD DEL USUARIO
+{revision_request}
 
 PRESUPUESTO ACTUAL
 {json.dumps(presupuesto_actual, ensure_ascii=False, separators=(',', ':'))}
 
-ALCANCE ACTUAL
-{current_result.alcance_resumido}
-
-PETICIÓN DEL USUARIO
-{revision_request}
-
-INSTRUCCIONES
-1. Cambia solamente lo necesario para atender la petición. Todo lo demás debe conservarse.
-2. Puedes AGREGAR, MODIFICAR o ELIMINAR actividades.
-3. Para MODIFICAR o ELIMINAR usa exactamente el codigo_objetivo existente.
-4. Para AGREGAR y MODIFICAR devuelve la actividad completa; para ELIMINAR usa actividad=null.
-5. La petición puede ser sencilla. Ejemplos válidos:
-   - "falta considerar limpieza fina";
-   - "el precio de pintura está muy bajo, revísalo";
-   - "esta cantidad debería ser mayor";
-   - "cambia el tipo de cancelería";
-   - "elimina este trabajo".
-6. Si el usuario indica que un precio está alto, bajo o pide revisarlo, modifica únicamente
-   el costo_unitario_estimado de la actividad afectada salvo que también solicite otro cambio.
-   En ese caso usa recalcular_precio=True y propón un nuevo costo razonable con base en la
-   descripción, especificación, unidad, ubicación y contexto del proyecto.
-7. Si el usuario proporciona un precio concreto, úsalo como costo_unitario_estimado y marca
-   recalcular_precio=True.
-8. Si cambia cantidad, descripción o detalle pero el costo unitario puede mantenerse, usa
-   recalcular_precio=False.
-9. Si cambia materialmente especificación, unidad, calidad o naturaleza del servicio, usa
-   recalcular_precio=True.
-10. Para actividades nuevas usa recalcular_precio=True.
-11. No modifiques precios no mencionados ni hagas ajustes generales por iniciativa propia.
-12. No desarrolles APU de materiales, herramientas o cuadrillas salvo que la petición
-    lo requiera expresamente. Sin embargo, mantén SIEMPRE separados los trabajos de
-    áreas físicas distintas. Una actividad debe corresponder a una sola área; si el
-    mismo oficio aparece en Cocina, Baño 1 y Baño 2, deben existir actividades separadas.
-    Usa area="General" solo para alcances verdaderamente generales.
-    En CARPINTERÍA y MOBILIARIO, además, no agrupes muebles distintos dentro
-    de una sola actividad. Si la petición incorpora varios muebles:
-    - unidades idénticas pueden usar una actividad con cantidad N;
-    - cada tipo/modelo/diseño/función/especificación o dimensión materialmente
-      distinta debe tener una actividad independiente y su propio costo unitario;
-    - no mezcles muebles diferentes en un solo LOTE cuando puedan identificarse
-      individualmente.
-13. Conserva la estructura comercial: area, partida amplia, subpartida corta,
-    titulo_comercial, concepto_base, descripción y orden_ejecucion. Si el usuario solo pide
-    revisar precio o cantidad, conserva esos campos salvo que el cambio realmente
-    afecte la naturaleza o dependencia de la actividad.
-13A. concepto_base debe seguir siendo genérico y estandarizado para el catálogo histórico;
-    no incluyas dimensiones ni ubicaciones específicas.
-14. Conserva el nivel comercial seleccionado del proyecto.
-15. porcentaje_materiales, porcentaje_mano_obra y porcentaje_otros son solamente
-    una composición estimada; mantenla coherente y cercana a 100 %.
-16. No calcules indirectos, utilidad, venta ni IVA; Python hará esos cálculos.
-17. Devuelve el alcance, consideraciones y datos faltantes completos y actualizados.
-18. En motivo escribe solo una explicación breve del cambio, sin razonamiento interno.
+REGLAS
+1. Conserva los datos que no necesiten cambio.
+2. Respeta áreas separadas; no fusiones oficios de áreas distintas.
+3. Carpintería/mobiliario: muebles distintos permanecen separados.
+4. concepto_base debe ser genérico, sin medidas ni ubicaciones específicas.
+5. descripcion_tecnica puede ser específica y apta para cliente.
+6. Cambia recalcular_precio=True solo cuando el alcance/especificación/unidad/naturaleza cambie materialmente.
+7. Para actividades nuevas, completa todos los campos de ActividadIA.
+8. No calcules indirectos, utilidad ni IVA.
+9. Motivo breve, sin razonamiento interno.
 """
 
     modelos = []
-    for model in [
-        model_name,
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
-    ]:
+    for model in [model_name, *GEMINI_MODELOS_PRIORIDAD]:
         if model and model not in modelos:
             modelos.append(model)
 
@@ -2682,10 +2456,7 @@ INSTRUCCIONES
                 client=client,
                 model=model,
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=RevisionPresupuestoIA,
-                ),
+                config=generar_config_json(RevisionPresupuestoIA),
                 progress_callback=progress_callback,
                 etapa="2/4 · Auditoría de estructura",
             )
@@ -2790,10 +2561,10 @@ def _preparar_referencias_para_valuacion(
             "partida": act.partida,
             "subpartida": act.subpartida,
             "titulo_comercial": act.titulo_comercial,
+            "concepto_base": act.concepto_base,
             "descripcion_tecnica": act.descripcion_tecnica,
             "unidad": act.unidad,
             "cantidad": float(act.cantidad),
-            "nivel_confianza_cantidad": act.nivel_confianza_cantidad,
             "requiere_cotizacion_inicial": bool(act.requiere_cotizacion),
             "costo_estimado_inicial_gemini": float(act.costo_unitario_estimado),
             "referencia_interna": None,
@@ -2837,77 +2608,35 @@ def valorar_precios_ia(
     level_criterion = criterio_nivel_presupuesto(budget_level)
 
     prompt = f"""
-Actúa como INGENIERO DE COSTOS SENIOR especializado en remodelación residencial y
-comercial en Ciudad de México. Esta es la SEGUNDA ETAPA de un presupuesto.
+Fija el costo unitario FINAL de subcontratación de cada actividad recibida.
+No hagas APU, no calcules indirectos/utilidad/IVA y no alteres unidad ni cantidad.
 
-Tu trabajo es fijar el COSTO UNITARIO FINAL RECOMENDADO DE SUBCONTRATACIÓN de cada
-actividad. Ese costo es el importe que razonablemente podría cobrar un proveedor
-por ejecutar el paquete descrito, antes de los indirectos y utilidad de nuestra
-empresa y antes de IVA.
-
-NO hagas APU ni desglose por material, cuadrilla o herramienta. Evalúa cada paquete
-comercial completo.
-
-PROYECTO
-Cliente: {project_data['name']}
+CONTEXTO
+Proyecto: {project_data['name']}
 Ubicación: {project_data['location'] or 'No indicada'}
 Tipo: {project_data['project_type']}
 Nivel: {budget_level}
-Criterio de nivel: {level_criterion}
-Año de referencia: {year}
+Año: {year}
 
-DESCRIPCIÓN ORIGINAL
+ALCANCE ORIGINAL
 {project_data['description']}
 
-TEXTO GUÍA
-{project_data['guide_text'] or 'Sin instrucciones adicionales.'}
-
-PARÁMETROS FINANCIEROS (NO LOS APLIQUES)
-Indirectos empresa: {params['indirect_pct']:.2f}%
-Utilidad empresa: {params['profit_pct']:.2f}%
-IVA: {params['iva_pct']:.2f}%
-
-REGLAS DE VALUACIÓN
-1. El costo final debe corresponder a SUBCONTRATACIÓN en CDMX, no al precio de venta
-   de nuestra empresa.
-2. La estimación inicial de Gemini es un punto de partida, NO una orden. Revísala y
-   corrígela cuando las especificaciones, dimensiones, complejidad o referencias lo exijan.
-3. Una referencia interna marcada como COSTO_REAL, VALIDADO o COTIZADO_PROVEEDOR es la
-   evidencia más importante. Úsala como ancla cuando realmente corresponda al mismo alcance,
-   pero verifica que la descripción, unidad y especificación sean comparables.
-4. Referencias internas de IA no validadas son solamente evidencia secundaria.
-5. Los acabados y especificaciones escritos en la descripción son OBLIGATORIOS para el precio.
-   No presupuestes una cocina, baño, vestidor, fachada, carpintería o cancelería genérica si
-   el usuario especificó materiales, herrajes, calidad, dimensiones, diseño o sistemas particulares.
-6. El nivel Económico/Medio/Medio-alto/Alto modifica PRINCIPALMENTE materiales, acabados,
-   herrajes, accesorios y soluciones cuya calidad cambia el costo. NO apliques un multiplicador
-   general al proyecto y NO subas o bajes automáticamente demolición, albañilería básica,
-   trámites, limpieza, acarreos o trabajos base cuando su especificación no cambia.
-7. Considera costos normales de subcontratación: materiales, mano de obra, equipo, desperdicio
-   aplicable, transporte/logística, fijaciones, consumibles, coordinación y riesgo razonable del
-   proveedor cuando formen parte natural del servicio.
-8. No uses precios artificialmente bajos por intentar encontrar una coincidencia exacta. Cuando
-   un trabajo sea especializado o tenga alta variabilidad, usa una estimación prudente y marca
-   requiere_cotizacion=True.
-9. Respeta la unidad y cantidad recibidas. No cambies cantidades ni unidades en esta etapa.
-10. No calcules indirectos, utilidad, margen, 30% de marca ni IVA. Python hará esos cálculos.
-11. Devuelve exactamente UNA valuación por cada código recibido. Ningún código puede quedar fuera.
-
-ACTIVIDADES Y REFERENCIAS
+ACTIVIDADES + REFERENCIAS
 {json.dumps(reference_packets, ensure_ascii=False, separators=(',', ':'))}
 
-Antes de responder revisa especialmente cocina, carpintería, baños, cancelería, fachada,
-acabados especiales y cualquier concepto con especificaciones particulares. No asumas que una
-referencia genérica representa un trabajo especial.
+REGLAS
+1. Precio en MXN de subcontratación en CDMX, antes de indirectos y utilidad.
+2. Una referencia interna VALIDADO/COSTO_REAL/COTIZADO_PROVEEDOR comparable es el ancla principal.
+3. Históricos IA no validados son evidencia secundaria.
+4. Respeta especificaciones, calidad, dimensiones, materiales y complejidad descritos.
+5. No supongas que una referencia genérica representa un trabajo especial.
+6. Para trabajos muy variables/especializados, sé prudente y marca requiere_cotizacion=True.
+7. Devuelve exactamente una valuación por cada codigo.
+8. fundamento_precio breve; no expongas razonamiento interno.
 """
 
     models = []
-    for model in [
-        model_name,
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
-    ]:
+    for model in [model_name, *GEMINI_MODELOS_PRIORIDAD]:
         if model and model not in models:
             models.append(model)
 
@@ -2916,9 +2645,7 @@ referencia genérica representa un trabajo especial.
         try:
             response = generar_con_gemini_resistente(
                 client=client, model=model, contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json", response_schema=ValuacionPreciosIA
-                ),
+                config=generar_config_json(ValuacionPreciosIA),
                 progress_callback=progress_callback,
                 etapa="4/4 · Valuación final de precios",
             )
@@ -2959,7 +2686,7 @@ def resolver_items(
         api_key = get_api_key_runtime()
     if not api_key:
         raise RuntimeError("Falta GEMINI_API_KEY para finalizar la valuación de precios.")
-    model_name = model_name or "gemini-3.6-flash"
+    model_name = model_name or GEMINI_MODELO_DEFAULT
 
     actualizar_progreso(progress_callback, 52, "3/4 · Consultando historial interno")
     reference_packets, refs_by_code = _preparar_referencias_para_valuacion(
@@ -5934,7 +5661,7 @@ with st.sidebar:
         with st.expander("Configuración"):
             model_name = st.text_input(
                 "Modelo Gemini",
-                value="gemini-3.6-flash",
+                value=GEMINI_MODELO_DEFAULT,
                 key="model_name",
             )
 
