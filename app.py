@@ -2508,7 +2508,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-09-07-v18-qol"
+DATABASE_CACHE_VERSION = "2026-09-07-v20-checkpoint-retry"
 
 
 @st.cache_resource(show_spinner=False)
@@ -2717,7 +2717,7 @@ def error_gemini_transitorio(exc: Exception) -> bool:
     ))
 
 
-MAX_REINTENTOS_GEMINI = 12
+MAX_REINTENTOS_GEMINI = 50
 DELAY_REINTENTO_GEMINI_SEG = 10
 
 
@@ -2733,9 +2733,13 @@ def generar_con_gemini_resistente(
     """
     Ejecuta una etapa Gemini sin abandonarla por saturación temporal.
 
-    Política: hasta 12 intentos para errores transitorios, esperando 10 s entre
+    Política: hasta 50 intentos para errores transitorios, esperando 10 s entre
     cada intento. Los errores de modelo inexistente (404/NOT_FOUND) se propagan
     inmediatamente para que el nivel superior pruebe otro modelo.
+
+    Importante: un 429/503 NO cambia de modelo de inmediato. Se insiste con el
+    mismo modelo porque estos errores suelen ser temporales y cambiar de modelo
+    prematuramente puede provocar mas solicitudes y consumir cuota sin necesidad.
     """
     ultimo_error = None
 
@@ -6709,6 +6713,45 @@ if section == "Catálogo e historial":
 
 
 # =========================================================
+# CHECKPOINTS DE GENERACIÓN
+# =========================================================
+
+def firma_generacion(project_data: dict, params: dict, model_name: str) -> str:
+    """Firma estable para saber si un checkpoint corresponde a los mismos datos."""
+    payload = {
+        "project_data": project_data,
+        "params": params,
+        "model_name": model_name or "",
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def guardar_checkpoint_generacion(
+    *,
+    stage: int,
+    status: str,
+    input_signature: str,
+    result=None,
+    items=None,
+    mensaje: str = "",
+):
+    """Guarda el mayor avance alcanzado sin depender de que la siguiente etapa termine."""
+    checkpoint = dict(st.session_state.get("generation_checkpoint") or {})
+    checkpoint.update({
+        "stage": int(stage),
+        "status": status,
+        "input_signature": input_signature,
+        "mensaje": mensaje,
+        "updated_at": ahora_iso(),
+    })
+    if result is not None:
+        checkpoint["result"] = result.model_dump() if hasattr(result, "model_dump") else result
+    if items is not None:
+        checkpoint["items"] = items
+    st.session_state["generation_checkpoint"] = checkpoint
+
+
+# =========================================================
 # FORMULARIO INICIAL
 # =========================================================
 
@@ -6967,59 +7010,105 @@ if "generated" not in st.session_state:
             progress_text.markdown(f"**{pct}%** · {message}")
 
         try:
-            # Reinicia el checkpoint de esta corrida. Los resultados completos de
-            # cada etapa se conservan en session_state para que un fallo posterior
-            # no borre lo que ya se alcanzó a generar.
-            st.session_state["generation_checkpoint"] = {
-                "stage": 0,
-                "status": "iniciando",
-            }
+            input_signature = firma_generacion(project_data, params, model_name)
+            old_checkpoint = st.session_state.get("generation_checkpoint") or {}
+            same_input = old_checkpoint.get("input_signature") == input_signature
+            if not same_input:
+                guardar_checkpoint_generacion(
+                    stage=0,
+                    status="iniciando",
+                    input_signature=input_signature,
+                    mensaje="Preparando una nueva corrida.",
+                )
+                old_checkpoint = st.session_state["generation_checkpoint"]
 
-            ui_progress(3, "Validando datos y preparando el proyecto")
-            ui_progress(8, "1/4 · Enviando el alcance completo a Gemini")
-            result = generar_presupuesto_ia(
-                api_key=api_key,
-                model_name=model_name,
-                project_data=project_data,
-                params=params,
-                progress_callback=lambda _pct, msg: ui_progress(10, msg),
-            )
-            st.session_state["generation_checkpoint"] = {
-                "stage": 1,
-                "status": "completada",
-                "result": result.model_dump(),
-            }
+            stage = int(old_checkpoint.get("stage") or 0) if same_input else 0
+            checkpoint_result = old_checkpoint.get("result")
+            checkpoint_items = old_checkpoint.get("items")
 
-            ui_progress(38, "2/4 · Revisando partidas, subpartidas y secuencia de obra")
-            result = auditar_estructura_presupuesto_ia(
-                api_key=api_key,
-                model_name=model_name,
-                project_data=project_data,
-                result=result,
-                progress_callback=lambda _pct, msg: ui_progress(40, msg),
-            )
-            st.session_state["generation_checkpoint"] = {
-                "stage": 2,
-                "status": "completada",
-                "result": result.model_dump(),
-            }
+            # ETAPA 1 -------------------------------------------------------
+            if stage >= 1 and checkpoint_result:
+                result = PresupuestoIA.model_validate(checkpoint_result)
+                ui_progress(25, "1/4 · Recuperando estructura ya generada")
+            else:
+                ui_progress(3, "Validando datos y preparando el proyecto")
+                ui_progress(8, "1/4 · Enviando el alcance completo a Gemini")
+                result = generar_presupuesto_ia(
+                    api_key=api_key,
+                    model_name=model_name,
+                    project_data=project_data,
+                    params=params,
+                    progress_callback=lambda _pct, msg: ui_progress(10, msg),
+                )
+                guardar_checkpoint_generacion(
+                    stage=1,
+                    status="completada",
+                    input_signature=input_signature,
+                    result=result,
+                    mensaje="Estructura base generada.",
+                )
+                stage = 1
 
-            ui_progress(52, "3/4 · Buscando precios históricos y referencias CDMX")
-            items = resolver_items(
-                db, result, project_data, params,
-                api_key=api_key,
-                model_name=model_name,
-                progress_callback=lambda pct, msg: ui_progress(max(52, min(pct, 92)), msg),
-            )
-            if not items:
-                raise RuntimeError("La IA no generó actividades utilizables.")
-            st.session_state["generation_checkpoint"] = {
-                "stage": 3,
-                "status": "completada",
-                "result": result.model_dump(),
-                "items": items,
-            }
+            # ETAPA 2 -------------------------------------------------------
+            checkpoint = st.session_state.get("generation_checkpoint") or {}
+            if stage >= 2 and checkpoint.get("result"):
+                result = PresupuestoIA.model_validate(checkpoint["result"])
+                ui_progress(45, "2/4 · Recuperando auditoría de partidas")
+            else:
+                ui_progress(38, "2/4 · Revisando partidas, subpartidas y secuencia de obra")
+                result = auditar_estructura_presupuesto_ia(
+                    api_key=api_key,
+                    model_name=model_name,
+                    project_data=project_data,
+                    result=result,
+                    progress_callback=lambda _pct, msg: ui_progress(40, msg),
+                )
+                guardar_checkpoint_generacion(
+                    stage=2,
+                    status="completada",
+                    input_signature=input_signature,
+                    result=result,
+                    mensaje="Partidas, subpartidas y secuencia auditadas.",
+                )
+                stage = 2
 
+            # ETAPA 3 -------------------------------------------------------
+            checkpoint = st.session_state.get("generation_checkpoint") or {}
+            checkpoint_items = checkpoint.get("items")
+            if stage >= 3 and checkpoint_items:
+                items = checkpoint_items
+                ui_progress(78, "3/4 · Recuperando valuación de precios ya completada")
+            else:
+                ui_progress(52, "3/4 · Buscando precios históricos y referencias CDMX")
+                # Dejamos explícito que estamos trabajando en esta etapa antes de
+                # entrar a Gemini. Si la etapa 3 falla, las etapas 1 y 2 siguen
+                # guardadas y la siguiente corrida comenzará aquí.
+                guardar_checkpoint_generacion(
+                    stage=2,
+                    status="etapa_3_en_curso",
+                    input_signature=input_signature,
+                    result=result,
+                    mensaje="Consultando referencias y valuando precios.",
+                )
+                items = resolver_items(
+                    db, result, project_data, params,
+                    api_key=api_key,
+                    model_name=model_name,
+                    progress_callback=lambda pct, msg: ui_progress(max(52, min(pct, 92)), msg),
+                )
+                if not items:
+                    raise RuntimeError("La IA no generó actividades utilizables.")
+                guardar_checkpoint_generacion(
+                    stage=3,
+                    status="completada",
+                    input_signature=input_signature,
+                    result=result,
+                    items=items,
+                    mensaje="Precios valuados y partidas convertidas en items.",
+                )
+                stage = 3
+
+            # ETAPA 4 -------------------------------------------------------
             ui_progress(93, "Calculando importes y preparando el Excel")
             financials = calcular_financieros(items, params)
             provisional_code = db.next_project_code(
@@ -7030,6 +7119,14 @@ if "generated" not in st.session_state:
                 items=items, params=params, version=1,
             )
 
+            guardar_checkpoint_generacion(
+                stage=4,
+                status="completada",
+                input_signature=input_signature,
+                result=result,
+                items=items,
+                mensaje="Excel preparado.",
+            )
             ui_progress(100, "Presupuesto terminado")
             st.session_state["generated"] = {
                 "project_id": None, "budget_id": None, "saved": False,
@@ -7039,6 +7136,7 @@ if "generated" not in st.session_state:
                 "excel_bytes": excel_bytes, "revision_history": [], "pending_revision_notes": [],
             }
             st.session_state["generation_in_progress"] = False
+            st.session_state.pop("generation_last_error", None)
             st.rerun()
         except Exception as exc:
             st.session_state["generation_in_progress"] = False
@@ -7050,9 +7148,9 @@ if "generated" not in st.session_state:
             stage = int(checkpoint.get("stage") or 0)
             if error_gemini_transitorio(exc):
                 st.error(
-                    "Gemini no respondió después de los reintentos configurados. "
+                    "Gemini sigue rechazando temporalmente la solicitud después de todos los reintentos. "
                     f"Se conservó el avance hasta la etapa {stage}/4. "
-                    "Puedes volver a ejecutar la generación sin perder ese checkpoint."
+                    "Al volver a pulsar Generar presupuesto se reanudará desde el último checkpoint compatible."
                 )
             else:
                 st.error(
