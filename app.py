@@ -9,7 +9,7 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from collections.abc import Mapping
 
@@ -2029,21 +2029,38 @@ class AuditoriaEstructuraIA(BaseModel):
     actividades: list[ClasificacionActividadIA]
 
 
+class CambiosActividadIA(BaseModel):
+    # PATCH parcial: Gemini solo rellena lo que realmente cambia.
+    area: str | None = Field(default=None, description="Nueva Área; null = conservar")
+    partida: str | None = Field(default=None, description="Nueva Partida; null = conservar")
+    subpartida: str | None = Field(default=None, description="Nueva Subpartida; null = conservar")
+    titulo_comercial: str | None = Field(default=None, description="Nuevo título comercial; null = conservar")
+    concepto_base: str | None = Field(default=None, description="Nuevo concepto base; null = conservar")
+    descripcion_tecnica: str | None = Field(default=None, description="Nueva descripción técnica; null = conservar")
+    unidad: str | None = Field(default=None, description="Nueva unidad; null = conservar")
+    cantidad: float | None = Field(default=None, ge=0, description="Nueva cantidad; null = conservar")
+    costo_unitario_estimado: float | None = Field(default=None, ge=0, description="Nuevo costo unitario interno; null = conservar")
+    porcentaje_materiales: float | None = Field(default=None, ge=0, le=100, description="Nuevo porcentaje de materiales; null = conservar")
+    porcentaje_mano_obra: float | None = Field(default=None, ge=0, le=100, description="Nuevo porcentaje de mano de obra; null = conservar")
+    porcentaje_otros: float | None = Field(default=None, ge=0, le=100, description="Nuevo porcentaje de otros; null = conservar")
+    desperdicio_materiales_pct: float | None = Field(default=None, ge=0, le=50, description="Nuevo desperdicio; null = conservar")
+    orden_ejecucion: int | None = Field(default=None, ge=1, le=999, description="Nuevo orden constructivo; null = conservar")
+    requiere_cotizacion: bool | None = Field(default=None, description="Nueva marca de cotización; null = conservar")
+    consideraciones: str | None = Field(default=None, description="Nuevas consideraciones; null = conservar")
+    included: bool | None = Field(default=None, description="Activar/desactivar; null = conservar")
+    contract_lot: str | None = Field(default=None, description="Lote interno; null = conservar")
+
+
 class OperacionRevisionIA(BaseModel):
-    accion: str = Field(description="AGREGAR, MODIFICAR o ELIMINAR")
-    codigo_objetivo: str = Field(
-        default="",
-        description="Código exacto de la actividad actual para MODIFICAR o ELIMINAR"
-    )
-    actividad: ActividadIA | None = Field(
-        default=None,
-        description="Actividad completa resultante para AGREGAR o MODIFICAR; null para ELIMINAR"
-    )
-    recalcular_precio: bool = Field(
-        default=True,
-        description="True si el cambio altera materialmente el alcance o la base del costo unitario"
-    )
-    motivo: str = Field(description="Resumen técnico breve del cambio solicitado")
+    accion: str = Field(description="AGREGAR, MODIFICAR, ELIMINAR o MOVER")
+    codigo_objetivo: str = Field(default="", description="Código exacto actual cuando sea conocido")
+    fila_objetivo: int | None = Field(default=None, ge=1, description="Número 1-based de la fila del presupuesto mostrado en el contexto; respaldo del código")
+    texto_objetivo: str = Field(default="", description="Descripción breve usada para identificar la actividad si no hay código")
+    actividad: ActividadIA | None = Field(default=None, description="Actividad completa para AGREGAR; opcional en MODIFICAR si se usa cambios")
+    cambios: CambiosActividadIA | None = Field(default=None, description="Cambios parciales para MODIFICAR; solo incluir campos que cambian")
+    posicion: int | None = Field(default=None, ge=1, description="Nueva posición 1-based para MOVER; opcional")
+    recalcular_precio: bool = Field(default=False, description="True solo si el costo debe reevaluarse")
+    motivo: str = Field(default="", description="Resumen técnico breve del cambio solicitado")
 
 
 class RevisionPresupuestoIA(BaseModel):
@@ -2564,118 +2581,74 @@ def revisar_presupuesto_ia(
     revision_request: str,
     progress_callback=None,
 ) -> RevisionPresupuestoIA:
-    """
-    Ajusta el presupuesto vigente sin regenerarlo por completo.
-    La solicitud puede referirse a alcance, cantidades, descripciones o precios.
-    """
+    """Interpreta una petición libre como operaciones granulares sobre el presupuesto vigente."""
     client = genai.Client(api_key=api_key)
 
-    presupuesto_actual = [
-        {
-            "codigo": x["code"],
+    presupuesto_actual = []
+    for idx, x in enumerate(current_items, start=1):
+        presupuesto_actual.append({
+            "fila": idx,
+            "codigo": x.get("code", ""),
             "area": area_excel_item(x),
-            "partida": x["category"],
-            "subpartida": x["subcategory"],
-            "orden_ejecucion": x.get("execution_order", 500),
+            "partida": x.get("category", ""),
+            "subpartida": x.get("subcategory", ""),
             "titulo_comercial": titulo_comercial_item(x),
-            "descripcion": x["description"],
-            "unidad": x["unit"],
-            "cantidad": x["quantity"],
-            "costo_unitario_actual": x["unit_cost"],
-            "fuente_precio": x["price_source"],
-            "detalle_fuente": x.get("price_source_detail") or "",
-            "materiales_pct": x.get("material_share_pct", 0.0),
-            "mano_obra_pct": x.get("labor_share_pct", 0.0),
-            "otros_pct": x.get("other_share_pct", 100.0),
-            "desperdicio_materiales_pct": x.get("waste_reference_pct", 0.0),
-            "criterio_cantidad": x["quantity_criterion"],
-            "consideraciones": x["considerations"],
-        }
-        for x in current_items
-    ]
+            "descripcion": x.get("description", ""),
+            "unidad": x.get("unit", ""),
+            "cantidad": x.get("quantity", 0),
+            "precio_venta_unitario": x.get("unit_sale", 0),
+            "costo_unitario_actual": x.get("unit_cost", 0),
+            "orden_ejecucion": x.get("execution_order", 500),
+            "incluido": item_esta_incluido(x),
+            "fuente_precio": x.get("price_source", ""),
+            "consideraciones": x.get("considerations", ""),
+        })
 
     prompt = f"""
-Actúa como revisor técnico y de costos de un presupuesto de remodelación e interiorismo.
-NO vuelvas a generar el presupuesto desde cero. Trabaja únicamente sobre las actividades
-que necesiten cambiar.
+Actúa como EDITOR EXPERTO de un presupuesto de remodelación e interiorismo.
+Tu trabajo NO es regenerar el presupuesto. Debes interpretar la instrucción del usuario
+como cambios concretos sobre la tabla existente y devolver SOLO las operaciones necesarias.
 
 DATOS DEL PROYECTO
 Cliente: {project_data['name']}
 Ubicación: {project_data['location']}
 Tipo de obra: {project_data['project_type']}
-Nivel de presupuesto: {project_data.get('budget_level', 'Medio-alto')}
+Nivel: {project_data.get('budget_level', 'Medio-alto')}
 
-DESCRIPCIÓN ORIGINAL
-{project_data['description']}
-
-TEXTO GUÍA
-{project_data['guide_text'] or 'Sin texto guía adicional.'}
-
-PRESUPUESTO ACTUAL
+PRESUPUESTO ACTUAL (fila es 1-based y código es el identificador principal)
 {json.dumps(presupuesto_actual, ensure_ascii=False, separators=(',', ':'))}
 
-ALCANCE ACTUAL
-{current_result.alcance_resumido}
-
-PETICIÓN DEL USUARIO
+INSTRUCCIÓN DEL USUARIO
 {revision_request}
 
-INSTRUCCIONES
-1. Cambia solamente lo necesario para atender la petición. Todo lo demás debe conservarse.
-2. Puedes AGREGAR, MODIFICAR o ELIMINAR actividades.
-3. Para MODIFICAR o ELIMINAR usa exactamente el codigo_objetivo existente.
-4. Para AGREGAR y MODIFICAR devuelve la actividad completa; para ELIMINAR usa actividad=null.
-5. La petición puede ser sencilla. Ejemplos válidos:
-   - "falta considerar limpieza fina";
-   - "el precio de pintura está muy bajo, revísalo";
-   - "esta cantidad debería ser mayor";
-   - "cambia el tipo de cancelería";
-   - "elimina este trabajo".
-6. Si el usuario indica que un precio está alto, bajo o pide revisarlo, modifica únicamente
-   el costo_unitario_estimado de la actividad afectada salvo que también solicite otro cambio.
-   En ese caso usa recalcular_precio=True y propón un nuevo costo razonable con base en la
-   descripción, especificación, unidad, ubicación y contexto del proyecto.
-7. Si el usuario proporciona un precio concreto, úsalo como costo_unitario_estimado y marca
-   recalcular_precio=True.
-8. Si cambia cantidad, descripción o detalle pero el costo unitario puede mantenerse, usa
-   recalcular_precio=False.
-9. Si cambia materialmente especificación, unidad, calidad o naturaleza del servicio, usa
-   recalcular_precio=True.
-10. Para actividades nuevas usa recalcular_precio=True.
-11. No modifiques precios no mencionados ni hagas ajustes generales por iniciativa propia.
-12. No desarrolles APU de materiales, herramientas o cuadrillas salvo que la petición
-    lo requiera expresamente. Sin embargo, mantén SIEMPRE separados los trabajos de
-    áreas físicas distintas. Una actividad debe corresponder a una sola área; si el
-    mismo oficio aparece en Cocina, Baño 1 y Baño 2, deben existir actividades separadas.
-    Usa area="General" solo para alcances verdaderamente generales.
-    En CARPINTERÍA y MOBILIARIO, además, no agrupes muebles distintos dentro
-    de una sola actividad. Si la petición incorpora varios muebles:
-    - unidades idénticas pueden usar una actividad con cantidad N;
-    - cada tipo/modelo/diseño/función/especificación o dimensión materialmente
-      distinta debe tener una actividad independiente y su propio costo unitario;
-    - no mezcles muebles diferentes en un solo LOTE cuando puedan identificarse
-      individualmente.
-13. Conserva la estructura comercial: area, partida amplia, subpartida corta,
-    titulo_comercial, concepto_base, descripción y orden_ejecucion. Si el usuario solo pide
-    revisar precio o cantidad, conserva esos campos salvo que el cambio realmente
-    afecte la naturaleza o dependencia de la actividad.
-13A. concepto_base debe seguir siendo genérico y estandarizado para el catálogo histórico;
-    no incluyas dimensiones ni ubicaciones específicas.
-14. Conserva el nivel comercial seleccionado del proyecto.
-15. porcentaje_materiales, porcentaje_mano_obra y porcentaje_otros son solamente
-    una composición estimada; mantenla coherente y cercana a 100 %.
-16. No calcules indirectos, utilidad, venta ni IVA; Python hará esos cálculos.
-17. Devuelve el alcance, consideraciones y datos faltantes completos y actualizados.
-18. En motivo escribe solo una explicación breve del cambio, sin razonamiento interno.
+REGLAS DEL EDITOR
+1. Conserva TODO lo que el usuario no pida cambiar.
+2. Puedes AGREGAR, MODIFICAR, ELIMINAR y MOVER.
+3. Para MODIFICAR, usa codigo_objetivo. Si no es evidente, usa fila_objetivo o texto_objetivo para identificarla.
+4. Para MODIFICAR NO devuelvas la actividad completa: utiliza cambios y rellena únicamente los campos que cambian.
+5. Para AGREGAR sí devuelve actividad completa. Puedes generar una actividad nueva desde cero.
+6. Para ELIMINAR no necesitas actividad ni cambios.
+7. Para MOVER usa posicion para la nueva posición si el usuario indica dónde quiere colocarla.
+8. "Agrega X después de Y", "pon X antes de Y", "mueve X al final de Acabados" y solicitudes similares deben convertirse en MOVER/AGREGAR con una posición coherente.
+9. Puedes cambiar libremente Área, Partida, Subpartida, Título, descripción, unidad, cantidad,
+   costo unitario, composición, desperdicio, orden, cotización, consideraciones, activar/desactivar y lote.
+10. Si el usuario da un PRECIO DE VENTA concreto, no lo guardes como costo_unitario_estimado sin analizar el contexto:
+    este módulo trabaja principalmente con costo interno. Solo cambia costo_unitario_estimado cuando la petición hable de costo/precio de subcontratación o pida recalcularlo.
+11. Si el usuario dice que algo está caro/barato, revisa costo_unitario_estimado y usa recalcular_precio=True.
+12. Si solo cambia cantidad, texto, área o clasificación, recalcular_precio=False.
+13. Si cambia unidad, especificación/material, complejidad o naturaleza, recalcular_precio=True.
+14. Si el usuario aporta una cifra exacta de costo unitario, úsala como costo_unitario_estimado y recalcular_precio=True.
+15. No cambies precios no mencionados.
+16. No agrupes áreas físicas diferentes en una sola actividad.
+17. No agrupes muebles diferentes en una sola actividad cuando tengan función, modelo o especificación diferente.
+18. Mantén concepto_base genérico, sin dimensiones ni ubicación.
+19. No calcules indirectos, utilidad, IVA ni importes finales; Python los recalcula.
+20. La respuesta debe ser ejecutable. No expliques razonamientos internos.
+21. Si la petición es ambigua, haz el cambio más conservador posible y deja una consideración breve.
 """
 
     modelos = []
-    for model in [
-        model_name,
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
-    ]:
+    for model in [model_name, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]:
         if model and model not in modelos:
             modelos.append(model)
 
@@ -2691,24 +2664,22 @@ INSTRUCCIONES
                     response_schema=RevisionPresupuestoIA,
                 ),
                 progress_callback=progress_callback,
-                etapa="2/4 · Auditoría de estructura",
+                etapa="2/4 · Interpretando cambios",
             )
             return RevisionPresupuestoIA.model_validate_json(response.text)
         except Exception as exc:
             last_error = exc
             msg = str(exc).lower()
             model_error = (
-                "404" in msg
-                or "not_found" in msg
-                or "no longer available" in msg
-                or ("model" in msg and "not available" in msg)
+                "404" in msg or "not_found" in msg or
+                "no longer available" in msg or
+                ("model" in msg and "not available" in msg)
             )
             if not model_error:
                 raise
 
-    raise RuntimeError(
-        f"No fue posible usar un modelo Gemini para la revisión. Último error: {last_error}"
-    )
+    raise RuntimeError(f"No fue posible usar un modelo Gemini para la revisión. Último error: {last_error}")
+
 
 
 # =========================================================
@@ -3135,7 +3106,6 @@ def item_a_actividad(item: dict) -> ActividadIA:
         consideraciones=item.get("considerations") or "",
     )
 
-
 def aplicar_revision_estructural(
     db: Database,
     current_result: PresupuestoIA,
@@ -3146,179 +3116,203 @@ def aplicar_revision_estructural(
     api_key: str | None = None,
     model_name: str | None = None,
 ) -> tuple[PresupuestoIA, list[dict], list[str]]:
-    """
-    Aplica las operaciones devueltas por Gemini. Las actividades no mencionadas
-    se copian literalmente desde la versión anterior.
-    """
+    """Aplica operaciones granulares; MODIFICAR usa parches y nunca reemplaza campos no pedidos."""
     if not revision.operaciones:
+        raise RuntimeError("Gemini no identificó cambios aplicables.")
+
+    items = [dict(x) for x in current_items]
+    change_log: list[str] = []
+
+    def find_index(op: OperacionRevisionIA) -> int:
+        code = str(op.codigo_objetivo or "").strip().upper()
+        if code:
+            for i, item in enumerate(items):
+                if str(item.get("code") or "").strip().upper() == code:
+                    return i
+        if op.fila_objetivo is not None:
+            idx = int(op.fila_objetivo) - 1
+            if 0 <= idx < len(items):
+                return idx
+        target = normalizar_texto(op.texto_objetivo or "")
+        if target:
+            best_idx, best_score = None, 0.0
+            for i, item in enumerate(items):
+                hay = normalizar_texto(" ".join([
+                    str(item.get("subcategory") or ""),
+                    titulo_comercial_item(item),
+                    str(item.get("description") or ""),
+                ]))
+                score = score_similitud(target, hay)
+                if score > best_score:
+                    best_score, best_idx = score, i
+            if best_idx is not None and best_score >= 0.50:
+                return best_idx
         raise RuntimeError(
-            "Gemini no identificó operaciones estructurales. "
-            "Revise que la solicitud describa un cambio importante de alcance."
+            f"No pude identificar la actividad objetivo para la operación '{op.accion}'. "
+            f"Código='{op.codigo_objetivo}', fila='{op.fila_objetivo}', texto='{op.texto_objetivo}'."
         )
 
-    operations = []
-    activities_to_resolve = []
-    force_codes = set()
-
-    for op in revision.operaciones:
-        action = (op.accion or "").strip().upper()
-        if action not in {"AGREGAR", "MODIFICAR", "ELIMINAR"}:
-            raise RuntimeError(f"Acción de revisión no válida: {op.accion}")
-
-        if action in {"AGREGAR", "MODIFICAR"}:
-            if op.actividad is None:
-                raise RuntimeError(f"La acción {action} no contiene una actividad completa.")
-            activities_to_resolve.append(op.actividad)
-            if action == "AGREGAR" or op.recalcular_precio:
-                force_codes.add(
-                    limpiar_codigo(
-                        op.actividad.codigo_sugerido,
-                        f"REV-{len(activities_to_resolve):03d}",
-                    )
-                )
-
-        operations.append((action, op))
-
-    resolved_changes = []
-    if activities_to_resolve:
-        temp_result = PresupuestoIA(
+    def resolve_new_activity(act: ActividadIA, force_price: bool = True) -> dict:
+        temp = PresupuestoIA(
             nombre_proyecto=current_result.nombre_proyecto,
             actividad_principal=revision.actividad_principal_actualizada,
             alcance_resumido=revision.alcance_resumido_actualizado,
             consideraciones_generales=revision.consideraciones_generales_actualizadas,
             datos_faltantes=revision.datos_faltantes_actualizados,
-            actividades=activities_to_resolve,
+            actividades=[act],
         )
-        resolved_changes = resolver_items(
-            db,
-            temp_result,
-            project_data,
-            params,
-            force_new_price_codes=force_codes,
+        forced = {limpiar_codigo(act.codigo_sugerido, "REV-001")} if force_price else set()
+        resolved = resolver_items(
+            db, temp, project_data, params,
+            force_new_price_codes=forced,
             api_key=api_key,
             model_name=model_name,
         )
+        if not resolved:
+            raise RuntimeError("No fue posible resolver la actividad nueva.")
+        return dict(resolved[0])
 
-    items = [dict(x) for x in current_items]
-    resolved_index = 0
-    change_log = []
+    for op in revision.operaciones:
+        action = (op.accion or "").strip().upper()
+        if action not in {"AGREGAR", "MODIFICAR", "ELIMINAR", "MOVER"}:
+            raise RuntimeError(f"Acción de revisión no válida: {op.accion}")
 
-    def find_index(code: str) -> int:
-        code_n = (code or "").strip().upper()
-        for i, item in enumerate(items):
-            if str(item.get("code") or "").strip().upper() == code_n:
-                return i
-        raise RuntimeError(
-            f"La revisión hizo referencia al código '{code}', "
-            "pero ese código no existe en el presupuesto actual."
-        )
+        if action == "AGREGAR":
+            if op.actividad is None:
+                raise RuntimeError("Una operación AGREGAR necesita actividad completa.")
+            new_item = resolve_new_activity(op.actividad, force_price=True)
+            if op.posicion:
+                insert_at = max(0, min(int(op.posicion) - 1, len(items)))
+                items.insert(insert_at, new_item)
+                change_log.append(f"AGREGADO {new_item.get('code')}: {titulo_comercial_item(new_item)} en posición {insert_at + 1}")
+            else:
+                items.append(new_item)
+                change_log.append(f"AGREGADO {new_item.get('code')}: {titulo_comercial_item(new_item)}")
+            continue
 
-    for action, op in operations:
+        idx = find_index(op)
+        item = dict(items[idx])
+
         if action == "ELIMINAR":
-            idx = find_index(op.codigo_objetivo)
             removed = items.pop(idx)
-            change_log.append(
-                f"ELIMINADO {removed['code']}: {titulo_comercial_item(removed)}"
-            )
+            change_log.append(f"ELIMINADO {removed.get('code')}: {titulo_comercial_item(removed)}")
             continue
 
-        new_item = dict(resolved_changes[resolved_index])
-        resolved_index += 1
+        if action == "MOVER":
+            if op.posicion is None:
+                raise RuntimeError("MOVER necesita posicion.")
+            moved = items.pop(idx)
+            new_idx = max(0, min(int(op.posicion) - 1, len(items)))
+            items.insert(new_idx, moved)
+            moved["execution_order"] = (new_idx + 1) * 10
+            change_log.append(f"MOVIDO {moved.get('code')}: posición {idx + 1} → {new_idx + 1}")
+            continue
 
-        if action == "MODIFICAR":
-            idx = find_index(op.codigo_objetivo)
-            old_item = items[idx]
-            # Un ajuste con IA no debe reactivar una actividad que el usuario
-            # había marcado como "No" en Excel ni perder su lote interno.
-            new_item["included"] = item_esta_incluido(old_item)
-            new_item["contract_lot"] = str(old_item.get("contract_lot") or "1")
-
-            same_unit = (
-                str(new_item.get("unit") or "").strip().upper()
-                == str(old_item.get("unit") or "").strip().upper()
-            )
-            desc_similarity = SequenceMatcher(
-                None,
-                normalizar_texto(str(old_item.get("description") or "")),
-                normalizar_texto(str(new_item.get("description") or "")),
-            ).ratio()
-
-            preserve_old_price = not op.recalcular_precio and same_unit
-            if preserve_old_price:
-                for key in [
-                    "concept_id",
-                    "unit_cost",
-                    "price_source",
-                    "price_source_detail",
-                    "price_status",
-                    "price_confidence",
-                    "material_share_pct",
-                    "labor_share_pct",
-                    "other_share_pct",
-                    "waste_reference_pct",
-                ]:
-                    new_item[key] = old_item.get(key)
-                new_item = recalcular_item_financiero(new_item, params)
-            elif same_unit and desc_similarity >= 0.72:
-                # Es el mismo concepto con una nueva valoración (por ejemplo,
-                # "este precio está muy bajo"). Conservamos su identidad para
-                # registrar un nuevo precio histórico en lugar de duplicarlo.
-                new_item["concept_id"] = old_item.get("concept_id")
-                new_item["record_new_price"] = True
-
-            # Evita que una modificación cambie el código a uno que ya pertenece
-            # a otra actividad.
-            proposed = str(new_item["code"]).strip().upper()
-            conflicts = {
-                str(x.get("code") or "").strip().upper()
-                for j, x in enumerate(items)
-                if j != idx
+        # MODIFICAR: parche campo por campo.
+        patch = op.cambios.model_dump(exclude_none=True) if op.cambios is not None else {}
+        if op.actividad is not None and not patch:
+            # Compatibilidad con revisiones antiguas: convertir actividad completa en cambios,
+            # pero solo sobre los campos estructurales/cantidad/precio relevantes.
+            full = op.actividad.model_dump()
+            patch = {
+                "area": full["area"],
+                "partida": full["partida"],
+                "subpartida": full["subpartida"],
+                "titulo_comercial": full["titulo_comercial"],
+                "concepto_base": full["concepto_base"],
+                "descripcion_tecnica": full["descripcion_tecnica"],
+                "unidad": full["unidad"],
+                "cantidad": full["cantidad"],
+                "costo_unitario_estimado": full["costo_unitario_estimado"],
+                "porcentaje_materiales": full["porcentaje_materiales"],
+                "porcentaje_mano_obra": full["porcentaje_mano_obra"],
+                "porcentaje_otros": full["porcentaje_otros"],
+                "desperdicio_materiales_pct": full["desperdicio_materiales_pct"],
+                "orden_ejecucion": full["orden_ejecucion"],
+                "consideraciones": full["consideraciones"],
             }
-            if proposed in conflicts:
-                new_item["code"] = old_item["code"]
 
-            items[idx] = new_item
-            change_log.append(
-                f"MODIFICADO {old_item['code']}: {op.motivo.strip() or 'Cambio de alcance'}"
-            )
+        if not patch:
             continue
 
-        # AGREGAR
-        existing_codes = {
-            str(x.get("code") or "").strip().upper() for x in items
+        # Mapear nombres IA -> claves internas.
+        field_map = {
+            "area": "area_hint",
+            "partida": "category",
+            "subpartida": "subcategory",
+            "titulo_comercial": "commercial_title",
+            "concepto_base": "concepto_base",
+            "descripcion_tecnica": "description",
+            "unidad": "unit",
+            "cantidad": "quantity",
+            "costo_unitario_estimado": "unit_cost",
+            "porcentaje_materiales": "material_share_pct",
+            "porcentaje_mano_obra": "labor_share_pct",
+            "porcentaje_otros": "other_share_pct",
+            "desperdicio_materiales_pct": "waste_reference_pct",
+            "orden_ejecucion": "execution_order",
+            "requiere_cotizacion": "requires_quote",
+            "consideraciones": "considerations",
+            "included": "included",
+            "contract_lot": "contract_lot",
         }
-        base_code = str(new_item["code"]).strip().upper() or "REV"
-        candidate = base_code
-        counter = 2
-        while candidate in existing_codes:
-            candidate = f"{base_code}-{counter}"
-            counter += 1
-        new_item["code"] = candidate
+        old_desc = item.get("description")
+        for src, value in patch.items():
+            dst = field_map[src]
+            if dst == "category":
+                value = normalizar_seccion_comercial(value)
+            elif dst == "unit":
+                value = normalizar_unidad(value)
+            elif dst == "area_hint":
+                value = normalizar_nombre_area(value)
+            item[dst] = value
 
-        # Inserta después de la última actividad de la misma partida para
-        # mantener el Excel ordenado por bloques.
-        insert_at = len(items)
-        same_category = [
-            i for i, x in enumerate(items)
-            if str(x.get("category") or "").strip().upper()
-            == str(new_item.get("category") or "").strip().upper()
-        ]
-        if same_category:
-            insert_at = max(same_category) + 1
-        items.insert(insert_at, new_item)
-        change_log.append(
-            f"AGREGADO {new_item['code']}: {titulo_comercial_item(new_item)}"
-        )
+        # Recalcular costos solo cuando corresponde. Si cambia el costo explícitamente,
+        # el costo dado por el usuario/IA prevalece. Si no cambia costo, se conserva.
+        recalcular_precio = bool(op.recalcular_precio)
+        if "unidad" in patch and str(item.get("unit") or "") != str(current_items[idx].get("unit") or ""):
+            recalcular_precio = True
+        if recalcular_precio and "costo_unitario_estimado" not in patch:
+            # Resolver una nueva valuación usando la actividad ya modificada.
+            act = item_a_actividad(item)
+            temp = PresupuestoIA(
+                nombre_proyecto=current_result.nombre_proyecto,
+                actividad_principal=revision.actividad_principal_actualizada,
+                alcance_resumido=revision.alcance_resumido_actualizado,
+                consideraciones_generales=revision.consideraciones_generales_actualizadas,
+                datos_faltantes=revision.datos_faltantes_actualizados,
+                actividades=[act],
+            )
+            resolved = resolver_items(
+                db, temp, project_data, params,
+                force_new_price_codes={str(item.get("code"))},
+                api_key=api_key,
+                model_name=model_name,
+            )
+            if resolved:
+                item = dict(resolved[0])
+                item["included"] = item_esta_incluido(items[idx])
+                item["contract_lot"] = str(items[idx].get("contract_lot") or "1")
+
+        item = recalcular_item_financiero(item, params)
+        item = aplicar_composicion_costo(item)
+        item["included"] = item.get("included", True)
+        items[idx] = item
+        change_log.append(f"MODIFICADO {item.get('code')}: " + ", ".join(patch.keys()))
+
+    # La posición real de la lista es la fuente de verdad del orden.
+    # Esto evita que Excel vuelva a ordenar un elemento movido por un execution_order antiguo.
+    for i, item in enumerate(items, start=1):
+        item["execution_order"] = i * 10
 
     revised_result = PresupuestoIA(
         nombre_proyecto=current_result.nombre_proyecto,
-        actividad_principal=revision.actividad_principal_actualizada,
-        alcance_resumido=revision.alcance_resumido_actualizado,
-        consideraciones_generales=revision.consideraciones_generales_actualizadas,
-        datos_faltantes=revision.datos_faltantes_actualizados,
+        actividad_principal=revision.actividad_principal_actualizada or current_result.actividad_principal,
+        alcance_resumido=revision.alcance_resumido_actualizado or current_result.alcance_resumido,
+        consideraciones_generales=revision.consideraciones_generales_actualizadas or current_result.consideraciones_generales,
+        datos_faltantes=revision.datos_faltantes_actualizados or current_result.datos_faltantes,
         actividades=[item_a_actividad(x) for x in items],
     )
-
     return revised_result, items, change_log
 
 
@@ -4001,6 +3995,7 @@ def preparar_items_desde_editor_excel(
 
     updated = []
     used_codes = {str(item.get("code") or "").strip().upper() for item in current_items}
+    current_by_code = {str(item.get("code") or "").strip().upper(): dict(item) for item in current_items}
 
     for position, (_, row) in enumerate(editor_df.iterrows()):
         area = normalizar_nombre_area(str(row.get("Área") or "").strip())
@@ -4018,8 +4013,9 @@ def preparar_items_desde_editor_excel(
         if quantity <= 0:
             raise ValueError(f"La fila {position + 1} debe tener una Cantidad mayor a 0.")
 
-        if position < len(current_items):
-            item = dict(current_items[position])
+        internal_code = str(row.get("__code") or "").strip().upper()
+        if internal_code and internal_code in current_by_code:
+            item = dict(current_by_code[internal_code])
         else:
             idx = 1
             while f"MAN-{idx:03d}" in used_codes:
@@ -4092,6 +4088,209 @@ def preparar_items_desde_editor_excel(
     if not updated:
         raise ValueError("El editor no contiene actividades con información válida.")
     return recalcular_areas_items(project_data, updated)
+
+
+def _numero_excel_flexible(value, default=0.0) -> float:
+    """Lee números pegados desde Excel tanto con punto como con coma decimal."""
+    if value is None:
+        return float(default)
+    if isinstance(value, (int, float)):
+        return float(value)
+    raw = str(value).strip().replace("$", "").replace("%", "").replace(" ", "")
+    if not raw:
+        return float(default)
+    try:
+        if "," in raw and "." in raw:
+            # 1,234.56 -> 1234.56
+            raw = raw.replace(",", "")
+        elif "," in raw:
+            tail = raw.rsplit(",", 1)[-1]
+            if len(tail) <= 2:
+                raw = raw.replace(".", "").replace(",", ".")
+            else:
+                raw = raw.replace(",", "")
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _normalizar_encabezado_pegado(value) -> str:
+    return normalizar_texto(value).upper()
+
+
+def parsear_actividades_pegadas(texto: str) -> pd.DataFrame:
+    """Convierte un bloque pegado desde Excel en las 7 columnas del editor.
+
+    Acepta encabezados en cualquier orden, alias habituales y bloques sin encabezado.
+    Excel normalmente pega TSV, pero también se toleran ; y ,.
+    """
+    if not str(texto or "").strip():
+        raise ValueError("No hay datos para pegar.")
+
+    raw = str(texto).replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines = [line for line in raw.split("\n") if line.strip()]
+    if not lines:
+        raise ValueError("No hay filas utilizables.")
+
+    sample = lines[0]
+    if "\t" in sample:
+        sep = "\t"
+    elif ";" in sample:
+        sep = ";"
+    else:
+        sep = ","
+
+    rows = [line.split(sep) for line in lines]
+    target_cols = ["Área", "Partida", "Subpartida", "Descripción Técnica", "Unidad", "Cant.", "Precio Unitario (MXN)"]
+    aliases = {
+        "area": {"AREA", "ÁREA"},
+        "partida": {"PARTIDA"},
+        "subpartida": {"SUBPARTIDA"},
+        "description": {"DESCRIPCION TECNICA", "DESCRIPCION", "CONCEPTO", "DESCRIPCION DEL CONCEPTO", "CONCEPTO / DESCRIPCION"},
+        "unit": {"UNIDAD", "U", "UN."},
+        "quantity": {"CANT", "CANTIDAD", "CANT.", "CANTIDAD FISICA"},
+        "unit_price": {"PRECIO UNITARIO MXN", "PRECIO UNITARIO", "P U", "P U VENTA", "P.U.", "PRECIO"},
+    }
+    normalized_aliases = {_normalizar_encabezado_pegado(x) for vals in aliases.values() for x in vals}
+    first_norm = [_normalizar_encabezado_pegado(x) for x in rows[0]]
+    has_header = len(set(first_norm) & normalized_aliases) >= 3
+
+    if has_header:
+        positions = {}
+        for i, h in enumerate(first_norm):
+            for field, opts in aliases.items():
+                if h in {_normalizar_encabezado_pegado(x) for x in opts} and field not in positions:
+                    positions[field] = i
+        data_rows = rows[1:]
+    else:
+        positions = {field: i for i, field in enumerate(["area", "partida", "subcategory", "description", "unit", "quantity", "unit_price"])}
+        # Corrección para el orden estándar solicitado: Área, Partida, Subpartida...
+        positions = {"area":0, "partida":1, "subcategory":2, "description":3, "unit":4, "quantity":5, "unit_price":6}
+        data_rows = rows
+
+    missing = [f for f in ["description", "unit"] if f not in positions]
+    if missing:
+        raise ValueError("No pude detectar las columnas mínimas: Descripción Técnica y Unidad.")
+
+    out = []
+    last_area = ""
+    last_partida = ""
+    last_subpartida = ""
+    for row in data_rows:
+        def cell(field):
+            i = positions.get(field)
+            return row[i].strip() if i is not None and i < len(row) else ""
+
+        area = cell("area")
+        partida = cell("partida")
+        subpartida = cell("subpartida")
+        description = cell("description")
+        unit = cell("unit")
+        qty_raw = cell("quantity")
+        price_raw = cell("unit_price")
+
+        # Excel puede traer celdas combinadas como vacías: heredamos la última clasificación.
+        if area:
+            last_area = area
+        else:
+            area = last_area
+        if partida:
+            last_partida = _quitar_numeracion_excel(partida)
+        else:
+            partida = last_partida
+        if subpartida:
+            last_subpartida = _quitar_numeracion_excel(subpartida)
+        else:
+            subpartida = last_subpartida
+
+        description = description.strip()
+        unit = normalizar_unidad(unit)
+        if not description and not qty_raw and not price_raw:
+            continue
+        if not description or not unit:
+            raise ValueError("Cada fila pegada necesita al menos Descripción Técnica y Unidad.")
+
+        out.append({
+            "Área": normalizar_nombre_area(area),
+            "Partida": normalizar_seccion_comercial(_quitar_numeracion_excel(partida)) if partida else "OTROS TRABAJOS",
+            "Subpartida": _quitar_numeracion_excel(subpartida) if subpartida else description[:80],
+            "Descripción Técnica": description,
+            "Unidad": unit,
+            "Cant.": max(_numero_excel_flexible(qty_raw, 1.0), 0.0),
+            "Precio Unitario (MXN)": max(_numero_excel_flexible(price_raw, 0.0), 0.0),
+        })
+
+    if not out:
+        raise ValueError("No encontré actividades utilizables en el bloque pegado.")
+    return pd.DataFrame(out, columns=target_cols)
+
+
+def insertar_actividades_pegadas(
+    current_items: list[dict],
+    pasted_df: pd.DataFrame,
+    params: dict,
+    project_data: dict,
+    mode: str = "Automático",
+    anchor_code: str = "",
+) -> list[dict]:
+    """Inserta actividades por Partida/Subpartida o en una posición exacta."""
+    if pasted_df.empty:
+        return list(current_items)
+
+    # Convertir las filas pegadas usando el mismo motor financiero del editor.
+    base_df = pasted_df.copy()
+    base_rows = []
+    for _, row in base_df.iterrows():
+        base_rows.append({
+            "Área": row.get("Área", ""),
+            "Partida": row.get("Partida", ""),
+            "Subpartida": row.get("Subpartida", ""),
+            "Descripción Técnica": row.get("Descripción Técnica", ""),
+            "Unidad": row.get("Unidad", ""),
+            "Cant.": row.get("Cant.", 0),
+            "Precio Unitario (MXN)": row.get("Precio Unitario (MXN)", 0),
+        })
+
+    # Preparar primero como nuevas filas, sin depender de posiciones actuales.
+    empty = []
+    prepared = preparar_items_desde_editor_excel(pd.DataFrame(base_rows, columns=base_df.columns), empty, params, project_data)
+
+    result = [dict(x) for x in current_items]
+    if mode.startswith("Después de") and anchor_code:
+        idx = next((i for i,x in enumerate(result) if str(x.get("code")) == anchor_code), len(result)-1)
+        result[idx+1:idx+1] = prepared
+    elif mode.startswith("Antes de") and anchor_code:
+        idx = next((i for i,x in enumerate(result) if str(x.get("code")) == anchor_code), len(result))
+        result[idx:idx] = prepared
+    elif mode == "Al final":
+        result.extend(prepared)
+    else:
+        # Automático: mismo Partida + Subpartida -> después del último de ese grupo;
+        # si solo coincide Partida -> después de la última actividad de esa Partida;
+        # si es una Partida nueva -> se coloca donde corresponde a la secuencia comercial.
+        for new_item in prepared:
+            category = normalizar_seccion_comercial(new_item.get("category"))
+            sub = normalizar_texto(new_item.get("subcategory") or "").upper()
+            exact = [i for i,x in enumerate(result) if normalizar_seccion_comercial(x.get("category")) == category and normalizar_texto(x.get("subcategory") or "").upper() == sub and sub]
+            same = [i for i,x in enumerate(result) if normalizar_seccion_comercial(x.get("category")) == category]
+            if exact:
+                insert_at = exact[-1] + 1
+            elif same:
+                insert_at = same[-1] + 1
+            else:
+                preferred = {name:i for i,name in enumerate(SECCIONES_COMERCIALES_PREFERENTES)}
+                target_phase = preferred.get(category, preferred.get("OTROS TRABAJOS", 10))
+                insert_at = len(result)
+                for i,x in enumerate(result):
+                    phase = preferred.get(normalizar_seccion_comercial(x.get("category")), 10)
+                    if phase > target_phase:
+                        insert_at = i
+                        break
+            result.insert(insert_at, new_item)
+
+    for i, item in enumerate(result, start=1):
+        item["execution_order"] = i * 10
+    return result
 
 
 # =========================================================
@@ -6674,68 +6873,151 @@ else:
     )
 
     # -----------------------------------------------------
-    # EDITOR RÁPIDO DEL EXCEL IMPORTADO (SIN IA)
+    # EDITOR DIRECTO + PEGAR DESDE EXCEL
     # -----------------------------------------------------
-    if g.get("imported_from_excel"):
-        st.divider()
-        st.subheader("Editar Excel sin IA")
-        st.caption(
-            "Agrega o modifica actividades directamente. Los cambios se aplican al mismo formato "
-            "de Excel y no hacen ninguna solicitud a Gemini."
-        )
+    st.divider()
+    st.subheader("Editor del presupuesto")
+    st.caption(
+        "Puedes editar cualquier fila directamente. El identificador interno queda oculto, "
+        "así que agregar o mover filas ya no desordena las actividades existentes."
+    )
 
-        editor_columns = [
-            "Área", "Partida", "Subpartida", "Descripción Técnica",
-            "Unidad", "Cant.", "Precio Unitario (MXN)",
-        ]
-        editor_rows = [
-            {
-                "Área": area_excel_item(item),
-                "Partida": item.get("category") or "",
-                "Subpartida": item.get("subcategory") or "",
-                "Descripción Técnica": item.get("description") or "",
-                "Unidad": item.get("unit") or "",
-                "Cant.": float(item.get("quantity") or 0.0),
-                "Precio Unitario (MXN)": float(item.get("unit_sale") or 0.0),
-            }
-            for item in items
-        ]
-        editor_df = pd.DataFrame(editor_rows, columns=editor_columns)
-        edited_df = st.data_editor(
-            editor_df,
-            key=f"excel_editor_{g['project_code']}_{version}",
-            num_rows="dynamic",
-            use_container_width=True,
-            hide_index=True,
-            column_order=editor_columns,
-            column_config={
-                "Área": st.column_config.TextColumn("Área", width="small"),
-                "Partida": st.column_config.TextColumn("Partida", width="medium"),
-                "Subpartida": st.column_config.TextColumn("Subpartida", width="medium"),
-                "Descripción Técnica": st.column_config.TextColumn("Descripción Técnica", width="large"),
-                "Unidad": st.column_config.TextColumn("Unidad", width="small"),
-                "Cant.": st.column_config.NumberColumn("Cant.", min_value=0.0, step=0.01, format="%.2f"),
-                "Precio Unitario (MXN)": st.column_config.NumberColumn(
-                    "Precio Unitario (MXN)", min_value=0.0, step=0.01, format="$ %.2f"
-                ),
-            },
+    editor_columns = [
+        "Área", "Partida", "Subpartida", "Descripción Técnica",
+        "Unidad", "Cant.", "Precio Unitario (MXN)",
+    ]
+    editor_rows = [
+        {
+            "__code": str(item.get("code") or ""),
+            "Área": area_excel_item(item),
+            "Partida": item.get("category") or "",
+            "Subpartida": item.get("subcategory") or "",
+            "Descripción Técnica": item.get("description") or "",
+            "Unidad": item.get("unit") or "",
+            "Cant.": float(item.get("quantity") or 0.0),
+            "Precio Unitario (MXN)": float(item.get("unit_sale") or 0.0),
+        }
+        for item in items
+    ]
+    editor_df = pd.DataFrame(editor_rows, columns=["__code"] + editor_columns)
+    edited_df = st.data_editor(
+        editor_df,
+        key=f"excel_editor_{g['project_code']}_{version}",
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_order=editor_columns,
+        column_config={
+            "__code": None,
+            "Área": st.column_config.TextColumn("Área", width="small"),
+            "Partida": st.column_config.TextColumn("Partida", width="medium"),
+            "Subpartida": st.column_config.TextColumn("Subpartida", width="medium"),
+            "Descripción Técnica": st.column_config.TextColumn("Descripción Técnica", width="large"),
+            "Unidad": st.column_config.TextColumn("Unidad", width="small"),
+            "Cant.": st.column_config.NumberColumn("Cant.", min_value=0.0, step=0.01, format="%.2f"),
+            "Precio Unitario (MXN)": st.column_config.NumberColumn(
+                "Precio Unitario (MXN)", min_value=0.0, step=0.01, format="$ %.2f"
+            ),
+        },
+    )
+
+    if st.button(
+        "Aplicar cambios del editor",
+        type="primary",
+        use_container_width=True,
+        key=f"apply_excel_editor_{g['project_code']}_{version}",
+    ):
+        try:
+            revised_items = preparar_items_desde_editor_excel(
+                edited_df, items, g["params"], g["project_data"]
+            )
+            revised_result = PresupuestoIA(
+                nombre_proyecto=g["project_data"]["name"],
+                actividad_principal=g["project_data"]["project_type"],
+                alcance_resumido="Presupuesto editado manualmente desde el editor.",
+                consideraciones_generales=["Cambios aplicados mediante editor manual."],
+                datos_faltantes=[],
+                actividades=[item_a_actividad(item) for item in revised_items],
+            )
+            revised_financials = calcular_financieros(revised_items, g["params"])
+            revised_excel = crear_excel(
+                project_code=g["project_code"],
+                project_data=g["project_data"],
+                result=revised_result,
+                items=revised_items,
+                params=g["params"],
+                version=version,
+            )
+            g.update({
+                "saved": False,
+                "result": revised_result.model_dump(),
+                "items": revised_items,
+                "financials": revised_financials,
+                "excel_bytes": revised_excel,
+            })
+            st.session_state["generated"] = g
+            st.rerun()
+        except Exception as exc:
+            st.error(f"No fue posible aplicar los cambios: {exc}")
+
+    with st.expander("Pegar actividades desde Excel", expanded=False):
+        st.caption(
+            "Copia directamente de Excel y pega aquí. Se detectan encabezados aunque estén en otro orden. "
+            "Con encabezados usa: Área · Partida · Subpartida · Descripción Técnica · Unidad · Cant. · Precio Unitario (MXN)."
         )
+        paste_text = st.text_area(
+            "Pega aquí las filas copiadas",
+            height=180,
+            placeholder=(
+                "Área\tPartida\tSubpartida\tDescripción Técnica\tUnidad\tCant.\tPrecio Unitario (MXN)\n"
+                "Cocina\tACABADOS Y RECUBRIMIENTOS\tMuros\tSuministro y aplicación de pintura...\tM2\t22.17\t185.00"
+            ),
+            key=f"paste_activities_{g['project_code']}_{version}",
+        )
+        paste_mode = st.selectbox(
+            "Dónde colocarlas",
+            [
+                "Automático (misma Partida/Subpartida)",
+                "Al final",
+                "Antes de una actividad",
+                "Después de una actividad",
+            ],
+            key=f"paste_mode_{g['project_code']}_{version}",
+        )
+        if paste_mode in {"Antes de una actividad", "Después de una actividad"} and items:
+            labels = [f"{i+1}. {item.get('subcategory') or item.get('description','')[:70]} [{item.get('code')}]" for i,item in enumerate(items)]
+            selected = st.selectbox(
+                "Actividad de referencia",
+                options=range(len(items)),
+                format_func=lambda i: labels[i],
+                key=f"paste_anchor_{g['project_code']}_{version}",
+            )
+            anchor_code = str(items[selected].get("code") or "")
+        else:
+            anchor_code = ""
 
         if st.button(
-            "Aplicar cambios y actualizar Excel (sin IA)",
-            type="primary",
+            "Pegar e insertar actividades",
+            type="secondary",
             use_container_width=True,
-            key=f"apply_excel_editor_{g['project_code']}_{version}",
+            key=f"insert_pasted_{g['project_code']}_{version}",
         ):
             try:
-                revised_items = preparar_items_desde_editor_excel(
-                    edited_df, items, g["params"], g["project_data"]
+                pasted_df = parsear_actividades_pegadas(paste_text)
+                mode = paste_mode
+                revised_items = insertar_actividades_pegadas(
+                    items,
+                    pasted_df,
+                    g["params"],
+                    g["project_data"],
+                    mode=mode,
+                    anchor_code=anchor_code,
                 )
                 revised_result = PresupuestoIA(
                     nombre_proyecto=g["project_data"]["name"],
                     actividad_principal=g["project_data"]["project_type"],
-                    alcance_resumido="Presupuesto editado manualmente desde el editor de Excel, sin usar Gemini.",
-                    consideraciones_generales=["Cambios aplicados mediante editor manual de Excel."],
+                    alcance_resumido="Presupuesto actualizado con actividades pegadas desde Excel.",
+                    consideraciones_generales=["Actividades insertadas desde un bloque copiado desde Excel."],
                     datos_faltantes=[],
                     actividades=[item_a_actividad(item) for item in revised_items],
                 )
@@ -6758,7 +7040,7 @@ else:
                 st.session_state["generated"] = g
                 st.rerun()
             except Exception as exc:
-                st.error(f"No fue posible aplicar los cambios: {exc}")
+                st.error(f"No fue posible insertar el bloque pegado: {exc}")
 
     # -----------------------------------------------------
     # Ajuste sencillo con IA
@@ -6807,16 +7089,6 @@ else:
                             params=g["params"],
                             api_key=api_key,
                             model_name=model_name,
-                        )
-                        revised_result = auditar_estructura_presupuesto_ia(
-                            api_key=api_key,
-                            model_name=model_name,
-                            project_data=g["project_data"],
-                            result=revised_result,
-                        )
-                        revised_items = sincronizar_items_con_estructura(
-                            revised_result,
-                            revised_items,
                         )
                         revised_items = recalcular_areas_items(
                             g["project_data"],
