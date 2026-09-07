@@ -31,6 +31,11 @@ except Exception:
     psycopg = None
     dict_row = None
 
+try:
+    from streamlit_local_storage import LocalStorage
+except Exception:
+    LocalStorage = None
+
 
 # =========================================================
 # CONFIGURACIÓN GENERAL
@@ -2088,8 +2093,8 @@ def error_gemini_transitorio(exc: Exception) -> bool:
     ))
 
 
-MAX_REINTENTOS_GEMINI = 20
-DELAY_REINTENTO_GEMINI_SEG = 30
+MAX_REINTENTOS_GEMINI = 50
+DELAY_REINTENTO_GEMINI_SEG = 10
 
 
 def generar_con_gemini_resistente(
@@ -5908,6 +5913,70 @@ def guardar_checkpoint_generacion(
 
 
 # =========================================================
+# BORRADOR LOCAL DEL FORMULARIO
+# =========================================================
+
+FORM_DRAFT_STORAGE_KEY = "presupuesto_form_draft_v1"
+
+
+def _get_local_storage():
+    """Obtiene el almacenamiento local del navegador cuando está disponible."""
+    if LocalStorage is None:
+        return None
+    try:
+        return LocalStorage()
+    except Exception:
+        return None
+
+
+def cargar_borrador_local():
+    """Recupera el último borrador guardado en el navegador."""
+    storage = _get_local_storage()
+    if storage is None:
+        return None
+    try:
+        raw = storage.getItem(
+            FORM_DRAFT_STORAGE_KEY,
+            key="_load_presupuesto_form_draft",
+        )
+        if not raw:
+            return None
+        if isinstance(raw, str):
+            return json.loads(raw)
+        if isinstance(raw, dict):
+            return raw
+    except Exception:
+        pass
+    return None
+
+
+def guardar_borrador_local(data: dict):
+    """Guarda los campos principales del formulario en el navegador."""
+    storage = _get_local_storage()
+    if storage is None:
+        return False
+    try:
+        storage.setItem(
+            FORM_DRAFT_STORAGE_KEY,
+            json.dumps(data, ensure_ascii=False),
+        )
+        return True
+    except Exception:
+        return False
+
+
+def limpiar_borrador_local():
+    """Elimina el borrador guardado localmente sin tocar otras claves."""
+    storage = _get_local_storage()
+    if storage is None:
+        return
+    try:
+        storage.setItem(FORM_DRAFT_STORAGE_KEY, "")
+    except Exception:
+        pass
+
+
+# =========================================================
 # FORMULARIO INICIAL
 # =========================================================
 
@@ -5983,6 +6052,16 @@ if "generated" not in st.session_state:
         for field_key, field_value in restore_data.items():
             st.session_state[field_key] = field_value
 
+    # En una recarga completa del navegador, session_state se pierde.
+    # Recuperamos el último borrador guardado en localStorage.
+    if not st.session_state.get("_draft_checked", False):
+        draft = cargar_borrador_local()
+        if draft:
+            for field_key, field_value in draft.items():
+                if field_value is not None:
+                    st.session_state[field_key] = field_value
+        st.session_state["_draft_checked"] = True
+
     if "guide_text" not in st.session_state:
         st.session_state["guide_text"] = DEFAULT_GUIDE_TEXT
 
@@ -6040,62 +6119,98 @@ if "generated" not in st.session_state:
 
     st.divider()
 
-    with st.form("form_proyecto"):
-        f1, f2 = st.columns(2)
-        with f1:
-            client_name = st.text_input(
-                "Nombre del cliente",
-                placeholder="Ej. Desarrollos de la Vega",
-                key="client_name",
-            )
-        with f2:
-            location = st.text_input(
-                "Ubicación",
-                placeholder="Ej. Coyoacán, CDMX",
-                key="project_location",
-            )
-
-        project_type = st.selectbox(
-            "Tipo de obra",
-            [
-                "Remodelación interior general",
-                "Baño",
-                "Cocina",
-                "Recámara",
-                "Sala / comedor",
-                "Local comercial",
-                "Oficina",
-                "Caseta / acceso",
-                "Otro",
-            ],
-            key="project_type",
+    # Los widgets están fuera de st.form para que cada cambio pueda
+    # guardarse automáticamente en el navegador y sobrevivir a una recarga.
+    f1, f2 = st.columns(2)
+    with f1:
+        client_name = st.text_input(
+            "Nombre del cliente",
+            placeholder="Ej. Desarrollos de la Vega",
+            key="client_name",
+        )
+    with f2:
+        location = st.text_input(
+            "Ubicación",
+            placeholder="Ej. Coyoacán, CDMX",
+            key="project_location",
         )
 
-        budget_level = st.selectbox(
-            "Nivel de presupuesto",
-            NIVELES_PRESUPUESTO,
-            index=2,
-            key="budget_level",
-        )
+    project_type = st.selectbox(
+        "Tipo de obra",
+        [
+            "Remodelación interior general",
+            "Baño",
+            "Cocina",
+            "Recámara",
+            "Sala / comedor",
+            "Local comercial",
+            "Oficina",
+            "Caseta / acceso",
+            "Otro",
+        ],
+        key="project_type",
+    )
 
-        description = st.text_area(
-            "Descripción general de trabajos",
-            placeholder=DESCRIPTION_EXAMPLE,
-            height=430,
-            key="project_description",
-        )
+    budget_level = st.selectbox(
+        "Nivel de presupuesto",
+        NIVELES_PRESUPUESTO,
+        index=2,
+        key="budget_level",
+    )
 
-        guide_text = st.text_area(
-            "Texto guía",
-            height=300,
-            key="guide_text",
-        )
+    description = st.text_area(
+        "Descripción general de trabajos",
+        placeholder=DESCRIPTION_EXAMPLE,
+        height=430,
+        key="project_description",
+    )
 
-        generate = st.form_submit_button(
+    guide_text = st.text_area(
+        "Texto guía",
+        height=300,
+        key="guide_text",
+    )
+
+    # Autoguardado local del borrador. No guarda API keys ni resultados de Gemini.
+    current_draft = {
+        "client_name": client_name,
+        "project_location": location,
+        "project_type": project_type,
+        "budget_level": budget_level,
+        "project_description": description,
+        "guide_text": guide_text,
+    }
+    draft_signature = json.dumps(
+        current_draft, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    if draft_signature != st.session_state.get("_last_saved_draft_signature"):
+        if guardar_borrador_local(current_draft):
+            st.session_state["_last_saved_draft_signature"] = draft_signature
+
+    c1, c2 = st.columns([4, 1])
+    with c1:
+        generate = st.button(
             "Generar presupuesto",
             type="primary",
             use_container_width=True,
         )
+    with c2:
+        clear_draft = st.button(
+            "Borrar borrador",
+            use_container_width=True,
+        )
+
+    if clear_draft:
+        limpiar_borrador_local()
+        for field_key in (
+            "client_name",
+            "project_location",
+            "project_description",
+            "guide_text",
+        ):
+            st.session_state.pop(field_key, None)
+        st.session_state.pop("_last_saved_draft_signature", None)
+        st.rerun()
 
     if generate:
         api_key = get_api_key_runtime()
