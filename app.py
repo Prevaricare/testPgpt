@@ -4130,15 +4130,16 @@ def crear_excel(
         ws.cell(row, 5, item["unit"])
         ws.cell(row, 6, float(item["quantity"]))
 
-        # H es el Importe interno editable que se utilizará para negociación
-        # con el equipo de subcontrataciones.
-        ws.cell(row, 8, float(item["sale_amount"]))
+        # G es el Precio Unitario editable. El Importe interno (H) se calcula
+        # siempre como Precio Unitario x Cantidad para facilitar ajustes manuales.
+        quantity = float(item["quantity"] or 0.0)
+        initial_unit_price = (
+            float(item["sale_amount"]) / quantity if quantity else 0.0
+        )
+        ws.cell(row, 7, initial_unit_price)
+        ws.cell(row, 8, f"=F{row}*G{row}")
 
-        # G se deriva del Importe interno / cantidad.
-        ws.cell(row, 7, f"=IF(F{row}=0,0,H{row}/F{row})")
-
-        # I controla si la actividad participa o no en el presupuesto. H conserva
-        # el valor para poder reactivarla sin perder el precio capturado.
+        # I controla si la actividad participa o no en el presupuesto.
         ws.cell(row, 9, "Sí" if item_esta_incluido(item) else "No")
 
         ws.cell(row, 6).number_format = "0.00"
@@ -4157,10 +4158,10 @@ def crear_excel(
         for col in (7, 8):
             ws.cell(row, col).alignment = Alignment(horizontal="right")
 
-        # H y I son controles editables; G es fórmula.
-        ws.cell(row, 8).fill = PatternFill("solid", fgColor=editable_fill)
+        # G es editable; H es fórmula (Precio Unitario x Cantidad); I es editable.
+        ws.cell(row, 7).fill = PatternFill("solid", fgColor=editable_fill)
+        ws.cell(row, 8).fill = PatternFill("solid", fgColor=formula_fill)
         ws.cell(row, 9).fill = PatternFill("solid", fgColor=editable_fill)
-        ws.cell(row, 7).fill = PatternFill("solid", fgColor=formula_fill)
 
         ws.row_dimensions[row].height = max(
             34,
