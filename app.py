@@ -1270,17 +1270,17 @@ class Database:
                         item["code"],
                         item["category"],
                         item["subcategory"],
-                        item["description"],
+                        item.get("concepto_base", item["description"]),
                         item["unit"],
-                        normalizar_texto(item["description"]),
+                        normalizar_texto(item.get("concepto_base", item["description"])),
                         budget_id,
                         created,
                     ),
                 )
 
-                # Solo se crea historial nuevo cuando el sistema generó o encontró
-                # una referencia externa nueva. Un precio interno reutilizado ya
-                # cuenta con historial propio.
+                # Solo se crea historial nuevo cuando el precio fue generado/estimado
+                # por la valuación actual. Un precio interno reutilizado ya cuenta
+                # con historial propio.
                 if item["price_source"] not in {"BASE_INTERNA", "HISTORICO_IA"}:
                     self.execute(
                         """
@@ -1453,9 +1453,9 @@ class Database:
                         item["code"],
                         item["category"],
                         item["subcategory"],
-                        item["description"],
+                        item.get("concepto_base", item["description"]),
                         item["unit"],
-                        normalizar_texto(item["description"]),
+                        normalizar_texto(item.get("concepto_base", item["description"])),
                         budget_id,
                         created,
                     ),
@@ -1848,9 +1848,11 @@ class Database:
     def list_budget_items(self, budget_id: str) -> list[dict]:
         return self.fetchall(
             """
-            SELECT * FROM budget_items
-            WHERE budget_id = ?
-            ORDER BY category, subcategory, code, created_at
+            SELECT bi.*, c.description AS concepto_base
+            FROM budget_items bi
+            LEFT JOIN concepts c ON c.id = bi.concept_id
+            WHERE bi.budget_id = ?
+            ORDER BY bi.category, bi.subcategory, bi.code, bi.created_at
             """,
             (budget_id,),
         )
@@ -1870,7 +1872,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-09-07-v21-no-cdmx"
+DATABASE_CACHE_VERSION = "2026-09-07-v22-concepto-base-csv"
 
 
 @st.cache_resource(show_spinner=False)
@@ -1925,8 +1927,16 @@ class ActividadIA(BaseModel):
     titulo_comercial: str = Field(
         description="Título corto y legible para el cliente, por ejemplo Pintura general o Demolición de muros"
     )
+    concepto_base: str = Field(
+        default="Concepto genérico",
+        description=(
+            "Nombre GENÉRICO y estandarizado para el catálogo histórico de la base de datos "
+            "(ej. 'Mueble a medida acabados altos', 'Piso de duela', 'Muro de tabique'). "
+            "NO incluyas dimensiones ni ubicaciones aquí."
+        ),
+    )
     descripcion_tecnica: str = Field(
-        description="Descripción clara del alcance que aparecerá debajo del título comercial"
+        description="Descripción hiperespecífica del alcance que aparecerá debajo del título comercial en el Excel"
     )
     unidad: str = Field(description="Unidad: LOTE, PZA, M2, M3, ML, PTO, JGO, etc.")
     cantidad: float = Field(ge=0, description="Cantidad justificable con la información disponible")
@@ -2171,9 +2181,9 @@ CONFIGURACIÓN FIJA DE LA EMPRESA
   un multiplicador arbitrario a todos los precios.
 - Cuando el alcance lo haga razonablemente necesario, contempla proyecto
   ejecutivo, ingenierías, licencias, permisos o trámites aplicables.
-- Después de esta etapa Python buscará referencias históricas internas y referencias
-  externas de CDMX. Esas referencias NO sustituyen automáticamente el costo de Gemini:
-  se entregarán a una segunda etapa de Gemini para la valuación final.
+- Después de esta etapa Python buscará referencias históricas internas. Las referencias
+  internas validadas se usarán como anclas de máxima prioridad y se entregarán a una segunda
+  etapa de Gemini para la valuación final.
 - Los conceptos deben poder presentarse al cliente y servir para solicitar
   cotizaciones a subcontratistas.
 
@@ -2278,7 +2288,11 @@ PARTIDAS Y SUBPARTIDAS
 10. descripcion_tecnica debe indicar qué se hace, dónde, especificación principal
    y qué incluye, sin volverse excesivamente larga. Menciona el área también dentro
    de la descripción para que el concepto siga siendo entendible fuera del Excel.
-10. codigo_sugerido es interno.
+11. concepto_base DEBE ser un nombre extremadamente simple y genérico para tu base
+   de datos histórica. Evita medidas, colores específicos o áreas. Ejemplos correctos:
+   "Cocina integral acabados premium", "Mueble de TV carpintería a medida",
+   "Pintura vinílica interior".
+12. codigo_sugerido es interno.
 
 CANTIDADES Y METRAJES
 10. Calcula M2, ML, M3, PZA u otras cantidades cuando las dimensiones aportadas
@@ -2638,9 +2652,11 @@ INSTRUCCIONES
     - no mezcles muebles diferentes en un solo LOTE cuando puedan identificarse
       individualmente.
 13. Conserva la estructura comercial: area, partida amplia, subpartida corta,
-    titulo_comercial, descripción y orden_ejecucion. Si el usuario solo pide
+    titulo_comercial, concepto_base, descripción y orden_ejecucion. Si el usuario solo pide
     revisar precio o cantidad, conserva esos campos salvo que el cambio realmente
     afecte la naturaleza o dependencia de la actividad.
+13A. concepto_base debe seguir siendo genérico y estandarizado para el catálogo histórico;
+    no incluyas dimensiones ni ubicaciones específicas.
 14. Conserva el nivel comercial seleccionado del proyecto.
 15. porcentaje_materiales, porcentaje_mano_obra y porcentaje_otros son solamente
     una composición estimada; mantenla coherente y cercana a 100 %.
@@ -2700,14 +2716,20 @@ def buscar_precio_interno(db: Database, actividad: ActividadIA) -> dict | None:
     candidatos = db.price_candidates(actividad.unidad)
     best = None
     best_score = 0.0
+    best_priority = -1
 
     for row in candidatos:
         score = score_similitud(actividad.descripcion_tecnica, row["description"])
-        if score > best_score:
+        priority = 2 if (row.get("status") or "").upper() == "VALIDADO" else 1
+        if (
+            score >= 0.82
+            and (priority > best_priority or (priority == best_priority and score > best_score))
+        ):
+            best_priority = priority
             best_score = score
             best = row
 
-    if best is None or best_score < 0.82:
+    if best is None:
         return None
 
     original_source = (best.get("source") or "").upper()
@@ -2719,11 +2741,10 @@ def buscar_precio_interno(db: Database, actividad: ActividadIA) -> dict | None:
     elif original_source == "IA_ESTIMADO" or original_status == "ESTIMADO_IA":
         source = "HISTORICO_IA"
         confidence = "Media" if best_score >= 0.9 else "Baja"
-    elif (
-        original_source in {"REFERENCIA_CDMX", "REFERENCIA_EXTERNA", "HISTORICO_EXTERNO"}
-        or original_status == "REFERENCIA_EXTERNA"
-    ):
-        source = "HISTORICO_EXTERNO"
+    elif original_status in {"REFERENCIA_EXTERNA", "REFERENCIA_CDMX"} or original_source in {"REFERENCIA_EXTERNA", "REFERENCIA_CDMX", "HISTORICO_EXTERNO"}:
+        # Compatibilidad con registros históricos antiguos: ya no se consideran
+        # una fuente externa operativa y se tratan como evidencia interna heredada.
+        source = "BASE_INTERNA"
         confidence = "Media" if best_score >= 0.9 else "Baja"
     else:
         source = "BASE_INTERNA"
@@ -3009,6 +3030,7 @@ def resolver_items(
             "code": requested_code,
             "execution_order": int(act.orden_ejecucion),
             "commercial_title": act.titulo_comercial.strip(),
+            "concepto_base": act.concepto_base.strip(),
             "description": act.descripcion_tecnica.strip(),
             "unit": act.unidad.strip().upper(),
             "quantity": quantity,
@@ -3088,6 +3110,7 @@ def item_a_actividad(item: dict) -> ActividadIA:
         codigo_sugerido=item["code"],
         orden_ejecucion=int(item.get("execution_order") or 500),
         titulo_comercial=titulo_comercial_item(item),
+        concepto_base=item.get("concepto_base") or item["description"],
         descripcion_tecnica=item["description"],
         unidad=item["unit"],
         cantidad=float(item["quantity"]),
@@ -4577,7 +4600,6 @@ def crear_excel(
             "IA_ESTIMADO",
             "GEMINI_VALORADO",
             "HISTORICO_IA",
-            "HISTORICO_EXTERNO",
         }:
             wt.cell(idx, 8).fill = PatternFill("solid", fgColor=trace_orange)
             wt.cell(idx, 9).fill = PatternFill("solid", fgColor=trace_orange)
@@ -4794,9 +4816,6 @@ def render_admin_database(db: Database):
     source_labels = {
         "COTIZACION_PROVEEDOR": "Cotización de proveedor",
         "COSTO_REAL": "Costo real de obra",
-        "REFERENCIA_EXTERNA": "Referencia externa",
-        "REFERENCIA_CDMX": "Referencia CDMX",
-        "HISTORICO_EXTERNO": "Histórico de referencia externa",
         "IA_ESTIMADO": "Estimación de IA",
         "MANUAL": "Registro manual",
         "BASE_INTERNA": "Base interna",
@@ -4806,7 +4825,6 @@ def render_admin_database(db: Database):
         "VALIDADO": "Validado",
         "COTIZADO_PROVEEDOR": "Cotizado por proveedor",
         "COSTO_REAL": "Costo real",
-        "REFERENCIA_EXTERNA": "Referencia externa",
         "ESTIMADO_IA": "Estimado por IA",
     }
 
@@ -5187,16 +5205,14 @@ def render_admin_database(db: Database):
                 source_options = [
                     "COTIZACION_PROVEEDOR",
                     "COSTO_REAL",
-                    "REFERENCIA_EXTERNA",
-                    "IA_ESTIMADO",
+                            "IA_ESTIMADO",
                     "MANUAL",
                 ]
                 status_options = [
                     "VALIDADO",
                     "COTIZADO_PROVEEDOR",
                     "COSTO_REAL",
-                    "REFERENCIA_EXTERNA",
-                    "ESTIMADO_IA",
+                            "ESTIMADO_IA",
                 ]
 
                 with st.form(f"add_price_form_{price_concept_id}"):
@@ -5708,6 +5724,104 @@ def render_admin_database(db: Database):
                 st.success("Todos los datos de la aplicación fueron eliminados.")
                 st.rerun()
 
+        with st.container(border=True):
+            st.markdown("### Carga Masiva de Catálogo Ancla (CSV)")
+            st.caption(
+                "Sube un archivo CSV con tus precios históricos estandarizados. "
+                "Las columnas requeridas son: **Codigo, Partida, Subpartida, Concepto_Generico, Unidad, Costo_Unitario**."
+            )
+
+            uploaded_csv = st.file_uploader(
+                "Subir archivo de catálogo CSV",
+                type=["csv"],
+                key="csv_uploader_seed",
+            )
+
+            if uploaded_csv:
+                if st.button(
+                    "Procesar y Cargar Catálogo",
+                    type="primary",
+                    use_container_width=True,
+                    key="process_seed_catalog_csv",
+                ):
+                    with st.spinner("Procesando carga masiva..."):
+                        try:
+                            df_csv = pd.read_csv(uploaded_csv)
+
+                            necesarias = [
+                                "Codigo",
+                                "Partida",
+                                "Subpartida",
+                                "Concepto_Generico",
+                                "Unidad",
+                                "Costo_Unitario",
+                            ]
+                            faltantes = [col for col in necesarias if col not in df_csv.columns]
+
+                            if faltantes:
+                                st.error(
+                                    "El archivo CSV no tiene el formato correcto. "
+                                    f"Faltan las columnas: {', '.join(faltantes)}"
+                                )
+                            else:
+                                count_nuevos = 0
+                                count_omitidos = 0
+                                for _, row in df_csv.iterrows():
+                                    code = str(row["Codigo"]).strip()
+                                    category = str(row["Partida"]).strip()
+                                    subcategory = str(row["Subpartida"]).strip()
+                                    description = str(row["Concepto_Generico"]).strip()
+                                    unit = str(row["Unidad"]).strip().upper()
+
+                                    raw_cost = (
+                                        str(row["Costo_Unitario"])
+                                        .replace("$", "")
+                                        .replace(",", "")
+                                        .strip()
+                                    )
+                                    try:
+                                        unit_cost = float(raw_cost)
+                                    except (TypeError, ValueError):
+                                        count_omitidos += 1
+                                        continue
+
+                                    if (
+                                        not code
+                                        or not category
+                                        or not subcategory
+                                        or not description
+                                        or not unit
+                                        or unit_cost <= 0
+                                    ):
+                                        count_omitidos += 1
+                                        continue
+
+                                    new_id = db.create_concept(
+                                        code, category, subcategory, description, unit
+                                    )
+
+                                    db.add_price(
+                                        concept_id=new_id,
+                                        unit_cost=unit_cost,
+                                        source="BASE_INTERNA",
+                                        source_detail="Carga masiva histórica CSV",
+                                        status="VALIDADO",
+                                        confidence="Alta",
+                                    )
+                                    count_nuevos += 1
+
+                                st.success(
+                                    f"✅ Se cargaron exitosamente {count_nuevos} conceptos ancla. "
+                                    "La IA ahora los priorizará."
+                                )
+                                if count_omitidos:
+                                    st.warning(
+                                        f"Se omitieron {count_omitidos} filas por tener precios o datos inválidos."
+                                    )
+
+                        except Exception as e:
+                            st.error(f"Error procesando el archivo CSV: {e}")
+
     # =====================================================
     # EXPORTAR
     # =====================================================
@@ -6206,7 +6320,7 @@ if "generated" not in st.session_state:
                 items = checkpoint_items
                 ui_progress(78, "3/4 · Recuperando valuación de precios ya completada")
             else:
-                ui_progress(52, "3/4 · Buscando precios históricos y referencias CDMX")
+                ui_progress(52, "3/4 · Buscando precios históricos internos")
                 # Dejamos explícito que estamos trabajando en esta etapa antes de
                 # entrar a Gemini. Si la etapa 3 falla, las etapas 1 y 2 siguen
                 # guardadas y la siguiente corrida comenzará aquí.
