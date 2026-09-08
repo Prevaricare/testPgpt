@@ -4298,6 +4298,190 @@ def insertar_actividades_pegadas(
 # =========================================================
 
 
+
+EDITOR_EXCEL_COLUMNS = [
+    "Área", "Partida", "Subpartida", "Descripción Técnica",
+    "Unidad", "Cant.", "Precio Unitario (MXN)",
+]
+
+
+def crear_excel_desde_editor(df: pd.DataFrame) -> bytes:
+    """Crea un Excel limpio con únicamente las 7 columnas del editor."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Presupuesto"
+
+    data = df.copy()
+    for col in EDITOR_EXCEL_COLUMNS:
+        if col not in data.columns:
+            data[col] = ""
+    data = data[EDITOR_EXCEL_COLUMNS]
+
+    mask = data.apply(
+        lambda row: any(str(v).strip() not in {"", "nan", "None"} for v in row),
+        axis=1,
+    )
+    data = data.loc[mask].copy()
+
+    header_fill = PatternFill("solid", fgColor="4A342B")
+    header_font = Font(bold=True, color="FFFFFF")
+    thin = Side(style="thin", color="D4D4D4")
+
+    for col_idx, name in enumerate(EDITOR_EXCEL_COLUMNS, start=1):
+        cell = ws.cell(1, col_idx, name)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = Border(bottom=thin)
+
+    for row_idx, (_, row) in enumerate(data.iterrows(), start=2):
+        for col_idx, name in enumerate(EDITOR_EXCEL_COLUMNS, start=1):
+            value = row[name]
+            if name in {"Cant.", "Precio Unitario (MXN)"}:
+                try:
+                    value = float(value) if str(value).strip() else None
+                except (TypeError, ValueError):
+                    value = None
+            else:
+                value = "" if pd.isna(value) else str(value).strip()
+
+            cell = ws.cell(row_idx, col_idx, value)
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=name == "Descripción Técnica",
+            )
+            if name == "Cant." and value is not None:
+                cell.number_format = "0.00"
+            elif name == "Precio Unitario (MXN)" and value is not None:
+                cell.number_format = '$#,##0.00'
+
+    widths = {
+        "Área": 20, "Partida": 30, "Subpartida": 25,
+        "Descripción Técnica": 65, "Unidad": 12, "Cant.": 12,
+        "Precio Unitario (MXN)": 22,
+    }
+    for idx, name in enumerate(EDITOR_EXCEL_COLUMNS, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = widths[name]
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:G{max(ws.max_row, 1)}"
+    ws.sheet_view.showGridLines = False
+
+    if ws.max_row >= 2:
+        from openpyxl.worksheet.table import Table, TableStyleInfo
+        table = Table(displayName="TablaPresupuesto", ref=f"A1:G{ws.max_row}")
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False, showLastColumn=False,
+            showRowStripes=True, showColumnStripes=False,
+        )
+        ws.add_table(table)
+
+    output = BytesIO()
+    wb.save(output)
+    return output.getvalue()
+
+
+def render_editor_excel_nuevo():
+    """Editor independiente para construir un presupuesto Excel desde cero."""
+    st.header("Crear presupuesto en Excel")
+    st.caption(
+        "Construye un archivo nuevo sin cargar un presupuesto existente. "
+        "Puedes capturar filas directamente o pegar un bloque copiado desde Excel."
+    )
+
+    st.info(
+        "El archivo exportado contiene únicamente: Área, Partida, Subpartida, "
+        "Descripción Técnica, Unidad, Cant. y Precio Unitario (MXN)."
+    )
+
+    def filas_vacias(n=5):
+        return pd.DataFrame(
+            [
+                {
+                    "Área": "", "Partida": "", "Subpartida": "",
+                    "Descripción Técnica": "", "Unidad": "",
+                    "Cant.": 1.0, "Precio Unitario (MXN)": 0.0,
+                }
+                for _ in range(n)
+            ],
+            columns=EDITOR_EXCEL_COLUMNS,
+        )
+
+    if "new_excel_editor_df" not in st.session_state:
+        st.session_state["new_excel_editor_df"] = filas_vacias()
+
+    with st.expander("Pegar actividades desde Excel", expanded=True):
+        st.caption(
+            "Copia directamente desde Excel. Se detectan encabezados aunque estén "
+            "en otro orden. También puedes pegar filas sin encabezado usando el orden estándar."
+        )
+        paste_text = st.text_area(
+            "Pega aquí las filas copiadas",
+            height=180,
+            placeholder=(
+                "Área\tPartida\tSubpartida\tDescripción Técnica\tUnidad\tCant.\tPrecio Unitario (MXN)\n"
+                "Cocina\tAcabados\tMuros\tSuministro y aplicación de pintura\tM2\t22.17\t185.00"
+            ),
+            key="new_excel_paste_text",
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Cargar al editor", type="secondary", use_container_width=True):
+                try:
+                    pasted = parsear_actividades_pegadas(paste_text)
+                    st.session_state["new_excel_editor_df"] = pasted[
+                        EDITOR_EXCEL_COLUMNS
+                    ].copy()
+                    st.success(f"{len(pasted)} actividad(es) cargada(s).")
+                except Exception as exc:
+                    st.error(f"No fue posible leer el bloque: {exc}")
+        with c2:
+            if st.button("Limpiar editor", use_container_width=True):
+                st.session_state["new_excel_editor_df"] = filas_vacias()
+                st.rerun()
+
+    st.subheader("Editor")
+    edited = st.data_editor(
+        st.session_state["new_excel_editor_df"],
+        key="new_excel_editor",
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_order=EDITOR_EXCEL_COLUMNS,
+        column_config={
+            "Área": st.column_config.TextColumn("Área", width="small"),
+            "Partida": st.column_config.TextColumn("Partida", width="medium"),
+            "Subpartida": st.column_config.TextColumn("Subpartida", width="medium"),
+            "Descripción Técnica": st.column_config.TextColumn(
+                "Descripción Técnica", width="large"
+            ),
+            "Unidad": st.column_config.TextColumn("Unidad", width="small"),
+            "Cant.": st.column_config.NumberColumn("Cant.", min_value=0.0, step=0.01),
+            "Precio Unitario (MXN)": st.column_config.NumberColumn(
+                "Precio Unitario (MXN)", min_value=0.0, step=0.01, format="$ %.2f"
+            ),
+        },
+    )
+    st.session_state["new_excel_editor_df"] = edited.copy()
+
+    nonempty = edited.apply(
+        lambda row: any(str(v).strip() not in {"", "nan", "None"} for v in row),
+        axis=1,
+    )
+    st.caption(f"{int(nonempty.sum())} fila(s) con contenido.")
+
+    excel_bytes = crear_excel_desde_editor(edited)
+    st.download_button(
+        "Exportar Excel",
+        data=excel_bytes,
+        file_name="Presupuesto_nuevo.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True,
+    )
+
+
 def crear_excel(
     project_code: str,
     project_data: dict,
@@ -6136,7 +6320,7 @@ with st.sidebar:
     st.header("Navegación")
     section = st.radio(
         "Sección",
-        ["Generar presupuesto", "Catálogo e historial"],
+        ["Generar presupuesto", "Crear Excel", "Catálogo e historial"],
         key="main_section",
         label_visibility="collapsed",
     )
@@ -6196,6 +6380,10 @@ with st.sidebar:
 # BASE INTERNA
 # =========================================================
 
+
+if section == "Crear Excel":
+    render_editor_excel_nuevo()
+    st.stop()
 
 if section == "Catálogo e historial":
     render_admin_database(db)
