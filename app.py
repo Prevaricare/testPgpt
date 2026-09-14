@@ -381,6 +381,44 @@ def estructura_partidas_excel(items: list[dict]) -> list[dict]:
     return output
 
 
+def codigo_capitulo_cliente(part_number: int) -> int:
+    """Código numérico de capítulo (capítulo * 1000), esquema del ejemplo."""
+    return int(part_number) * 1000
+
+
+def codigo_partida_cliente(part_number: int, subpart_number: int) -> int:
+    """Código numérico de partida (capítulo * 1000 + subpartida)."""
+    return int(part_number) * 1000 + int(subpart_number)
+
+
+def asignar_codigos_jerarquicos(items: list[dict]) -> list[dict]:
+    """
+    Sustituye el código de cada item (antes alfanumérico: CON-001, IMP-001,
+    MAN-001, etc.) por el nuevo esquema numérico jerárquico -- capítulo * 1000
+    + subpartida --, el mismo que usa la columna Código del Excel formato
+    cliente. Se calcula una sola vez a partir del orden comercial (el mismo
+    que ya usan ambos Excels vía estructura_partidas_excel) y queda grabado
+    en item["code"], de modo que también es lo que se guarda en la base de
+    datos (concepts.code, budget_items.code) de aquí en adelante.
+
+    No se basa en la posición dentro de la lista `items`, sino en el código
+    previo de cada item, así que el orden original de `items` se conserva.
+    """
+    structured = estructura_partidas_excel(items)
+    nuevo_codigo = {
+        it["code"]: str(codigo_partida_cliente(it["part_number"], it["subpart_number"]))
+        for it in structured
+    }
+    actualizados = []
+    for it in items:
+        nuevo = dict(it)
+        original = it.get("code")
+        if original in nuevo_codigo:
+            nuevo["code"] = nuevo_codigo[original]
+        actualizados.append(nuevo)
+    return actualizados
+
+
 def descripcion_excel_item(item: dict) -> str:
     """
     El ejemplo de la empresa coloca una descripción técnica amplia en una sola
@@ -403,6 +441,11 @@ def descripcion_excel_item(item: dict) -> str:
 
 
 AREA_GENERAL = "General"
+
+# Margen fijo que se aplica sobre el Importe interno para calcular el Precio
+# del Excel formato cliente (hoja Partidas). Ya no es configurable desde la
+# interfaz: es una constante de negocio.
+MARGEN_PRESUPUESTO_CLIENTE_PCT = 30.0
 
 
 PATRONES_AREAS_EXPLICITAS = [
@@ -3920,6 +3963,7 @@ def importar_presupuesto_excel(
         items.append(item)
 
     items = recalcular_areas_items(project_data, items)
+    items = asignar_codigos_jerarquicos(items)
 
     activities = [item_a_actividad(item) for item in items]
     result = PresupuestoIA(
@@ -3938,7 +3982,7 @@ def importar_presupuesto_excel(
 
     financials = calcular_financieros(items, params)
 
-    excel_bytes_rebuilt = crear_excel(
+    excel_bytes_rebuilt = crear_paquete_excels(
         project_code=metadata["project_code"],
         project_data=project_data,
         result=result,
@@ -5156,6 +5200,216 @@ def crear_excel(
     wb.save(out)
     out.seek(0)
     return out.getvalue()
+
+
+# =========================================================
+# EXCEL — FORMATO CLIENTE (Resumen + Partidas)
+# =========================================================
+
+# Estilo tomado directamente del archivo de ejemplo (AQUI PRO). Se deja como
+# constante para que ambas hojas (Resumen y Partidas) luzcan idénticas al
+# ejemplo y para no repetir literales de color por toda la función.
+_CLIENTE_HEADER_FILL = PatternFill(fill_type="solid", fgColor="FF37241B")
+_CLIENTE_HEADER_FONT = Font(name="Calibri", size=12, bold=True, color="FFEEEEEE")
+_CLIENTE_DATA_FONT = Font(name="Calibri", size=12, bold=False, color="FF37241B")
+_CLIENTE_HIGHLIGHT_FILL = PatternFill(fill_type="solid", fgColor="FF7A7776")
+_CLIENTE_RIGHT_ALIGN = Alignment(horizontal="right")
+
+
+def crear_excel_formato_cliente(
+    project_code: str,
+    project_data: dict,
+    items: list[dict],
+    params: dict,
+    version: int = 1,
+    margin_pct: float | None = None,
+) -> bytes:
+    """
+    Libro con el formato "cliente" (dos hojas: Resumen y Partidas), calcado
+    del ejemplo proporcionado por la empresa.
+
+    Reutiliza estructura_partidas_excel(...) -- la misma función que arma
+    01 Presupuesto -- para que los capítulos y su orden sean siempre
+    equivalentes entre ambos archivos.
+
+    Coste  = Importe interno de cada partida (item["sale_amount"]).
+    Margen = constante de negocio MARGEN_PRESUPUESTO_CLIENTE_PCT (30%).
+    Precio = fórmula Coste * (1 + Margen / 100), se recalcula sola en Excel.
+    """
+    margin_pct = (
+        float(margin_pct) if margin_pct is not None else MARGEN_PRESUPUESTO_CLIENTE_PCT
+    )
+    iva_pct = float(params.get("iva_pct", 16.0))
+
+    incluidos = [it for it in items if item_esta_incluido(it)]
+    structured_items = estructura_partidas_excel(incluidos)
+
+    wb = Workbook()
+    wb.calculation.calcMode = "auto"
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
+    wb.calculation.calcOnSave = True
+
+    # --------------------------- Resumen ---------------------------
+    resumen = wb.active
+    resumen.title = "Resumen"
+    resumen.sheet_view.showGridLines = True
+    resumen.column_dimensions["A"].width = 20
+    resumen.column_dimensions["B"].width = 40
+
+    oportunidad = (
+        f"{project_data.get('project_type', '')} · "
+        f"{project_data.get('budget_level', 'Medio-alto')} · "
+        f"{project_data.get('location', '')} · {project_code} · V{version:02d}"
+    )
+
+    resumen_labels_values = [
+        ("Nombre", project_data.get("name", "")),
+        ("Oportunidad", oportunidad),
+        ("ID Presupuesto", project_code),
+        ("Autor", ""),
+        ("Estado", "draft"),
+        ("Fecha", datetime.now()),
+    ]
+    for row_idx, (label, value) in enumerate(resumen_labels_values, start=1):
+        a = resumen.cell(row_idx, 1, label)
+        a.font = _CLIENTE_HEADER_FONT
+        a.fill = _CLIENTE_HEADER_FILL
+        b = resumen.cell(row_idx, 2, value)
+        b.font = _CLIENTE_DATA_FONT
+        b.alignment = _CLIENTE_RIGHT_ALIGN
+        if label == "Fecha":
+            b.number_format = "[$-409]m/d/yy"
+
+    money_labels = ["Presupuesto", "Extras", "Descuentos", "Impuestos", "Total"]
+    for row_idx, label in enumerate(money_labels, start=7):
+        a = resumen.cell(row_idx, 1, label)
+        a.font = _CLIENTE_HEADER_FONT
+        a.fill = _CLIENTE_HEADER_FILL
+        b = resumen.cell(row_idx, 2)
+        b.font = _CLIENTE_DATA_FONT
+        b.alignment = _CLIENTE_RIGHT_ALIGN
+
+    # --------------------------- Partidas ---------------------------
+    partidas = wb.create_sheet("Partidas")
+    partidas.sheet_view.showGridLines = True
+    partidas.column_dimensions["B"].width = 25
+    partidas.column_dimensions["C"].width = 55
+
+    headers = [
+        "Código", "Capítulo", "Partida", "Descripción", "Uds.",
+        "Tipo Ud.", "Margen", "Coste", "Precio", "% Impuestos",
+    ]
+    for col, header in enumerate(headers, start=1):
+        c = partidas.cell(1, col, header)
+        c.font = _CLIENTE_HEADER_FONT
+        c.fill = _CLIENTE_HEADER_FILL
+
+    row = 2
+    current_chapter = None
+    for item in structured_items:
+        part_number = item["part_number"]
+        subpart_number = item["subpart_number"]
+
+        if part_number != current_chapter:
+            current_chapter = part_number
+            code_cell = partidas.cell(row, 1, codigo_capitulo_cliente(part_number))
+            code_cell.font = _CLIENTE_DATA_FONT
+            code_cell.fill = _CLIENTE_HIGHLIGHT_FILL
+            cap_cell = partidas.cell(
+                row, 2, nombre_partida_excel(item.get("category")).upper()
+            )
+            cap_cell.font = _CLIENTE_DATA_FONT
+            cap_cell.alignment = _CLIENTE_RIGHT_ALIGN
+            row += 1
+
+        code_cell = partidas.cell(
+            row, 1, codigo_partida_cliente(part_number, subpart_number)
+        )
+        code_cell.font = _CLIENTE_DATA_FONT
+        code_cell.fill = _CLIENTE_HIGHLIGHT_FILL
+
+        values = [
+            (3, nombre_subpartida_excel(item)),
+            (4, item.get("description", "")),
+            (5, float(item.get("quantity", 0.0))),
+            (6, str(item.get("unit", "")).lower()),
+            (7, margin_pct),
+        ]
+        for col, val in values:
+            c = partidas.cell(row, col, val)
+            c.font = _CLIENTE_DATA_FONT
+            c.alignment = _CLIENTE_RIGHT_ALIGN
+
+        coste_cell = partidas.cell(row, 8, float(item.get("sale_amount", 0.0)))
+        coste_cell.font = _CLIENTE_DATA_FONT
+        coste_cell.alignment = _CLIENTE_RIGHT_ALIGN
+
+        precio_cell = partidas.cell(row, 9, f"=H{row}*(1+G{row}/100)")
+        precio_cell.font = _CLIENTE_DATA_FONT
+        precio_cell.fill = _CLIENTE_HIGHLIGHT_FILL
+
+        row += 1
+
+    last_item_row = row - 1
+    if last_item_row >= 2:
+        resumen["B7"] = f"=SUM(Partidas!I2:I{last_item_row})"
+    else:
+        resumen["B7"] = 0
+    resumen["B8"] = 0
+    resumen["B9"] = 0
+    resumen["B10"] = f"=(B7+B8-B9)*{iva_pct / 100.0:.6f}"
+    resumen["B11"] = "=B7+B8-B9+B10"
+
+    out = BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def empaquetar_excels_zip(
+    excel_interno: bytes, excel_cliente: bytes, project_code: str, version: int
+) -> bytes:
+    """Empaqueta el Excel interno (negociación) y el Excel cliente (Resumen +
+    Partidas) en un único .zip para que ambos se descarguen de una sola vez."""
+    buf = BytesIO()
+    tag = f"{project_code}-V{version:02d}"
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{tag}_Presupuesto_interno.xlsx", excel_interno)
+        zf.writestr(f"{tag}_Presupuesto_cliente.xlsx", excel_cliente)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def crear_paquete_excels(
+    project_code: str,
+    project_data: dict,
+    result: PresupuestoIA,
+    items: list[dict],
+    params: dict,
+    version: int = 1,
+) -> bytes:
+    """
+    Genera ambos archivos -- el interno de siempre (crear_excel) y el nuevo
+    formato cliente (crear_excel_formato_cliente) -- y los entrega juntos en
+    un .zip. Mismo orden de argumentos que crear_excel para poder sustituir
+    las llamadas existentes sin tocar el resto de cada flujo.
+    """
+    excel_interno = crear_excel(
+        project_code=project_code,
+        project_data=project_data,
+        result=result,
+        items=items,
+        params=params,
+        version=version,
+    )
+    excel_cliente = crear_excel_formato_cliente(
+        project_code=project_code,
+        project_data=project_data,
+        items=items,
+        params=params,
+        version=version,
+    )
+    return empaquetar_excels_zip(excel_interno, excel_cliente, project_code, version)
 
 
 # =========================================================
@@ -6898,11 +7152,12 @@ if "generated" not in st.session_state:
 
             # ETAPA 4 -------------------------------------------------------
             ui_progress(93, "Calculando importes y preparando el Excel")
+            items = asignar_codigos_jerarquicos(items)
             financials = calcular_financieros(items, params)
             provisional_code = db.next_project_code(
                 project_data["name"], project_data["location"]
             )
-            excel_bytes = crear_excel(
+            excel_bytes = crear_paquete_excels(
                 project_code=provisional_code, project_data=project_data, result=result,
                 items=items, params=params, version=1,
             )
@@ -7053,11 +7308,16 @@ else:
 
     file_status = f"V{version:02d}" if g.get("project_id") else "BORRADOR"
     st.download_button(
-        "Descargar Excel",
+        "Descargar Excel (interno + cliente)",
         data=g["excel_bytes"],
-        file_name=f"{g['project_code']}-{file_status}_Presupuesto.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        file_name=f"{g['project_code']}-{file_status}_Presupuesto.zip",
+        mime="application/zip",
         use_container_width=True,
+    )
+    st.caption(
+        "El .zip incluye los dos archivos: el Excel interno de negociación "
+        "(01 Presupuesto / 02 Control Interno / 03 Trazabilidad / 04 Costos "
+        "por Área) y el Excel formato cliente (Resumen + Partidas)."
     )
 
     # -----------------------------------------------------
@@ -7119,6 +7379,7 @@ else:
             revised_items = preparar_items_desde_editor_excel(
                 edited_df, items, g["params"], g["project_data"]
             )
+            revised_items = asignar_codigos_jerarquicos(revised_items)
             revised_result = PresupuestoIA(
                 nombre_proyecto=g["project_data"]["name"],
                 actividad_principal=g["project_data"]["project_type"],
@@ -7128,7 +7389,7 @@ else:
                 actividades=[item_a_actividad(item) for item in revised_items],
             )
             revised_financials = calcular_financieros(revised_items, g["params"])
-            revised_excel = crear_excel(
+            revised_excel = crear_paquete_excels(
                 project_code=g["project_code"],
                 project_data=g["project_data"],
                 result=revised_result,
@@ -7201,6 +7462,7 @@ else:
                     mode=mode,
                     anchor_code=anchor_code,
                 )
+                revised_items = asignar_codigos_jerarquicos(revised_items)
                 revised_result = PresupuestoIA(
                     nombre_proyecto=g["project_data"]["name"],
                     actividad_principal=g["project_data"]["project_type"],
@@ -7210,7 +7472,7 @@ else:
                     actividades=[item_a_actividad(item) for item in revised_items],
                 )
                 revised_financials = calcular_financieros(revised_items, g["params"])
-                revised_excel = crear_excel(
+                revised_excel = crear_paquete_excels(
                     project_code=g["project_code"],
                     project_data=g["project_data"],
                     result=revised_result,
@@ -7282,6 +7544,7 @@ else:
                             g["project_data"],
                             revised_items,
                         )
+                        revised_items = asignar_codigos_jerarquicos(revised_items)
                         revised_financials = calcular_financieros(
                             revised_items,
                             g["params"],
@@ -7296,7 +7559,7 @@ else:
                             target_version = 1
                             pending_revision = False
 
-                        excel_bytes = crear_excel(
+                        excel_bytes = crear_paquete_excels(
                             project_code=g["project_code"],
                             project_data=g["project_data"],
                             result=revised_result,
@@ -7392,7 +7655,7 @@ else:
                     project_id = g["project_id"]
                     real_code = g["project_code"]
 
-                excel_bytes = crear_excel(
+                excel_bytes = crear_paquete_excels(
                     project_code=real_code,
                     project_data=g["project_data"],
                     result=result,
