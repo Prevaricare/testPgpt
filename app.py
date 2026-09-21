@@ -176,6 +176,9 @@ SECCIONES_COMERCIALES_PREFERENTES = [
 
 SECCION_ALIASES = {
     "PROYECTO Y TRAMITES": "PROYECTO Y TRÁMITES",
+    "DEMOLICION Y DESMONTAJE": "DESMONTAJES Y DEMOLICIONES",
+    "DEMOLICION Y DESMONTAJES": "DESMONTAJES Y DEMOLICIONES",
+    "CARPINTERIA Y MOBILIARIO": "CARPINTERÍA",
     "PROYECTO": "PROYECTO Y TRÁMITES",
     "TRAMITES": "PROYECTO Y TRÁMITES",
     "PRELIMINARES": "PRELIMINARES Y PROTECCIONES",
@@ -1919,7 +1922,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-09-07-v22-concepto-base-csv"
+DATABASE_CACHE_VERSION = "2026-09-21-v25-estilo-presupuesto-empresa"
 
 
 @st.cache_resource(show_spinner=False)
@@ -2024,6 +2027,35 @@ class ActividadIA(BaseModel):
     consideraciones: str = Field(description="Supuestos, exclusiones o condiciones relevantes")
 
 
+class AreaNecesidadesIA(BaseModel):
+    area: str = Field(description="Área física identificada en el documento, normalizada y reconocible")
+    superficie_m2: float | None = Field(default=None, ge=0, description="Superficie explícita si el documento la proporciona")
+    necesidades: list[str] = Field(default_factory=list, description="Necesidades explícitas de esa área")
+    restricciones: list[str] = Field(default_factory=list, description="Restricciones, preferencias o condiciones que afectan la solución")
+    intervenciones_probables: list[str] = Field(default_factory=list, description="Trabajos o sistemas que probablemente deben presupuestarse para resolver las necesidades")
+
+
+class PaqueteAlcanceIA(BaseModel):
+    area: str = Field(description="Área física principal donde se ejecuta el paquete")
+    nombre: str = Field(description="Nombre corto del paquete de trabajo que podría convertirse en una o varias partidas")
+    disciplina: str = Field(description="Disciplina principal: CARPINTERIA, ACABADOS, ELECTRICA, HIDROSANITARIA, ALBANILERIA, etc.")
+    objetivo: str = Field(description="Qué necesidad del cliente resuelve")
+    trabajos_implicitos: list[str] = Field(default_factory=list, description="Trabajos necesarios para entregar el objetivo aunque no estén escritos literalmente")
+    entregables: list[str] = Field(default_factory=list, description="Elementos concretos que deben quedar terminados")
+    unidad_sugerida: str = Field(default="", description="Unidad natural de cotización si puede determinarse")
+    base_de_cantidad: str = Field(default="", description="Cómo debería metarse la cantidad con los datos disponibles")
+    depende_de: list[str] = Field(default_factory=list, description="Trabajos previos que deben existir antes")
+    nivel_certeza: str = Field(default="Media", description="Alta, Media o Baja")
+
+
+class MapaAlcanceIA(BaseModel):
+    objetivo_general: str
+    criterios_transversales: list[str] = Field(default_factory=list)
+    areas: list[AreaNecesidadesIA] = Field(default_factory=list)
+    paquetes: list[PaqueteAlcanceIA] = Field(default_factory=list)
+    datos_faltantes: list[str] = Field(default_factory=list)
+
+
 class PresupuestoIA(BaseModel):
     nombre_proyecto: str
     actividad_principal: str
@@ -2057,10 +2089,58 @@ class ValuacionPreciosIA(BaseModel):
     valuaciones: list[ValuacionPrecioIA]
 
 
+class RecursoCosteoIA(BaseModel):
+    categoria: str = Field(
+        description=(
+            "Familia del recurso: MATERIAL, HERRAJE, MANO_OBRA, CONSUMIBLE, EQUIPO, "
+            "TRANSPORTE, DESPERDICIO, SUBCONTRATO u OTROS."
+        )
+    )
+    concepto: str = Field(
+        description=(
+            "Recurso concreto que se presupuestaría para una unidad del concepto. "
+            "Ejemplos: tablero melamínico 18 mm, canto PVC, bisagra cierre suave, "
+            "taquete y tornillo, oficial de carpintería, ayudante, traslado."
+        )
+    )
+    unidad: str = Field(description="Unidad de compra o consumo del recurso: PZA, ML, M2, H, JGO, L, KG, etc.")
+    cantidad: float = Field(ge=0, description="Cantidad del recurso necesaria para UNA unidad de la actividad principal")
+    costo_unitario: float = Field(ge=0, description="Costo estimado en MXN por unidad del recurso, antes de indirectos y utilidad de la empresa")
+    obligatorio: bool = Field(description="True si el recurso forma parte normal del paquete para entregar correctamente el concepto")
+    criterio: str = Field(description="Criterio breve de metrado, consumo o estimación del recurso")
+
+
+class CosteoActividadIA(BaseModel):
+    codigo: str = Field(description="Código exacto de la actividad")
+    recursos: list[RecursoCosteoIA] = Field(description="Desglose interno completo de recursos para una unidad de actividad")
+    confianza: str = Field(description="Alta, Media o Baja")
+    requiere_cotizacion: bool = Field(description="True cuando el costo tiene alta variabilidad o requiere proveedor especializado")
+    advertencias: list[str] = Field(default_factory=list, description="Advertencias técnicas o supuestos relevantes")
+
+
+class CosteoPresupuestoIA(BaseModel):
+    actividades: list[CosteoActividadIA]
+
+
+class AuditoriaCosteoActividadIA(BaseModel):
+    codigo: str = Field(description="Código exacto de la actividad auditada")
+    recursos_corregidos: list[RecursoCosteoIA] = Field(description="Hoja de costeo corregida; sustituye completamente la anterior")
+    confianza: str = Field(description="Alta, Media o Baja")
+    requiere_cotizacion: bool = Field(description="True cuando debe confirmarse con proveedor")
+    hallazgos: list[str] = Field(default_factory=list, description="Errores u omisiones encontrados y corregidos")
+
+
+class AuditoriaCosteoPresupuestoIA(BaseModel):
+    actividades: list[AuditoriaCosteoActividadIA]
+
+
 class ClasificacionActividadIA(BaseModel):
     codigo: str = Field(description="Código exacto de la actividad recibida")
     partida: str = Field(description="Partida comercial corregida")
     subpartida: str = Field(description="Subpartida breve corregida, sin numeración")
+    titulo_comercial: str = Field(description="Título corto, claro y comercial corregido")
+    descripcion_tecnica: str = Field(description="Descripción técnica/comercial corregida, breve pero completa")
+    concepto_base: str = Field(description="Nombre genérico y reutilizable para el histórico")
     orden_ejecucion: int = Field(
         ge=1,
         le=999,
@@ -2154,7 +2234,37 @@ def error_gemini_transitorio(exc: Exception) -> bool:
 
 
 MAX_REINTENTOS_GEMINI = 50
-DELAY_REINTENTO_GEMINI_SEG = 10
+DELAY_REINTENTO_GEMINI_SEG = 30
+
+
+def configuracion_gemini_razonada(
+    response_schema=None,
+    thinking_level: str = "high",
+    max_output_tokens: int = 32768,
+    ground_with_search: bool = False,
+):
+    """Configura Gemini para presupuestación con razonamiento y búsqueda de mercado opcional."""
+    kwargs = {
+        "max_output_tokens": max_output_tokens,
+    }
+    if response_schema is not None:
+        kwargs.update({
+            "response_mime_type": "application/json",
+            "response_schema": response_schema,
+        })
+    try:
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+    except Exception:
+        # Compatibilidad con una versión antigua del SDK. El servidor mantiene
+        # razonamiento dinámico en modelos Gemini compatibles aunque no forcemos el nivel.
+        pass
+    if ground_with_search:
+        try:
+            kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+        except Exception:
+            # Si una versión vieja del SDK no reconoce GoogleSearch, seguimos sin grounding.
+            pass
+    return types.GenerateContentConfig(**kwargs)
 
 
 def generar_con_gemini_resistente(
@@ -2169,7 +2279,7 @@ def generar_con_gemini_resistente(
     """
     Ejecuta una etapa Gemini sin abandonarla por saturación temporal.
 
-    Política: hasta 50 intentos para errores transitorios, esperando 10 s entre
+    Política: hasta 50 intentos para errores transitorios, esperando 30 s entre
     cada intento. Los errores de modelo inexistente (404/NOT_FOUND) se propagan
     inmediatamente para que el nivel superior pruebe otro modelo.
 
@@ -2215,27 +2325,137 @@ def generar_con_gemini_resistente(
     raise ultimo_error if ultimo_error else RuntimeError("Error desconocido de Gemini.")
 
 
+def analizar_documento_necesidades_ia(
+    api_key: str,
+    model_name: str,
+    project_data: dict,
+    params: dict,
+    progress_callback=None,
+) -> MapaAlcanceIA:
+    """Primera pasada: convierte un briefing narrativo en un mapa estructurado de alcance.
+
+    Esta pasada no fija precios ni genera el presupuesto final. Su función es evitar que
+    necesidades como "ocultar el área de lavado" o "integrar una estación de café" se pierdan
+    al convertir un documento de interiorismo en actividades contratables.
+    """
+    client = genai.Client(api_key=api_key)
+    year = datetime.now().year
+    budget_level = project_data.get("budget_level", "Medio-alto")
+
+    prompt = f"""
+Actúa como ANALISTA SENIOR DE ALCANCE para una empresa de remodelación e interiorismo en Ciudad de México.
+Vas a recibir un documento narrativo de necesidades, no un catálogo de conceptos. Tu trabajo es convertirlo
+en un MAPA ESTRUCTURADO DE LO QUE REALMENTE DEBERÁ RESOLVERSE antes de generar las partidas y precios.
+
+NO GENERES PRECIOS. NO GENERES EL EXCEL. NO ELIMINES NECESIDADES PORQUE PAREZCAN "DE DISEÑO".
+
+PRINCIPIOS
+1. Lee el documento completo primero y vuelve a revisarlo buscando dependencias y trabajos implícitos.
+2. Distingue entre: necesidad del cliente, restricción, solución probable y trabajo realmente presupuestable.
+3. Una necesidad puede requerir varias disciplinas. Ejemplo: "ocultar e integrar el área de lavado"
+   puede implicar carpintería/mobiliario, herrajes, preparación y eventualmente ajustes eléctricos;
+   no la reduzcas a una sola palabra.
+4. "Evaluar", "revisar" o "considerar" no significa automáticamente ejecutar. Marca como trabajo probable
+   solo aquello que razonablemente deba contemplarse para resolver el objetivo; deja la incertidumbre en nivel_certeza.
+5. No agregues trabajos decorativos no respaldados por el documento.
+6. Conserva las áreas explícitas y sus m². Si una necesidad afecta una zona concreta, asígnala a esa zona.
+7. Detecta entregables independientes aunque estén dentro de la misma habitación.
+8. Para muebles o elementos a medida, identifica su función, componentes previsibles y dependencias; no los
+   conviertas todavía en precios.
+9. Identifica faltantes de información que podrían cambiar materialmente el metrado, pero no bloquees el análisis.
+10. Devuelve un mapa que sirva como contexto para otra IA que posteriormente generará partidas comerciales.
+
+TIPO DE PROYECTO: {project_data['project_type']}
+UBICACIÓN: {project_data['location'] or 'No indicada'}
+NIVEL: {budget_level}
+AÑO: {year}
+
+DOCUMENTO ORIGINAL
+{project_data['description']}
+
+GUÍA ADICIONAL
+{project_data['guide_text'] or 'Sin instrucciones adicionales.'}
+
+PARÁMETROS ECONÓMICOS: NO LOS USES PARA FIJAR PRECIOS EN ESTA ETAPA.
+"""
+
+    last_error = None
+    for model in _modelos_gemini_disponibles(model_name):
+        try:
+            response = generar_con_gemini_resistente(
+                client=client, model=model, contents=prompt,
+                config=configuracion_gemini_razonada(
+                    MapaAlcanceIA, thinking_level="high", max_output_tokens=24576
+                ),
+                progress_callback=progress_callback,
+                etapa="0/4 · Interpretando necesidades y alcance",
+            )
+            return MapaAlcanceIA.model_validate_json(response.text)
+        except Exception as exc:
+            last_error = exc
+            if not error_gemini_modelo_no_disponible(exc):
+                raise
+    raise RuntimeError(f"No fue posible interpretar el documento de necesidades: {last_error}")
+
+
 def generar_presupuesto_ia(
     api_key: str,
     model_name: str,
     project_data: dict,
     params: dict,
     progress_callback=None,
+    scope_map: MapaAlcanceIA | None = None,
 ) -> PresupuestoIA:
     client = genai.Client(api_key=api_key)
     year = datetime.now().year
     budget_level = project_data.get("budget_level", "Medio-alto")
     level_criterion = criterio_nivel_presupuesto(budget_level)
 
-    prompt = f"""
-Actúa como un INGENIERO DE COSTOS SENIOR de una empresa de remodelación de alto
-nivel, con experiencia en presupuestos residenciales y comerciales. La empresa
-opera principalmente en Ciudad de México y SUBCONTRATA prácticamente todas las
-actividades.
+    scope_map_text = json.dumps(scope_map.model_dump() if scope_map else {}, ensure_ascii=False, separators=(",", ":"))
 
-No te limites a copiar la lista del usuario. Interpreta el alcance como un
-profesional de costos, detecta trabajos indispensables y conviértelos en
-conceptos comerciales claros.
+    prompt = f"""
+Actúa como un INGENIERO DE COSTOS SENIOR y EDITOR DE PRESUPUESTOS COMERCIALES de una
+empresa de remodelación e interiorismo de alto nivel en Ciudad de México. La empresa
+SUBCONTRATA prácticamente todas las actividades.
+
+ESTILO COMERCIAL DE LA EMPRESA — OBLIGATORIO
+El presupuesto final debe parecer escrito por un presupuestista humano con experiencia,
+no por una IA que simplemente reescribe el briefing. Usa esta estructura mental:
+
+PARTIDA
+  Área
+    Actividad puntual con acción + elemento + medida/especificación + alcance incluido.
+
+Ejemplos de referencia del estilo de la empresa:
+- "Desmontaje y retiro de mueble de almacenamiento antiguo de piso a techo de 6.75m2."
+- "Instalación de 1 pto eléctrico para extractor de aire junto a ventana, incluye ranurado, cableado y adaptaciones/resanes menores en muro."
+- "Aplicación de pintura lavable en muros de 18m2."
+- "Fabricación e instalación de banca de entrada para calzado de 0.60ml."
+- "Fabricación e instalación de mueble para TV y escritorio de 3.58ml, con gabinetes inferiores y repisas de madera."
+- "Suministro e instalación de espejo de 0.78m2 (1.30 x 0.60m)."
+- "Suministro de 1 sofá en L de 5.5ml, con tapiz textil color beige/gris, diseño modular divisible en 3 sillones."
+
+REGLAS DERIVADAS DEL ESTILO
+1. No conviertas el presupuesto en una lista plana. Conserva la estructura PARTIDA → ÁREA → ACTIVIDADES.
+2. Una actividad = un alcance comercial que un proveedor pueda entender y cotizar.
+3. En la misma área, separa muebles o suministros que sean físicamente distintos.
+4. Junta solamente tareas homogéneas que naturalmente se cotizan como un mismo servicio y comparten preparación,
+   ejecución y acabado; por ejemplo, pintura de muros de una misma área puede ir junta.
+5. Empieza las descripciones con verbos comerciales claros: "Fabricación e instalación", "Suministro e instalación",
+   "Suministro", "Aplicación", "Instalación", "Desmontaje y retiro".
+6. Conserva medidas, cantidades, colores, materiales, acabados, ubicación, diseño y referencias a showroom/muestras
+   cuando el usuario las haya dado. No sustituyas una especificación por una genérica.
+7. La descripción debe ser suficientemente completa para cotización, pero NO debe convertirse en un APU ni enumerar
+   tableros, tornillos, horas de mano de obra o herramientas; esos elementos son internos.
+8. Para un mueble a medida, identifica externamente su función y forma de contratación; el desglose físico de materiales,
+   herrajes, mano de obra, transporte y consumibles se hace después en la hoja interna de costeo.
+9. No agregues partidas de proyecto, ingeniería, permisos o trabajos constructivos solo por rutina. Inclúyelos únicamente
+   cuando el alcance realmente los justifique.
+10. Las "Consideraciones generales" son instrucciones transversales: conviértelas en actividades solo cuando representen
+    un costo real que deba presupuestarse (por ejemplo protección general o limpieza final); no conviertas cada frase
+    de coordinación en un concepto.
+11. No expongas cadenas de pensamiento. El razonamiento debe ocurrir internamente y la salida debe ser estructurada.
+
 
 CONFIGURACIÓN FIJA DE LA EMPRESA
 - Referencia de mercado: Ciudad de México, {year}.
@@ -2262,6 +2482,13 @@ DESCRIPCIÓN GENERAL DE LOS TRABAJOS
 
 CONSIDERACIONES GENERALES DEL PROYECTO
 {project_data['guide_text'] or 'Sin consideraciones adicionales.'}
+
+MAPA ESTRUCTURADO DE NECESIDADES — PRIMERA PASADA DE IA
+{scope_map_text}
+
+Usa este mapa como capa intermedia de interpretación. No lo copies ciegamente: contrástalo con el
+documento original y corrige cualquier interpretación incorrecta. Es obligatorio preservar las necesidades
+explícitas del documento y convertir los paquetes pertinentes en actividades contratables.
 
 PARÁMETROS COMERCIALES
 Indirectos: {params['indirect_pct']:.2f}%
@@ -2314,12 +2541,32 @@ REVISIÓN DEL ALCANCE
    tipo, genera dos actividades: una con cantidad 2 para el primer tipo y otra
    con cantidad 1 para el segundo. No combines ambos tipos en una sola actividad.
 
-3. No omitas un trabajo indispensable solo porque no fue escrito literalmente.
-   Si la inclusión es inferida, indícalo brevemente en fundamento_inclusion o
-   consideraciones.
-4. No agregues trabajos opcionales o decorativos ajenos al alcance.
+3. Convierte cada paquete de alcance relevante del mapa en una o varias actividades contratables.
+   Si un paquete contiene entregables físicamente distintos, SEPÁRALOS. Ejemplo: una estación de café,
+   un cerramiento para ocultar lavado y un copete para refrigerador son tres elementos diferentes aunque estén
+   en la misma zona.
+4. No omitas un trabajo indispensable solo porque no fue escrito literalmente. Si la inclusión es inferida,
+   indícalo brevemente en fundamento_inclusion o consideraciones.
+5. No agregues trabajos opcionales o decorativos ajenos al alcance.
+6. Para instrucciones verbales como "evaluar", "revisar" o "considerar", distingue entre inspección/diagnóstico,
+   suministro e instalación. No cotices una ejecución definitiva si el documento solo pide evaluar, salvo que
+   exista suficiente contexto para inferir que la corrección es parte del alcance.
 
 PARTIDAS Y SUBPARTIDAS
+4.1. ESTILO DE REDACCIÓN: cada actividad debe poder copiarse directamente a un presupuesto humano.
+     Estructura preferida: VERBO/ACCIÓN + ELEMENTO + MEDIDA + ESPECIFICACIÓN + INCLUYE.
+     Ejemplos: "Desmontaje y retiro de mueble de almacenamiento antiguo de piso a techo de 6.75m2.";
+     "Fabricación e instalación de mueble tipo coffee station de 1.00ml.";
+     "Aplicación de pintura lavable en muros de 18m2.";
+     "Suministro e instalación de espejo de 0.78m2 (1.30 x 0.60m)."
+     No copies literalmente los ejemplos salvo que correspondan al proyecto; úsalos como patrón.
+
+4.2. AGRUPACIÓN: no mezcles en una sola actividad muebles, suministros o trabajos físicamente distintos.
+     Sí agrupa tareas homogéneas de un mismo servicio y área cuando el proveedor las cotizaría juntas.
+
+4.3. MUEBLES: usa "Fabricación e instalación de..." para carpintería hecha a medida; "Suministro..." para piezas
+     compradas; "Suministro e instalación..." cuando ambas cosas formen parte del alcance.
+
 5. Usa preferentemente, cuando correspondan:
    - PROYECTO Y TRÁMITES
    - PRELIMINARES Y PROTECCIONES
@@ -2427,9 +2674,10 @@ CONTROL DE CALIDAD
     modelos = []
     for model in [
         model_name,
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
         "gemini-3.6-flash",
         "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
     ]:
         if model and model not in modelos:
             modelos.append(model)
@@ -2439,8 +2687,8 @@ CONTROL DE CALIDAD
         try:
             response = generar_con_gemini_resistente(
                 client=client, model=model, contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json", response_schema=PresupuestoIA
+                config=configuracion_gemini_razonada(
+                    PresupuestoIA, thinking_level="high", max_output_tokens=32768
                 ),
                 progress_callback=progress_callback,
                 etapa="1/4 · Generación del presupuesto",
@@ -2482,21 +2730,30 @@ def auditar_estructura_presupuesto_ia(
             "area": act.area,
             "partida_actual": act.partida,
             "subpartida_actual": act.subpartida,
-            "titulo": act.titulo_comercial,
-            "descripcion": act.descripcion_tecnica,
+            "titulo_actual": act.titulo_comercial,
+            "descripcion_actual": act.descripcion_tecnica,
+            "concepto_base_actual": act.concepto_base,
+            "unidad": act.unidad,
+            "cantidad": float(act.cantidad),
             "orden_actual": act.orden_ejecucion,
         }
         for act in result.actividades
     ]
 
     prompt = f"""
-Actúa como AUDITOR DE PARTIDAS Y SECUENCIA DE OBRA.
+Actúa como AUDITOR Y EDITOR FINAL DE PARTIDAS, REDACCIÓN COMERCIAL Y SECUENCIA DE OBRA.
 
-Revisa el presupuesto COMPLETO como un conjunto. No cambies actividades,
-cantidades, unidades, descripciones, especificaciones ni precios. Solo corrige:
+Revisa el presupuesto COMPLETO como un conjunto. NO cambies el número de actividades,
+las cantidades ni las unidades. Sí puedes corregir los campos de presentación comercial:
 - partida;
 - subpartida;
+- titulo_comercial;
+- descripcion_tecnica;
+- concepto_base;
 - orden_ejecucion.
+
+No cambies el alcance técnico real de la actividad: mejora únicamente su clasificación y redacción
+para que sea más clara, cotizable y consistente con el estilo de la empresa.
 
 PROYECTO
 Tipo: {project_data['project_type']}
@@ -2530,7 +2787,14 @@ CRITERIOS
 10. En CARPINTERÍA/MOBILIARIO considera además que actividades separadas pueden
    representar muebles distintos del mismo espacio. No homogeneices títulos o
    subpartidas de forma que se pierda la distinción entre esos muebles.
-11. Devuelve exactamente una entrada por cada código recibido y conserva el código.
+11. Redacta en el estilo comercial de la empresa: acción + elemento + medida/especificación + alcance incluido.
+   Ejemplos de patrón: "Fabricación e instalación de mueble para TV y escritorio de 3.58ml, con gabinetes
+   inferiores y repisas de madera."; "Suministro e instalación de espejo de 0.78m2 (1.30 x 0.60m).";
+   "Aplicación de pintura lavable en muros de 18m2."; "Desmontaje y retiro de mueble de almacenamiento
+   antiguo de piso a techo de 6.75m2." No copies un ejemplo si no corresponde al proyecto.
+12. Evita títulos genéricos como "Carpintería", "Mueble", "Acabados" o "Instalación" cuando pueda
+   identificarse el objeto real. El título debe reconocer el elemento que se está cobrando.
+13. Devuelve exactamente una entrada por cada código recibido y conserva el código, cantidad y unidad.
 
 No incluyas explicaciones adicionales.
 """
@@ -2538,9 +2802,10 @@ No incluyas explicaciones adicionales.
     models = []
     for model in [
         model_name,
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
         "gemini-3.6-flash",
         "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
     ]:
         if model and model not in models:
             models.append(model)
@@ -2549,8 +2814,8 @@ No incluyas explicaciones adicionales.
         try:
             response = generar_con_gemini_resistente(
                 client=client, model=model, contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json", response_schema=AuditoriaEstructuraIA
+                config=configuracion_gemini_razonada(
+                    AuditoriaEstructuraIA, thinking_level="high", max_output_tokens=16384
                 ),
                 progress_callback=progress_callback,
                 etapa="2/4 · Auditoría de estructura",
@@ -2578,6 +2843,9 @@ No incluyas explicaciones adicionales.
                         update={
                             "partida": normalizar_seccion_comercial(correction.partida),
                             "subpartida": correction.subpartida.strip() or act.subpartida,
+                            "titulo_comercial": correction.titulo_comercial.strip() or act.titulo_comercial,
+                            "descripcion_tecnica": correction.descripcion_tecnica.strip() or act.descripcion_tecnica,
+                            "concepto_base": correction.concepto_base.strip() or act.concepto_base,
                             "orden_ejecucion": int(correction.orden_ejecucion),
                         }
                     )
@@ -2691,7 +2959,7 @@ REGLAS DEL EDITOR
 """
 
     modelos = []
-    for model in [model_name, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]:
+    for model in _modelos_gemini_disponibles(model_name):
         if model and model not in modelos:
             modelos.append(model)
 
@@ -2702,9 +2970,8 @@ REGLAS DEL EDITOR
                 client=client,
                 model=model,
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=RevisionPresupuestoIA,
+                config=configuracion_gemini_razonada(
+                    RevisionPresupuestoIA, thinking_level="high", max_output_tokens=32768
                 ),
                 progress_callback=progress_callback,
                 etapa="2/4 · Interpretando cambios",
@@ -2922,9 +3189,10 @@ referencia genérica representa un trabajo especial.
     models = []
     for model in [
         model_name,
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
         "gemini-3.6-flash",
         "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
     ]:
         if model and model not in models:
             models.append(model)
@@ -2963,6 +3231,344 @@ referencia genérica representa un trabajo especial.
     )
 
 
+def _modelos_gemini_disponibles(model_name: str | None) -> list[str]:
+    modelos = []
+    for model in [
+        model_name,
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+    ]:
+        if model and model not in modelos:
+            modelos.append(model)
+    return modelos
+
+
+def costear_actividad_detalladamente_ia(
+    api_key: str,
+    model_name: str,
+    project_data: dict,
+    params: dict,
+    activity: ActividadIA,
+    internal_reference: dict | None = None,
+    progress_callback=None,
+) -> CosteoActividadIA:
+    """Construye una hoja interna de costo por recursos para UNA unidad de actividad.
+
+    La salida no se muestra al cliente. Su finalidad es obligar al modelo a metrar y
+    costear materiales, herrajes, mano de obra, consumibles, equipo y logística antes
+    de fijar el costo unitario final.
+    """
+    client = genai.Client(api_key=api_key)
+    year = datetime.now().year
+    budget_level = project_data.get("budget_level", "Medio-alto")
+    level_criterion = criterio_nivel_presupuesto(budget_level)
+
+    reference_text = json.dumps(internal_reference or {}, ensure_ascii=False, separators=(",", ":"))
+    prompt = f"""
+Actúa como un PRESUPUESTISTA SENIOR y ESPECIALISTA EN COSTOS DE CARPINTERÍA, INTERIORISMO
+Y REMODELACIÓN en Ciudad de México. Vas a construir la HOJA INTERNA DE COSTEO de una
+sola actividad. Esta hoja será revisada por otro modelo antes de convertirse en precio.
+
+OBJETIVO
+No des un precio aproximado por ML/M2/PZA de forma directa. Primero reconstruye lo que
+REALMENTE tendría que comprar, fabricar, transportar, instalar y pagar un subcontratista
+para ejecutar esta actividad. Después expresa cada recurso por separado.
+
+REGLA CRÍTICA
+- Las cantidades de "recursos" deben corresponder a UNA SOLA UNIDAD de la actividad principal.
+- La actividad principal puede estar expresada por ML, M2, PZA, PTO o LOTE, pero eso NO significa que debas
+  costearla con un precio unitario genérico. Reconstruye primero su contenido físico.
+- Si solo existe un área global (por ejemplo 6.75 M2 de un mueble) y faltan ancho/alto/profundidad, conserva la
+  unidad/cantidad comercial, formula una geometría constructiva profesional para el costeo interno y registra la
+  hipótesis; no cambies silenciosamente la cantidad comercial.
+- Distingue entre superficie comercial y consumo real de fabricación: un mueble de 6.75 M2 de frente puede requerir
+  muchos más M2 de tablero por laterales, divisiones, puertas, entrepaños, respaldo, zoclo, etc.
+- Si la actividad es PZA, un recurso debe cubrir una pieza completa.
+- Si es ML, M2, M3, etc., los recursos deben expresarse por UN ML/M2/M3.
+- No uses una sola línea "mueble completo" ni "materiales varios" cuando sea posible identificar
+  los componentes reales.
+- Para muebles, piensa como fabricante: tableros/paneles, entrepaños, respaldos, zoclos,
+  cantos, herrajes, fijaciones, consumibles, mano de obra de despiece/canteado/armado/instalación,
+  transporte y otros costos normales del proveedor.
+- Para repisas, por ejemplo, identifica explícitamente la cantidad de repisas, laterales/divisiones,
+  sistema de fijación o soporte, acabado/canto y horas de fabricación e instalación. No supongas que una repisa
+  es simplemente 1 ML de tablero.
+- Para pintura, descompón internamente preparación/resanes/sellador/pintura y mano de obra según el alcance;
+  la actividad comercial puede seguir siendo una sola "Aplicación de pintura...".
+- Para instalaciones eléctricas, considera internamente mecanismo/accesorios, caja, cableado, tubería o canalización,
+  ranurado, resane y mano de obra cuando correspondan; la partida comercial debe seguir siendo clara y compacta.
+- Para suministros de mobiliario, considera internamente costo de compra, traslado, protección, armado o instalación
+  si el alcance los incluye.
+- Considera merma/desperdicio físicamente razonable dentro de la cantidad del recurso o como
+  una línea explícita de categoría DESPERDICIO. No vuelvas a sumar un desperdicio global después.
+- No incluyas utilidad ni indirectos de NUESTRA empresa. Solo el costo de subcontratación.
+- Un costo puede incluir gastos normales del propio subcontratista cuando formen parte natural
+  de contratar ese servicio.
+- No inventes una precisión falsa: cuando falten datos críticos, usa una hipótesis profesional
+  y deja una advertencia.
+- Cuando el costo de un material, herraje o insumo sea material para el total, usa la búsqueda
+  de Google disponible en Gemini para contrastar precios vigentes en México/CDMX y referencias de
+  proveedores o distribuidores. No uses la búsqueda como sustituto del metrado físico.
+
+EJEMPLO DE RAZONAMIENTO DESEADO
+Si el usuario pide un mueble de repisas de 3 ML x 2 M de alto, no respondas solo "3 ML x $X".
+Analiza, por ejemplo, cuántos entrepaños caben razonablemente, qué paneles verticales requiere,
+qué fijación necesita, qué cantidad de tablero y canto se consume, cuántas horas de fabricación
+/ armado / instalación hacen falta, y qué transporte o consumibles son normales. La cantidad y
+material exactos deben adaptarse al alcance real, no copiar este ejemplo literalmente.
+
+PROYECTO
+Cliente: {project_data['name']}
+Ubicación: {project_data['location'] or 'No indicada'}
+Tipo: {project_data['project_type']}
+Nivel: {budget_level}
+Criterio: {level_criterion}
+Año de referencia: {year}
+
+DESCRIPCIÓN ORIGINAL
+{project_data['description']}
+
+GUÍA
+{project_data['guide_text'] or 'Sin instrucciones adicionales.'}
+
+PARÁMETROS ECONÓMICOS (SOLO CONTEXTO, NO APLICAR)
+Indirectos empresa: {params['indirect_pct']:.2f}%
+Utilidad empresa: {params['profit_pct']:.2f}%
+IVA: {params['iva_pct']:.2f}%
+
+ACTIVIDAD A COSTEAR
+{json.dumps({
+    'codigo': activity.codigo_sugerido,
+    'area': activity.area,
+    'partida': activity.partida,
+    'subpartida': activity.subpartida,
+    'titulo_comercial': activity.titulo_comercial,
+    'descripcion_tecnica': activity.descripcion_tecnica,
+    'unidad': activity.unidad,
+    'cantidad_actividad': float(activity.cantidad),
+    'criterio_cantidad': activity.criterio_cantidad,
+    'nivel_confianza_cantidad': activity.nivel_confianza_cantidad,
+    'estimacion_inicial_debil': float(activity.costo_unitario_estimado),
+    'composicion_inicial': {
+        'materiales_pct': float(activity.porcentaje_materiales),
+        'mano_obra_pct': float(activity.porcentaje_mano_obra),
+        'otros_pct': float(activity.porcentaje_otros),
+        'desperdicio_pct': float(activity.desperdicio_materiales_pct),
+    },
+}, ensure_ascii=False, separators=(',', ':'))}
+
+REFERENCIA HISTÓRICA INTERNA (solo si existe; no la copies ciegamente)
+{reference_text}
+
+ANTES DE RESPONDER, REVISA DOS VECES TU PROPIO COSTEO:
+1) ¿Faltó algún componente físico o servicio necesario?
+2) ¿Las cantidades corresponden a UNA unidad de la actividad y no a toda la obra?
+3) ¿Incluiste fijaciones/herrajes/consumibles/instalación cuando aplican?
+4) ¿La mano de obra tiene horas o una cantidad equivalente defendible?
+5) ¿El transporte/logística tiene sentido para el paquete?
+6) ¿Hay doble conteo entre materiales y desperdicio?
+7) ¿El costo resultante es razonable para subcontratación en CDMX y para el nivel especificado?
+
+Devuelve SOLO la hoja estructurada. El total lo calculará Python sumando cantidad x costo_unitario
+por recurso; no intentes sustituir el desglose por una cifra única.
+"""
+
+    last_error = None
+    for model in _modelos_gemini_disponibles(model_name):
+        try:
+            response = generar_con_gemini_resistente(
+                client=client,
+                model=model,
+                contents=prompt,
+                config=configuracion_gemini_razonada(
+                    CosteoActividadIA,
+                    thinking_level="high",
+                    max_output_tokens=32768,
+                    ground_with_search=True,
+                ),
+                progress_callback=progress_callback,
+                etapa=f"Costeo detallado · {activity.codigo_sugerido}",
+            )
+            return CosteoActividadIA.model_validate_json(response.text)
+        except Exception as exc:
+            last_error = exc
+            if not error_gemini_modelo_no_disponible(exc):
+                raise
+    raise RuntimeError(f"No fue posible construir el costeo detallado de {activity.codigo_sugerido}: {last_error}")
+
+
+def auditar_costeos_detallados_ia(
+    api_key: str,
+    model_name: str,
+    project_data: dict,
+    params: dict,
+    result: PresupuestoIA,
+    costings: CosteoPresupuestoIA,
+    references: list[dict],
+    progress_callback=None,
+) -> AuditoriaCosteoPresupuestoIA:
+    """Segunda lectura: revisa el conjunto de hojas de costo y devuelve correcciones completas."""
+    client = genai.Client(api_key=api_key)
+    year = datetime.now().year
+    budget_level = project_data.get("budget_level", "Medio-alto")
+
+    compact_costings = []
+    for costing in costings.actividades:
+        recursos = []
+        for resource in costing.recursos:
+            recursos.append(resource.model_dump())
+        costo_unitario_calculado = sum(
+            float(r.get("cantidad") or 0.0) * float(r.get("costo_unitario") or 0.0)
+            for r in recursos
+        )
+        compact_costings.append({
+            "codigo": costing.codigo,
+            "recursos": recursos,
+            "costo_unitario_calculado_python": round(costo_unitario_calculado, 2),
+            "confianza": costing.confianza,
+            "requiere_cotizacion": costing.requiere_cotizacion,
+            "advertencias": costing.advertencias,
+        })
+
+    prompt = f"""
+Actúa como un AUDITOR DE COSTOS DE SEGUNDA LECTURA. No estás generando un presupuesto desde cero:
+estás verificando hojas de costeo ya construidas por otro presupuestista.
+
+OBJETIVO
+Revisa actividad por actividad y también el presupuesto completo para detectar omisiones,
+doble conteo, cantidades mal dimensionadas, mano de obra insuficiente, herrajes/fijaciones
+faltantes, logística omitida, desperdicios mal aplicados o precios unitarios incoherentes.
+Cuando detectes un problema, corrige la hoja completa de recursos de esa actividad.
+
+IMPORTANTE
+- No conviertas esto en un simple precio por ML/M2/PZA.
+- Conserva el carácter de costeo físico: cada recurso debe tener concepto, unidad, cantidad y costo.
+- Las cantidades de recursos son por UNA unidad de la actividad principal.
+- El costo unitario definitivo lo calculará Python como suma de cantidad x costo_unitario de los recursos corregidos.
+- No apliques indirectos, utilidad ni IVA de nuestra empresa.
+- Usa referencias internas validadas como anclas cuando sean realmente comparables, pero no las copies ciegamente.
+- Cuando un insumo o precio de mercado sea determinante y pueda verificarse, usa Google Search
+  para contrastar referencias vigentes en México/CDMX. La búsqueda complementa el criterio de costos,
+  pero no reemplaza el metrado físico.
+- Respeta las especificaciones del proyecto y el nivel seleccionado.
+
+PROYECTO
+Cliente: {project_data['name']}
+Ubicación: {project_data['location'] or 'No indicada'}
+Tipo: {project_data['project_type']}
+Nivel: {budget_level}
+Año: {year}
+
+DESCRIPCIÓN ORIGINAL
+{project_data['description']}
+
+HOJAS DE COSTEO GENERADAS
+{json.dumps(compact_costings, ensure_ascii=False, separators=(',', ':'))}
+
+REFERENCIAS INTERNAS POR ACTIVIDAD
+{json.dumps(references, ensure_ascii=False, separators=(',', ':'))}
+
+ACTIVIDADES DEL PRESUPUESTO
+{json.dumps([
+    {
+        'codigo': a.codigo_sugerido,
+        'area': a.area,
+        'titulo': a.titulo_comercial,
+        'descripcion': a.descripcion_tecnica,
+        'unidad': a.unidad,
+        'cantidad': float(a.cantidad),
+    }
+    for a in result.actividades
+], ensure_ascii=False, separators=(',', ':'))}
+
+REVISA EN ESPECIAL CARPINTERÍA/MOBILIARIO:
+- que no se haya valuado solo por ML;
+- que el despiece físico sea creíble para las dimensiones;
+- que entrepaños, costados, respaldos, zoclos, cantos y herrajes estén contemplados cuando correspondan;
+- que la fabricación y la instalación tengan tiempo razonable;
+- que fijaciones y consumibles no desaparezcan;
+- que transporte/logística no se ignore cuando sea normal;
+- que un mismo componente no se haya contado dos veces.
+
+Devuelve exactamente una actividad auditada por cada código recibido.
+"""
+
+    last_error = None
+    for model in _modelos_gemini_disponibles(model_name):
+        try:
+            response = generar_con_gemini_resistente(
+                client=client,
+                model=model,
+                contents=prompt,
+                config=configuracion_gemini_razonada(
+                    AuditoriaCosteoPresupuestoIA,
+                    thinking_level="high",
+                    max_output_tokens=32768,
+                    ground_with_search=True,
+                ),
+                progress_callback=progress_callback,
+                etapa="Auditoría de costeos detallados",
+            )
+            audit = AuditoriaCosteoPresupuestoIA.model_validate_json(response.text)
+            expected = {a.codigo_sugerido.strip().upper() for a in result.actividades}
+            received = {a.codigo.strip().upper() for a in audit.actividades}
+            missing = expected - received
+            if missing:
+                raise RuntimeError("La auditoría de costos omitió códigos: " + ", ".join(sorted(missing)))
+            return audit
+        except Exception as exc:
+            last_error = exc
+            if not error_gemini_modelo_no_disponible(exc):
+                raise
+    raise RuntimeError(f"No fue posible auditar los costeos detallados: {last_error}")
+
+
+def normalizar_recursos_costeo(resources: list[RecursoCosteoIA]) -> tuple[list[dict], float]:
+    """Normaliza recursos y calcula en Python el costo unitario, sin delegar la aritmética a Gemini."""
+    if not resources:
+        raise RuntimeError("La hoja de costeo llegó sin recursos; no se permite regresar a un precio por ML/M2/PZA.")
+
+    rows = []
+    total = 0.0
+    categories = set()
+    for resource in resources:
+        qty = max(float(resource.cantidad), 0.0)
+        unit_cost = max(float(resource.costo_unitario), 0.0)
+        amount = qty * unit_cost
+        total += amount
+        category = str(resource.categoria or "OTROS").strip().upper()
+        categories.add(category)
+        rows.append({
+            "categoria": category,
+            "concepto": str(resource.concepto or "Recurso").strip(),
+            "unidad": normalizar_unidad(resource.unidad),
+            "cantidad": qty,
+            "costo_unitario": unit_cost,
+            "importe": round(amount, 2),
+            "obligatorio": bool(resource.obligatorio),
+            "criterio": str(resource.criterio or "").strip(),
+        })
+
+    # Para muebles/carpintería exigimos como mínimo una base material/herraje y mano de obra.
+    # En otros conceptos dejamos que el tipo de trabajo determine las categorías.
+    hay_carpinteria = any(
+        token in normalizar_texto(f"{row['concepto']} {row['categoria']}").upper()
+        for row in rows
+        for token in ("MUEBLE", "CARPINTER", "TABLERO", "MELAMINA", "MDF", "REPISA", "CLOSET")
+    )
+    if hay_carpinteria:
+        if not any(cat in categories for cat in {"MATERIAL", "HERRAJE", "CONSUMIBLE"}):
+            raise RuntimeError("El costeo de carpintería no contiene materiales/herrajes/consumibles identificables.")
+        if "MANO_OBRA" not in categories:
+            raise RuntimeError("El costeo de carpintería no contiene mano de obra identificable.")
+
+    if total <= 0:
+        raise RuntimeError("El costeo detallado produjo un costo unitario cero.")
+    return rows, round(total, 2)
+
+
 def resolver_items(
     db: Database,
     result: PresupuestoIA,
@@ -2973,49 +3579,94 @@ def resolver_items(
     model_name: str | None = None,
     progress_callback=None,
 ) -> list[dict]:
+    """Resuelve actividades mediante costeo detallado + segunda auditoría.
+
+    El precio unitario final ya no proviene de una aproximación directa por ML/M2/PZA:
+    Python suma una hoja interna de recursos construida y luego revisada por Gemini.
+    """
     if not api_key:
         api_key = get_api_key_runtime()
     if not api_key:
         raise RuntimeError("Falta GEMINI_API_KEY para finalizar la valuación de precios.")
-    model_name = model_name or "gemini-3.6-flash"
+    model_name = model_name or "gemini-3.8-flash"
 
-    actualizar_progreso(progress_callback, 52, "3/4 · Consultando historial interno")
+    force_new_price_codes = {
+        str(x).strip().upper() for x in (force_new_price_codes or set())
+    }
+
+    actualizar_progreso(progress_callback, 50, "3/6 · Consultando historial interno")
     reference_packets, refs_by_code = _preparar_referencias_para_valuacion(
         db, result, project_data, params, force_new_price_codes=force_new_price_codes
     )
-    actualizar_progreso(progress_callback, 62, "3/4 · Referencias listas; preparando valuación final")
-    valuation = valorar_precios_ia(
+
+    # Primera lectura profunda: una hoja de costo independiente por actividad.
+    costings = []
+    total_acts = max(len(result.actividades), 1)
+    for idx, act in enumerate(result.actividades, start=1):
+        code = limpiar_codigo(act.codigo_sugerido, f"CON-{idx:03d}")
+        ref_data = refs_by_code.get(code.upper(), {})
+        internal = ref_data.get("internal")
+        actualizar_progreso(
+            progress_callback,
+            52 + int((idx - 1) / total_acts * 23),
+            f"4/6 · Construyendo costeo físico {idx}/{total_acts}: {code}",
+        )
+        costing = costear_actividad_detalladamente_ia(
+            api_key=api_key,
+            model_name=model_name,
+            project_data=project_data,
+            params=params,
+            activity=act,
+            internal_reference=(
+                {
+                    "costo_unitario": float(internal["unit_cost"]),
+                    "fuente": internal["source"],
+                    "estado": internal["status"],
+                    "confianza": internal["confidence"],
+                    "coincidencia": internal["match_score"],
+                    "detalle": internal["source_detail"],
+                }
+                if internal else None
+            ),
+            progress_callback=(
+                (lambda _pct, msg: actualizar_progreso(progress_callback, 52 + int((idx - 1) / total_acts * 23), msg))
+                if progress_callback is not None else None
+            ),
+        )
+        # Fuerza el código solicitado para evitar cualquier ambigüedad.
+        costing = costing.model_copy(update={"codigo": code})
+        costings.append(costing)
+
+    costings_bundle = CosteoPresupuestoIA(actividades=costings)
+    actualizar_progreso(progress_callback, 77, "5/6 · Segunda lectura: auditando materiales, herrajes, mano de obra y logística")
+    audit = auditar_costeos_detallados_ia(
         api_key=api_key,
         model_name=model_name,
         project_data=project_data,
         params=params,
         result=result,
-        reference_packets=reference_packets,
+        costings=costings_bundle,
+        references=reference_packets,
         progress_callback=(
-            (lambda _pct, msg: actualizar_progreso(progress_callback, 72, msg))
+            (lambda _pct, msg: actualizar_progreso(progress_callback, 80, msg))
             if progress_callback is not None else None
         ),
     )
-    valuations = {
-        x.codigo.strip().upper(): x for x in valuation.valuaciones
-    }
 
+    audit_by_code = {x.codigo.strip().upper(): x for x in audit.actividades}
     items = []
-    force_new_price_codes = {
-        str(x).strip().upper() for x in (force_new_price_codes or set())
-    }
 
     for idx, act in enumerate(result.actividades, start=1):
         fallback = f"CON-{idx:03d}"
         requested_code = limpiar_codigo(act.codigo_sugerido, fallback)
-        valuation_row = valuations.get(requested_code.upper())
-        if valuation_row is None:
-            raise RuntimeError(f"Gemini no devolvió precio final para {requested_code}.")
+        audited = audit_by_code.get(requested_code.upper())
+        if audited is None:
+            raise RuntimeError(f"La auditoría de costos no devolvió {requested_code}.")
+
+        resources, unit_cost = normalizar_recursos_costeo(audited.recursos_corregidos)
 
         ref_data = refs_by_code.get(requested_code.upper(), {})
         internal = ref_data.get("internal")
-
-        unit_cost = max(float(valuation_row.costo_unitario_final), 0.0)
         concept_id = internal.get("concept_id") if internal else None
         quantity = max(float(act.cantidad), 0.0)
         indirect_unit = unit_cost * params["indirect_pct"] / 100.0
@@ -3027,12 +3678,17 @@ def resolver_items(
         sale_margin_pct = (benefit_amount / sale_amount * 100.0) if sale_amount else 0.0
 
         considerations = act.consideraciones.strip()
-        if valuation_row.requiere_cotizacion:
-            considerations = (considerations + " | " if considerations else "") + "Requiere cotización de proveedor."
+        if audited.requiere_cotizacion:
+            suffix = "Requiere cotización de proveedor."
+            considerations = (considerations + " | " if considerations else "") + suffix
+        if audited.hallazgos:
+            summary = " | ".join(str(x).strip() for x in audited.hallazgos if str(x).strip())
+            if summary:
+                considerations = (considerations + " | " if considerations else "") + "Auditoría de costeo: " + summary
 
         detail_parts = [
-            "Precio final fijado por Gemini en segunda etapa de valuación.",
-            f"Fundamento: {valuation_row.fundamento_precio.strip()}",
+            "Costo unitario calculado por hoja de recursos + segunda auditoría IA.",
+            f"Recursos internos auditados: {len(resources)} líneas; suma matemática Python: ${unit_cost:,.2f}/{act.unidad}.",
         ]
         if internal:
             detail_parts.append(
@@ -3060,10 +3716,10 @@ def resolver_items(
             "sale_amount": sale_amount,
             "benefit_amount": benefit_amount,
             "sale_margin_pct": sale_margin_pct,
-            "price_source": "GEMINI_VALORADO",
+            "price_source": "GEMINI_COSTEO_AUDITADO",
             "price_source_detail": " | ".join(detail_parts),
-            "price_status": "ESTIMADO_IA_VALORADO",
-            "price_confidence": valuation_row.nivel_confianza,
+            "price_status": "ESTIMADO_IA_COSTEO_AUDITADO",
+            "price_confidence": audited.confianza,
             "material_share_pct": act.porcentaje_materiales,
             "labor_share_pct": act.porcentaje_mano_obra,
             "other_share_pct": act.porcentaje_otros,
@@ -3074,6 +3730,8 @@ def resolver_items(
             "quantity_criterion": act.criterio_cantidad.strip(),
             "inclusion_basis": act.fundamento_inclusion.strip(),
             "considerations": considerations,
+            # Se conserva internamente en session/checkpoint; el Excel no muestra este detalle.
+            "costing_breakdown": resources,
         }
         item_data = aplicar_composicion_costo(item_data)
         item_data["area_allocations"] = [{
@@ -3085,8 +3743,8 @@ def resolver_items(
         }]
         items.append(item_data)
 
+    actualizar_progreso(progress_callback, 92, "6/6 · Calculando precios de venta y cerrando presupuesto")
     return items
-
 
 
 
@@ -5079,6 +5737,7 @@ def crear_excel(
         if item["price_source"] in {
             "IA_ESTIMADO",
             "GEMINI_VALORADO",
+            "GEMINI_COSTEO_AUDITADO",
             "HISTORICO_IA",
         }:
             wt.cell(idx, 8).fill = PatternFill("solid", fgColor=trace_orange)
@@ -6621,7 +7280,7 @@ with st.sidebar:
         with st.expander("Configuración"):
             model_name = st.text_input(
                 "Modelo Gemini",
-                value="gemini-3.6-flash",
+                value="gemini-3.8-flash",
                 key="model_name",
             )
 
@@ -6651,6 +7310,7 @@ if section == "Catálogo e historial":
 def firma_generacion(project_data: dict, params: dict, model_name: str) -> str:
     """Firma estable para saber si un checkpoint corresponde a los mismos datos."""
     payload = {
+        "engine_version": DATABASE_CACHE_VERSION,
         "project_data": project_data,
         "params": params,
         "model_name": model_name or "",
@@ -7071,23 +7731,32 @@ if "generated" not in st.session_state:
             # ETAPA 1 -------------------------------------------------------
             if stage >= 1 and checkpoint_result:
                 result = PresupuestoIA.model_validate(checkpoint_result)
-                ui_progress(25, "1/4 · Recuperando estructura ya generada")
+                ui_progress(25, "1/6 · Recuperando estructura ya generada")
             else:
                 ui_progress(3, "Validando datos y preparando el proyecto")
-                ui_progress(8, "1/4 · Enviando el alcance completo a Gemini")
+                ui_progress(4, "1/6 · Interpretando áreas, necesidades y trabajos implícitos")
+                ui_progress(8, "1/6 · Convirtiendo el mapa de necesidades en partidas")
+                scope_map = analizar_documento_necesidades_ia(
+                    api_key=api_key,
+                    model_name=model_name,
+                    project_data=project_data,
+                    params=params,
+                    progress_callback=lambda _pct, msg: ui_progress(6, msg),
+                )
                 result = generar_presupuesto_ia(
                     api_key=api_key,
                     model_name=model_name,
                     project_data=project_data,
                     params=params,
-                    progress_callback=lambda _pct, msg: ui_progress(10, msg),
+                    scope_map=scope_map,
+                    progress_callback=lambda _pct, msg: ui_progress(12, msg),
                 )
                 guardar_checkpoint_generacion(
                     stage=1,
                     status="completada",
                     input_signature=input_signature,
                     result=result,
-                    mensaje="Estructura base generada.",
+                    mensaje="Mapa de necesidades interpretado y estructura base generada.",
                 )
                 stage = 1
 
@@ -7095,9 +7764,9 @@ if "generated" not in st.session_state:
             checkpoint = st.session_state.get("generation_checkpoint") or {}
             if stage >= 2 and checkpoint.get("result"):
                 result = PresupuestoIA.model_validate(checkpoint["result"])
-                ui_progress(45, "2/4 · Recuperando auditoría de partidas")
+                ui_progress(45, "2/6 · Recuperando auditoría de partidas")
             else:
-                ui_progress(38, "2/4 · Revisando partidas, subpartidas y secuencia de obra")
+                ui_progress(38, "2/6 · Revisando partidas, subpartidas y secuencia de obra")
                 result = auditar_estructura_presupuesto_ia(
                     api_key=api_key,
                     model_name=model_name,
@@ -7119,9 +7788,9 @@ if "generated" not in st.session_state:
             checkpoint_items = checkpoint.get("items")
             if stage >= 3 and checkpoint_items:
                 items = checkpoint_items
-                ui_progress(78, "3/4 · Recuperando valuación de precios ya completada")
+                ui_progress(78, "3/6 · Recuperando costeo ya completado")
             else:
-                ui_progress(52, "3/4 · Buscando precios históricos internos")
+                ui_progress(52, "3/6 · Buscando precios históricos internos")
                 # Dejamos explícito que estamos trabajando en esta etapa antes de
                 # entrar a Gemini. Si la etapa 3 falla, las etapas 1 y 2 siguen
                 # guardadas y la siguiente corrida comenzará aquí.
