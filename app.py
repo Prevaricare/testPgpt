@@ -7,7 +7,6 @@ import html
 import re
 import json
 import time
-import random
 import sqlite3
 import unicodedata
 import uuid
@@ -2014,7 +2013,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-09-29-v29-ahorro"
+DATABASE_CACHE_VERSION = "2026-09-29-v30-progreso"
 
 
 @st.cache_resource(show_spinner=False)
@@ -2330,7 +2329,7 @@ def error_gemini_transitorio(exc: Exception) -> bool:
 
 
 MAX_REINTENTOS_GEMINI = 3
-DELAY_REINTENTO_GEMINI_SEG = 4
+INTERVALO_GEMINI_SEG = 35
 
 
 def configuracion_gemini_razonada(
@@ -2378,11 +2377,12 @@ def generar_con_gemini_resistente(client,model,contents,config,progress_callback
     if cached is not None:
         if hasattr(schema,'model_validate_json'):schema.model_validate_json(cached['text'])
         registrar_uso_ia(etapa,model,'CACHE')
-        actualizar_progreso(progress_callback,0,etapa+' · respuesta recuperada')
+        actualizar_progreso(progress_callback,0,etapa+' · respuesta recuperada y validada; '+resumen_respuesta_gemini(cached['text']))
         return SimpleNamespace(text=cached['text'])
-    for attempt in range(min(3,max(1,max_reintentos_transitorios))):
+    total_intentos=max(1,max_reintentos_transitorios)
+    for attempt in range(total_intentos):
         esperar_turno_ia(model,progress_callback)
-        actualizar_progreso(progress_callback,0,f'{etapa} · intento {attempt+1}/3')
+        actualizar_progreso(progress_callback,0,f'{etapa} · solicitando a Gemini ({model}), intento {attempt+1}/{total_intentos}')
         started=time.monotonic()
         try:
             response=client.models.generate_content(model=model,contents=contents,config=config)
@@ -2390,17 +2390,23 @@ def generar_con_gemini_resistente(client,model,contents,config,progress_callback
             registrar_uso_ia(etapa,model,'ERROR',time.monotonic()-started,error_code=getattr(exc,'code',type(exc).__name__))
             if error_gemini_modelo_no_disponible(exc) or not error_gemini_transitorio(exc):raise
             delay=pausa_reintento_ia(exc,attempt)
-            if attempt+1>=min(3,max(1,max_reintentos_transitorios)):
-                raise GeminiPausa('Gemini sigue temporalmente no disponible. Se guardó el avance. Reanuda más tarde sin repetir los análisis terminados.') from exc
-            actualizar_progreso(progress_callback,0,f'{etapa} · reintento en {math.ceil(delay)} s')
-            time.sleep(delay)
+            actualizar_progreso(progress_callback,0,f'{etapa} · Gemini devolvió {type(exc).__name__}; {str(exc)[:150]}')
+            if attempt+1>=total_intentos:
+                raise GeminiPausa('Gemini no respondió tras los reintentos. El avance terminado quedó guardado.') from exc
+            actualizar_progreso(progress_callback,0,f'{etapa} · nuevo intento después de {math.ceil(delay)} s')
+            esperar_con_progreso(delay, progress_callback, 'Esperando antes del siguiente intento')
             continue
         registrar_uso_ia(etapa,model,'OK',time.monotonic()-started,response)
-        if not getattr(response,'text',None):raise GeminiPausa('Respuesta vacía. Se guardó el avance anterior; reintenta esta etapa.')
+        if not getattr(response,'text',None):raise GeminiPausa('Gemini devolvió una respuesta vacía. El avance terminado quedó guardado.')
         if hasattr(schema,'model_validate_json'):schema.model_validate_json(response.text)
         cache_ia_guardar(key,{'text':response.text})
+        usage=getattr(response,'usage_metadata',None)
+        entrada=getattr(usage,'prompt_token_count',None)
+        salida=getattr(usage,'candidates_token_count',None)
+        tokens=f' · entrada: {entrada if entrada is not None else "s/d"}, salida: {salida if salida is not None else "s/d"} tokens'
+        actualizar_progreso(progress_callback,0,etapa+' · Gemini respondió: '+resumen_respuesta_gemini(response.text)+tokens)
         return response
-    raise GeminiPausa('Solicitud pausada.')
+    raise GeminiPausa('Gemini no completó la solicitud.')
 
 
 def analizar_documento_necesidades_ia(
@@ -8947,15 +8953,39 @@ def render_secuencia_editor(g: dict, model: str, epoch: str):
     except Exception as exc:st.error(str(exc))
 
 
-# Motor de ahorro: ningún precio estimado se convierte automáticamente en validado.
-AI_ENGINE_VERSION = 'ahorro-1'
+# Los precios estimados requieren revisión antes de convertirse en referencias aprobadas.
+AI_ENGINE_VERSION = 'ahorro-1'  # Mantiene compatibles los análisis ya guardados.
 
 class GeminiPausa(RuntimeError):
-    """Solicitud pausada; el trabajo terminado permanece en el almacén."""
+    """Gemini no completó la solicitud; el trabajo terminado permanece guardado."""
 
 
 def modo_ahorro():
-    return bool(st.session_state.get('ai_economy', True))
+    # Se conserva el costeo por lotes y la validación Python sin mostrar ajustes técnicos.
+    return bool(st.session_state.get('ai_economy',True))
+
+
+def resumen_respuesta_gemini(response_text):
+    """Muestra resultados útiles sin copiar datos privados del presupuesto al registro."""
+    try:
+        data=json.loads(response_text)
+    except (TypeError, ValueError):
+        return f'respuesta de {len(response_text or "")} caracteres'
+    if not isinstance(data,dict):
+        return f'respuesta JSON de {len(response_text)} caracteres'
+    counts=[f'{len(value)} {name}' for name,value in data.items()
+            if isinstance(value,list) and name in {'actividades','areas','paquetes','valuaciones','operaciones','tareas'}]
+    return 'JSON válido'+(' · '+', '.join(counts) if counts else f' · {len(data)} campos')
+
+
+def esperar_con_progreso(seconds, progress_callback=None, message='Esperando'):
+    """Actualiza la cuenta regresiva sin iniciar solicitudes adicionales."""
+    remaining=max(0.0,float(seconds))
+    while remaining>0:
+        actualizar_progreso(progress_callback,0,f'{message}: {math.ceil(remaining)} s')
+        tick=min(5.0,remaining)
+        time.sleep(tick)
+        remaining-=tick
 
 
 def huella_ia(value):
@@ -9012,6 +9042,20 @@ def registrar_uso_ia(etapa, model, status, elapsed=0, response=None, error_code=
         except Exception:st.session_state['ai_usage_warning']='No se pudo registrar el consumo en la base; se conserva en esta sesión.'
 
 
+def render_uso_gemini():
+    """Consulta breve de solicitudes y tokens, sin opciones técnicas de ahorro."""
+    with st.sidebar.expander('Entradas y salidas de Gemini',expanded=False):
+        events=st.session_state.get('ai_usage') or []
+        calls=[event for event in events if event['estado'] in {'OK','ERROR'}]
+        st.caption(f"Solicitudes: {len(calls)} · Resultados recuperados: {sum(e['estado']=='CACHE' for e in events)}")
+        st.write(f"Tokens de entrada: {sum(e.get('entrada') or 0 for e in events):,}")
+        st.write(f"Tokens de salida: {sum(e.get('salida') or 0 for e in events):,}")
+        if any(e.get('total') is None for e in calls):
+            st.caption('Algunas respuestas no informaron consumo de tokens.')
+        if calls:
+            st.dataframe(pd.DataFrame(calls)[['at','etapa','estado','entrada','salida','segundos']],hide_index=True)
+
+
 def crear_cliente_ia(api_key):
     # Un solo intento en el SDK; la aplicación controla la espera y el máximo total.
     return genai.Client(api_key=api_key,http_options=types.HttpOptions(timeout=90000,retry_options=types.HttpRetryOptions(attempts=1)))
@@ -9020,31 +9064,27 @@ def crear_cliente_ia(api_key):
 def pausa_reintento_ia(exc, attempt):
     message=str(exc).lower()
     if any(word in message for word in ('requestsperday','tokensperday','per_day','perday','daily quota','daily limit')):
-        raise GeminiPausa('Cuota diaria agotada. Se guardó el avance; reanuda cuando se restablezca la cuota.') from exc
+        raise GeminiPausa('Cuota diaria de Gemini agotada. El avance terminado quedó guardado.') from exc
     matches=re.findall(r'(?:retrydelay[\s\"\x27:]+|retry in\s+)(\d+(?:\.\d+)?)',message)
-    delay=max([float(x) for x in matches] or [4 * (2 ** attempt)])
-    if delay>60:
-        raise GeminiPausa(f'Gemini solicita esperar {math.ceil(delay)} segundos. Se guardó el avance; reanuda después de esa espera.') from exc
-    return min(60,delay+random.uniform(0,1))
+    return max([INTERVALO_GEMINI_SEG]+[float(x) for x in matches])
 
 
 def esperar_turno_ia(model, progress_callback=None):
-    interval=float(st.session_state.get('ai_interval',8))
+    interval=INTERVALO_GEMINI_SEG
     database=almacen_ia(); now=time.time()
     if database:
         # Reserva atómica compartida por las sesiones de esta aplicación.
         with database._connect() as conn:
             cur=conn.cursor()
-            cur.execute(database._adapt('INSERT INTO ai_slots (model,next_at) VALUES (?,?) ON CONFLICT(model) DO NOTHING'),(model,now))
-            cur.execute(database._adapt('UPDATE ai_slots SET next_at=CASE WHEN next_at>? THEN next_at+? ELSE ? END WHERE model=? RETURNING next_at'),(now,interval,now+interval,model))
+            # La cuota RPM se comparte entre sesiones y modelos del mismo proyecto.
+            cur.execute(database._adapt('INSERT INTO ai_slots (model,next_at) VALUES (?,?) ON CONFLICT(model) DO NOTHING'),('__proyecto__',now))
+            cur.execute(database._adapt('UPDATE ai_slots SET next_at=CASE WHEN next_at>? THEN next_at+? ELSE ? END WHERE model=? RETURNING next_at'),(now,interval,now+interval,'__proyecto__'))
             row=cur.fetchone(); end=float(row['next_at'] if hasattr(row,'keys') else row[0]); conn.commit()
         delay=max(0,end-interval-now)
     else:
-        slots=st.session_state.setdefault('_ai_slots',{});delay=max(0,slots.get(model,0)-now);slots[model]=now+delay+interval
-    if delay>60:raise GeminiPausa('Hay solicitudes pendientes. El avance está guardado; vuelve a intentarlo en un minuto.')
+        slots=st.session_state.setdefault('_ai_slots',{});delay=max(0,slots.get('__proyecto__',0)-now);slots['__proyecto__']=now+delay+interval
     if delay:
-        actualizar_progreso(progress_callback,0,f'Pausa de {math.ceil(delay)} s para espaciar solicitudes')
-        time.sleep(delay)
+        esperar_con_progreso(delay,progress_callback,'Espaciando solicitudes a Gemini')
 
 
 def actividad_compacta(a):
@@ -9218,25 +9258,6 @@ def obtener_costeos_ahorro(database,result,project,api_key,model,refs,force_code
     return costs,AuditoriaCosteoPresupuestoIA(actividades=audits),sources
 
 
-def render_ahorro_ia(database):
-    with st.sidebar.expander('Uso de Gemini y ahorro',expanded=False):
-        st.checkbox('Modo ahorro',value=True,key='ai_economy')
-        if not database.persistent:st.caption('La base local conserva el avance durante esta ejecución, pero puede perderse al reiniciar Streamlit Cloud. PostgreSQL conserva el avance entre reinicios.')
-        st.number_input('Actividades por consulta',min_value=1,max_value=5,value=3,step=1,key='ai_batch_size')
-        st.number_input('Espera mínima entre solicitudes (s)',min_value=0,max_value=60,value=8,step=1,key='ai_interval')
-        st.checkbox('Auditoría IA de alertas de recursos',value=False,key='ai_selective_audit')
-        st.caption('Ahorro: sin búsqueda web automática; los precios IA requieren confirmación. Las respuestas y análisis se conservan 7 días. Las plantillas revisadas usan su vigencia propia.')
-        rows=st.session_state.get('ai_usage') or []
-        sent=[r for r in rows if r['estado'] in {'OK','ERROR'}]
-        st.write(f"Esta sesión: {len(sent)} solicitudes; {sum(r['estado']=='CACHE' for r in rows)} recuperaciones; {sum(r['estado']=='PLANTILLA' for r in rows)} plantillas.")
-        st.write('Tokens reportados: '+str(sum(r.get('total') or 0 for r in rows)))
-        st.caption('Las solicitudes fallidas pueden no reportar tokens. No se interpreta un dato ausente como consumo cero.')
-        if st.session_state.get('ai_usage_warning'):st.warning(st.session_state['ai_usage_warning'])
-        if st.button('Consultar consumo reciente',key='ai_usage_read'):
-            st.session_state['_ai_usage_view']=[json.loads(r['payload']) for r in database.fetchall('SELECT payload FROM ai_usage ORDER BY created_at DESC LIMIT 100')]
-        if st.session_state.get('_ai_usage_view'):st.dataframe(pd.DataFrame(st.session_state['_ai_usage_view']),hide_index=True)
-
-
 def render_plantilla_python(g,item,suffix):
     database=almacen_ia()
     if not database:return
@@ -9302,7 +9323,8 @@ except Exception as exc:
     st.exception(exc)
     st.stop()
 
-render_ahorro_ia(db)
+st.session_state['ai_economy']=True
+render_uso_gemini()
 
 with st.sidebar:
     st.header("Navegación")
@@ -9385,7 +9407,7 @@ if section == "Catálogo e historial":
 def firma_generacion(project_data: dict, params: dict, model_name: str) -> str:
     """Firma estable para saber si un checkpoint corresponde a los mismos datos."""
     payload = {
-        "engine_version": DATABASE_CACHE_VERSION,
+        "engine_version": "2026-09-29-v29-ahorro",  # Conserva checkpoints anteriores.
         "project_data": project_data,
         "params": params,
         "model_name": model_name or "",
@@ -9654,11 +9676,13 @@ if "generated" not in st.session_state:
             "Generar presupuesto",
             type="primary",
             use_container_width=True,
+            disabled=bool(st.session_state.get("generation_in_progress")),
         )
     with c2:
         clear_draft = st.button(
             "Borrar borrador",
             use_container_width=True,
+            disabled=bool(st.session_state.get("generation_in_progress")),
         )
 
     if clear_draft:
@@ -9710,36 +9734,21 @@ if "generated" not in st.session_state:
             st.stop()
 
         st.session_state["generation_in_progress"] = True
-        overlay = st.empty()
-        overlay.markdown(
-            """
-            <style>
-            div[data-testid="stAppViewContainer"]::before {
-                content: "Generando presupuesto...";
-                position: fixed;
-                inset: 0;
-                background: rgba(255,255,255,0.78);
-                z-index: 999999;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 1.15rem;
-                font-weight: 600;
-                color: #222;
-                pointer-events: all;
-                cursor: wait;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-        progress_bar = st.progress(0)
-        progress_text = st.empty()
+        st.session_state["generation_log"] = []
+        status = st.status("Generando presupuesto", expanded=True)
+        progress_bar = status.progress(0)
+        progress_text = status.empty()
+        log_view = status.empty()
 
         def ui_progress(pct: int, message: str):
-            # La UI principal conserva solo una barra: la información de estado va debajo.
-            progress_bar.progress(max(0, min(int(pct), 100)))
-            progress_text.markdown(f"**{pct}%** · {message}")
+            percent=max(0,min(int(pct),100))
+            progress_bar.progress(percent)
+            progress_text.caption(f"{percent}% · {message}")
+            entries=st.session_state["generation_log"]
+            if not entries or entries[-1]["message"]!=message:
+                entries.append({"time":datetime.now().strftime("%H:%M:%S"),"message":str(message)[:500]})
+                if len(entries)>160:del entries[:-160]
+            log_view.code("\n".join(f"[{entry['time']}] {entry['message']}" for entry in entries),language=None,height=320)
 
         try:
             input_signature = firma_generacion(project_data, params, model_name)
@@ -9776,6 +9785,7 @@ if "generated" not in st.session_state:
                     params=params,
                     progress_callback=lambda _pct, msg: ui_progress(6, msg),
                 )
+                ui_progress(10,f"Mapa interpretado: {len(scope_map.areas)} áreas y {len(scope_map.paquetes)} paquetes de trabajo")
                 result = generar_presupuesto_ia(
                     api_key=api_key,
                     model_name=model_name,
@@ -9784,6 +9794,7 @@ if "generated" not in st.session_state:
                     scope_map=scope_map,
                     progress_callback=lambda _pct, msg: ui_progress(12, msg),
                 )
+                ui_progress(25,f"Estructura generada: {len(result.actividades)} actividades")
                 guardar_checkpoint_generacion(
                     stage=1,
                     status="completada",
@@ -9807,6 +9818,7 @@ if "generated" not in st.session_state:
                     result=result,
                     progress_callback=lambda _pct, msg: ui_progress(40, msg),
                 )
+                ui_progress(45,f"Estructura revisada: {len(result.actividades)} actividades")
                 guardar_checkpoint_generacion(
                     stage=2,
                     status="completada",
@@ -9842,6 +9854,7 @@ if "generated" not in st.session_state:
                 )
                 if not items:
                     raise RuntimeError("La IA no generó actividades utilizables.")
+                ui_progress(90,f"Costeo terminado: {len(items)} actividades con importes calculados")
                 guardar_checkpoint_generacion(
                     stage=3,
                     status="completada",
@@ -9873,6 +9886,7 @@ if "generated" not in st.session_state:
                 mensaje="Excel preparado.",
             )
             ui_progress(100, "Presupuesto terminado")
+            status.update(label="Presupuesto terminado",state="complete",expanded=False)
             st.session_state["generated"] = {
                 "project_id": None, "budget_id": None, "saved": False,
                 "pending_revision": False, "project_code": provisional_code, "version": 1,
@@ -9887,20 +9901,18 @@ if "generated" not in st.session_state:
             st.session_state["generation_in_progress"] = False
             checkpoint = st.session_state.get("generation_checkpoint") or {}
             st.session_state["generation_last_error"] = str(exc)
-            overlay.empty()
-            progress_text.empty()
-            progress_bar.empty()
+            ui_progress(0,f"Error: {exc}")
+            status.update(label="Generación detenida",state="error",expanded=True)
             stage = int(checkpoint.get("stage") or 0)
             if error_gemini_transitorio(exc):
                 st.error(
-                    "Gemini sigue rechazando temporalmente la solicitud después de todos los reintentos. "
-                    f"Se conservó el avance hasta la etapa {stage}/4. "
-                    "Al volver a pulsar Generar presupuesto se reanudará desde el último checkpoint compatible."
+                    "Gemini no completó la solicitud tras los reintentos. "
+                    f"Se guardó el trabajo terminado hasta la etapa {stage}/4."
                 )
             else:
                 st.error(
                     "No fue posible completar la generación. "
-                    f"Se conservó el avance hasta la etapa {stage}/4. Detalle: {exc}"
+                    f"Se guardó el trabajo terminado hasta la etapa {stage}/4. Detalle: {exc}"
                 )
 
 
@@ -9911,6 +9923,9 @@ if "generated" not in st.session_state:
 
 else:
     g = st.session_state["generated"]
+    if st.session_state.get("generation_log"):
+        with st.expander("Registro de generación",expanded=False):
+            st.code("\n".join(f"[{entry['time']}] {entry['message']}" for entry in st.session_state["generation_log"]),language=None,height=320)
     g["items"] = asegurar_identidades(g["items"])
     g["schedule"] = g.get("schedule") or {"tasks": []}
     result = PresupuestoIA.model_validate(g["result"])
