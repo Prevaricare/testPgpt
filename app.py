@@ -2196,7 +2196,7 @@ class RecursoCosteoIA(BaseModel):
     )
     unidad: str = Field(description="Unidad de compra o consumo del recurso: PZA, ML, M2, H, JGO, L, KG, etc.")
     cantidad: float = Field(ge=0, description="Cantidad del recurso necesaria para UNA unidad de la actividad principal")
-    costo_unitario: float = Field(ge=0, description="Costo estimado en MXN por unidad del recurso, antes de indirectos y utilidad de la empresa")
+    costo_unitario: float = Field(ge=0, description="Costo estimado en MXN por unidad del recurso, antes de indirectos y utilidad del proveedor; sin utilidad de nuestra empresa ni IVA")
     obligatorio: bool = Field(description="True si el recurso forma parte normal del paquete para entregar correctamente el concepto")
     criterio: str = Field(description="Criterio breve de metrado, consumo o estimación del recurso")
     fuente_precio: str = Field(default="Estimación IA sin fuente verificada", description="Proveedor o procedencia real del precio; identificar las estimaciones sin evidencia")
@@ -2215,6 +2215,44 @@ class CosteoActividadIA(BaseModel):
 
 class CosteoPresupuestoIA(BaseModel):
     actividades: list[CosteoActividadIA]
+
+
+class RecursoLoteIA(RecursoCosteoIA):
+    cantidad: float = Field(ge=0, description="Consumo TOTAL para toda la cantidad de esta actividad, no por unidad comercial")
+
+
+class CosteoActividadLoteIA(BaseModel):
+    codigo: str
+    recursos: list[RecursoLoteIA]
+    minimo_mano_obra_lote: float = Field(ge=0, description="Mínimo de mano de obra directa asignado a esta actividad completa, MXN; 0 para solo suministro o si no aplica. No es precio de venta ni incluye utilidad.")
+    criterio_minimo: str = Field(description="Cuadrilla, horas mínimas y distribución con otras actividades del mismo oficio; justificar también cuando sea cero")
+    advertencias: list[str] = Field(default_factory=list)
+
+
+class CosteoLotesIA(BaseModel):
+    actividades: list[CosteoActividadLoteIA]
+
+
+def convertir_costeo_lote(cost, activity):
+    qty=float(activity.cantidad)
+    if not math.isfinite(qty) or qty<=0:
+        raise ValueError('La cantidad debe ser positiva para costear: '+activity.codigo_sugerido)
+    if not math.isfinite(cost.minimo_mano_obra_lote) or not cost.criterio_minimo.strip():
+        raise ValueError('Falta justificar el mínimo de mano de obra: '+cost.codigo)
+    resources=[RecursoCosteoIA.model_validate(r.model_dump()) for r in cost.recursos]
+    labor=sum(r.cantidad*r.costo_unitario for r in resources if r.categoria.upper()=='MANO_OBRA')
+    difference=max(0.0,cost.minimo_mano_obra_lote-labor)
+    if difference:
+        resources.append(RecursoCosteoIA(categoria='MANO_OBRA',concepto='Complemento de mano de obra mínima del lote',
+            unidad='LOTE',cantidad=1,costo_unitario=difference,obligatorio=True,criterio=cost.criterio_minimo))
+    for r in resources:
+        r.criterio=f'Lote de {qty:g} {activity.unidad}; consumo total {r.cantidad:g}. '+r.criterio
+        r.cantidad=r.cantidad/qty
+        r.fuente_precio='Estimación IA sin verificar';r.url_fuente='';r.fecha_precio=''
+    output=CosteoActividadIA(codigo=cost.codigo,recursos=resources,confianza='Baja',requiere_cotizacion=True,
+        advertencias=cost.advertencias+['Mano de obra mínima del lote: '+cost.criterio_minimo])
+    validar_costeo_python(output)
+    return output
 
 
 class AuditoriaCosteoActividadIA(BaseModel):
@@ -2340,7 +2378,7 @@ def configuracion_gemini_razonada(
 ):
     """Configura Gemini para presupuestación con razonamiento y búsqueda de mercado opcional."""
     if modo_ahorro():
-        thinking_level="low"
+        thinking_level="high"
         max_output_tokens=min(max_output_tokens,16384)
         ground_with_search=False
     kwargs = {
@@ -2764,6 +2802,10 @@ Respeta las áreas. Clasifica por naturaleza del trabajo, con títulos breves y 
 Para cada actividad conserva una cantidad justificable; no cambies unidades o medidas explícitas sin indicarlo.
 Los precios se calcularán después: costo_unitario_estimado=0 y porcentajes informativos=0.
 criterio_cantidad y fundamento_inclusion breves. No agregues trámites ni trabajos no respaldados.
+Evalúa protección de áreas existentes, limpieza de entrega, retiro de residuos y accesos cuando sean
+necesarios para ejecutar los trabajos. Si no están ya incluidos, crea un concepto separado con alcance
+acotado y supuesto explícito; no inventes metros cuadrados ni los dupliques en los oficios.
+No presupuestes diseño, organización o trámites propios de nuestra empresa salvo solicitud expresa.
 """+json.dumps({'cliente':project_data['name'],'ubicacion':project_data.get('location'),
                'tipo':project_data.get('project_type'),'nivel':budget_level,'documento':project_data['description'],
                'guia':project_data.get('guide_text'),'mapa':scope_map.model_dump() if scope_map else None},ensure_ascii=False,separators=(',',':'))
@@ -2771,10 +2813,8 @@ criterio_cantidad y fundamento_inclusion breves. No agregues trámites ni trabaj
     modelos = []
     for model in [
         model_name,
-        "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
     ]:
         if model and model not in modelos:
             modelos.append(model)
@@ -2903,10 +2943,8 @@ No incluyas explicaciones adicionales.
     models = []
     for model in [
         model_name,
-        "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
     ]:
         if model and model not in models:
             models.append(model)
@@ -3241,8 +3279,8 @@ TEXTO GUÍA
 {project_data['guide_text'] or 'Sin instrucciones adicionales.'}
 
 PARÁMETROS FINANCIEROS (NO LOS APLIQUES)
-Indirectos empresa: {params['indirect_pct']:.2f}%
-Utilidad empresa: {params['profit_pct']:.2f}%
+Indirectos del proveedor (Python los aplica después): {params['indirect_pct']:.2f}%
+Utilidad del proveedor (Python la aplica después): {params['profit_pct']:.2f}%
 IVA: {params['iva_pct']:.2f}%
 
 REGLAS DE VALUACIÓN
@@ -3282,10 +3320,8 @@ referencia genérica representa un trabajo especial.
     models = []
     for model in [
         model_name,
-        "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
     ]:
         if model and model not in models:
             models.append(model)
@@ -3328,10 +3364,8 @@ def _modelos_gemini_disponibles(model_name: str | None) -> list[str]:
     modelos = []
     for model in [
         model_name,
-        "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
     ]:
         if model and model not in modelos:
             modelos.append(model)
@@ -3427,8 +3461,8 @@ GUÍA
 {project_data['guide_text'] or 'Sin instrucciones adicionales.'}
 
 PARÁMETROS ECONÓMICOS (SOLO CONTEXTO, NO APLICAR)
-Indirectos empresa: {params['indirect_pct']:.2f}%
-Utilidad empresa: {params['profit_pct']:.2f}%
+Indirectos del proveedor (Python los aplica después): {params['indirect_pct']:.2f}%
+Utilidad del proveedor (Python la aplica después): {params['profit_pct']:.2f}%
 IVA: {params['iva_pct']:.2f}%
 
 ACTIVIDAD A COSTEAR
@@ -3540,7 +3574,7 @@ IMPORTANTE
 - Conserva el carácter de costeo físico: cada recurso debe tener concepto, unidad, cantidad y costo.
 - Las cantidades de recursos son por UNA unidad de la actividad principal.
 - El costo unitario definitivo lo calculará Python como suma de cantidad x costo_unitario de los recursos corregidos.
-- No apliques indirectos, utilidad ni IVA de nuestra empresa.
+- No apliques indirectos ni utilidad del proveedor: Python los añade después. Tampoco incluyas utilidad de nuestra empresa ni IVA. Si una referencia ya incluye margen del proveedor, no la confundas con costo directo.
 - Usa referencias internas validadas como anclas cuando sean realmente comparables, pero no las copies ciegamente.
 - Cuando un insumo o precio de mercado sea determinante y pueda verificarse, usa Google Search
   para contrastar referencias vigentes en México/CDMX. La búsqueda complementa el criterio de costos,
@@ -3585,7 +3619,17 @@ REVISA EN ESPECIAL CARPINTERÍA/MOBILIARIO:
 - que transporte/logística no se ignore cuando sea normal;
 - que un mismo componente no se haya contado dos veces.
 
-Devuelve exactamente una actividad auditada por cada código recibido.
+CONTROL DE CONTRATACIÓN
+- Comprueba el IMPORTE TOTAL de cada actividad (unitario por cantidad), no solo el unitario.
+- Revisa mínimos de mano de obra del lote, preparación y movilización. No borres un complemento
+  por mínimo sin recalcular y justificar la cobertura del trabajo completo.
+- Compara las otras actividades del proyecto incluidas en las referencias para no cobrar visitas,
+  equipo o jornadas repetidas. Reparte costos compartidos con criterio explícito.
+- Revisa LED completo, suministro de accesorios, corte/pulido de espejos y fabricación de logotipos.
+- No impongas un piso universal de precio. Tampoco aumentes todos los conceptos por igual.
+- Estimaciones sin evidencia siguen con confianza Baja y requieren cotización; no inventes fuentes.
+Devuelve exactamente una actividad auditada por cada código de HOJAS DE COSTEO GENERADAS.
+Los demás códigos de las referencias son solo contexto, no requieren una salida.
 """
 
     last_error = None
@@ -3687,7 +3731,7 @@ def resolver_items(
         api_key = get_api_key_runtime()
     if not api_key and not modo_ahorro():
         raise RuntimeError("Falta GEMINI_API_KEY para finalizar la valuación de precios.")
-    model_name = model_name or "gemini-3.8-flash"
+    model_name = model_name or "gemini-3.5-flash-lite"
 
     force_new_price_codes = {
         str(x).strip().upper() for x in (force_new_price_codes or set())
@@ -5462,20 +5506,20 @@ def agregar_hojas_costeo(wb, items: list[dict], commercial_rows: dict, control_s
     heading(formation, "FORMACIÓN DEL PRECIO ACTIVO", ["Etapa", "Importe MXN", "Criterio"], [43, 23, 83])
     formation["A2"] = "Mismos porcentajes comerciales del presupuesto. Incluye únicamente actividades marcadas Sí."
     rows = [
-        ["Costo de contratación estimado", "='02 Control Interno'!E3", "Precio vigente de contratación. Confirmar qué gastos y utilidad del subcontratista incluye; no se agrega otro porcentaje automáticamente."],
-        ["Indirectos de nuestra empresa", "=B4*'02 Control Interno'!B3", "Porcentaje sobre costo de contratación."],
-        ["Utilidad objetivo de nuestra empresa", "=(B4+B5)*'02 Control Interno'!B4", "Porcentaje sobre contratación más indirectos."],
-        ["Precio interno calculado", "=SUM(B4:B6)", "Costo de contratación más indirectos y utilidad objetivo."],
+        ["Costo directo estimado del proveedor", "='02 Control Interno'!E3", "Costo directo de recursos del proveedor, antes de sus indirectos y utilidad."],
+        ["Indirectos del proveedor", "=B4*'02 Control Interno'!B3", "Porcentaje sobre costo de contratación."],
+        ["Utilidad del proveedor", "=(B4+B5)*'02 Control Interno'!B4", "Porcentaje sobre contratación más indirectos."],
+        ["Precio interno calculado", "=SUM(B4:B6)", "Costo directo más indirectos y utilidad del proveedor."],
         ["Ajuste del precio interno vigente", "='02 Control Interno'!E4-B7", "Diferencia entre el precio vigente y el calculado; incluye ajustes manuales."],
         ["Precio interno vigente", "=SUM(B7:B8)", "Coincide con el importe activo de 01 Presupuesto."],
-        ["Recargo comercial", "=B9*$F$4", "Recargo sobre el interno vigente. No es margen sobre venta."],
+        ["Utilidad de nuestra empresa (recargo)", "=B9*$F$4", "Recargo sobre el interno vigente. No es margen sobre venta."],
         ["Precio cliente antes de IVA", "=SUM(B9:B10)", "Base del archivo cliente exportado en esta versión."],
         ["IVA cliente", "=B11*'02 Control Interno'!B5", "IVA sobre el precio cliente después del recargo."],
         ["Total cliente", "=SUM(B11:B12)", "El archivo cliente es independiente: exportar otra vez tras modificar el presupuesto en la app."],
     ]
     for values in rows:
         formation.append(values)
-    formation["E4"], formation["F4"] = "Recargo comercial", MARGEN_PRESUPUESTO_CLIENTE_PCT / 100
+    formation["E4"], formation["F4"] = "Utilidad de nuestra empresa (recargo)", MARGEN_PRESUPUESTO_CLIENTE_PCT / 100
     formation["F4"].number_format = "0.0%"
     formation.column_dimensions["E"].width = 24
     formation.column_dimensions["F"].width = 16
@@ -5865,9 +5909,9 @@ def crear_excel(
         wc[cell].font = Font(bold=True, color=white)
         wc[cell].fill = PatternFill("solid", fgColor=internal_blue)
 
-    wc["A3"] = "Indirectos"
+    wc["A3"] = "Indirectos del proveedor"
     wc["B3"] = params["indirect_pct"] / 100.0
-    wc["A4"] = "Utilidad objetivo"
+    wc["A4"] = "Utilidad del proveedor"
     wc["B4"] = params["profit_pct"] / 100.0
     wc["A5"] = "IVA"
     wc["B5"] = params["iva_pct"] / 100.0
@@ -5891,7 +5935,7 @@ def crear_excel(
     for col in range(5, 7):
         wc.cell(2, col).fill = PatternFill("solid", fgColor=profit_green)
     summary_labels = [
-        "Costo subcontratado activo",
+        "Costo directo del proveedor",
         "Importe interno activo",
         "Diferencia vs interno",
     ]
@@ -7890,6 +7934,8 @@ def crear_excel_formato_cliente(project_code: str, project_data: dict, items: li
             target.freeze_panes = source.freeze_panes
             for key, dimension in source.column_dimensions.items():
                 target.column_dimensions[key] = copy.copy(dimension)
+                target.column_dimensions[key].parent=target
+                copiar_estilo_excel(target.column_dimensions[key],dimension)
             target.sheet_properties = copy.copy(source.sheet_properties)
             target.page_setup = copy.copy(source.page_setup)
             target.page_margins = copy.copy(source.page_margins)
@@ -7897,7 +7943,7 @@ def crear_excel_formato_cliente(project_code: str, project_data: dict, items: li
             if sheet_name == "Resumen":
                 for r in range(1, 12):
                     for c in (1, 2):
-                        target.cell(r,c)._style = copy.copy(source.cell(r,c)._style)
+                        copiar_estilo_excel(target.cell(r,c), source.cell(r,c))
             else:
                 for column in range(1, 11):
                     target.cell(1, column, source.cell(1, column).value)
@@ -7910,7 +7956,7 @@ def crear_excel_formato_cliente(project_code: str, project_data: dict, items: li
                     if source.row_dimensions[origin].height:
                         target.row_dimensions[r].height = source.row_dimensions[origin].height
                     for c in range(1,11):
-                        target.cell(r,c)._style = copy.copy(source.cell(origin,c)._style)
+                        copiar_estilo_excel(target.cell(r,c), source.cell(origin,c))
                 # Respetar también la representación porcentual de la plantilla importada.
                 for r in range(2,target.max_row + 1):
                     if not target.cell(r,4).value: continue
@@ -7922,6 +7968,13 @@ def crear_excel_formato_cliente(project_code: str, project_data: dict, items: li
                         target.cell(r,10).value = float(target.cell(r,10).value) / 100
                         summary["B10"] = str(summary["B10"].value).replace(f"*Partidas!J{r}/100", f"*Partidas!J{r}")
     out = BytesIO(); wb.save(out); return out.getvalue()
+
+
+def copiar_estilo_excel(destino, origen):
+    # Los índices internos de estilo pertenecen a cada workbook; nunca copiar _style entre libros.
+    for atributo in ('font','fill','border','alignment','protection'):
+        setattr(destino,atributo,copy.copy(getattr(origen,atributo)))
+    destino.number_format=origen.number_format
 
 
 def actualizar_formacion_cliente(wb, items, params, project_data, commercial_rows):
@@ -8141,7 +8194,7 @@ def ordenar_operaciones(operations: list[OperacionEditorIA]) -> list[OperacionEd
     return ordered
 
 
-def planificar_editor_ia(g: dict, request: str, selected_ids: list[str], api_key: str, model: str) -> dict:
+def planificar_editor_ia(g: dict, request: str, selected_ids: list[str], api_key: str, model: str, progress=None) -> dict:
     prompt = f"""Eres el editor de un presupuesto de remodelación. Primero diseña un plan ejecutable.
 Solicitud del usuario: {request}
 IDs autorizados para modificar/retirar/mover: {json.dumps(selected_ids)}.
@@ -8151,6 +8204,8 @@ REGLAS:
 - Usa solo IDs internos exactos. Puedes agregar actividades, dividir una en varias mediante AGREGAR+RETIRAR,
   modificar cualquier campo permitido y retirar áreas completas mediante sus IDs seleccionados.
 - Revisa recursos, supuestos, alcance original e historial. Detecta instalaciones y trabajos compartidos.
+- El precio que el usuario ve es INTERNO: pago al proveedor con sus indirectos y utilidad.
+  Si pide fijar un precio sin indicar cliente, utiliza INTERNO. Nuestra utilidad e IVA solo van al Excel cliente.
 - Para bajar precio distingue: renegociar contratación, ajustar venta interna/cliente o cambiar especificación y recostear.
 - No inventes una cifra para una solicitud de revisión de costo: usa RECALCULAR sin precio_unitario.
 - Para precio exacto utiliza precio_tipo y precio_unitario. Nunca cambios.costo_unitario_estimado.
@@ -8162,7 +8217,7 @@ REGLAS:
 - No añadas duplicados de trabajos que ya están incluidos. No retires conceptos compartidos sin evaluar su alcance.
 - Si faltan datos indispensables, devuelve preguntas; con suposiciones suficientes documenta los supuestos.
 Devuelve PlanEditorIA. No calcules importes totales ni alteres actividades fuera de selección."""
-    plan = solicitar_json_editor(api_key, model, prompt, PlanEditorIA)
+    plan = solicitar_json_editor(api_key, model, prompt, PlanEditorIA, progress)
     if plan.operaciones:
         validar_plan_editor(plan, g["items"], selected_ids)
     return {"fingerprint": firma_editor(g), "request":request, "allowed_ids":selected_ids, "plan":plan.model_dump()}
@@ -8214,7 +8269,7 @@ def cambiar_item_editor(item: dict, op: OperacionEditorIA, params: dict) -> dict
     return actualizar_alertas_costeo(out)
 
 
-def ejecutar_operacion_editor(g: dict, items: list[dict], op: OperacionEditorIA, db, api_key: str, model: str) -> list[dict]:
+def ejecutar_operacion_editor(g: dict, items: list[dict], op: OperacionEditorIA, db, api_key: str, model: str, progress=None) -> list[dict]:
     output = clonar_estado(items)
     if op.accion == "RETIRAR": return [x for x in output if x["item_id"] not in op.ids]
     if op.accion == "MOVER":
@@ -8239,7 +8294,7 @@ def ejecutar_operacion_editor(g: dict, items: list[dict], op: OperacionEditorIA,
             local_result=resultado_de_items(g,output).model_copy(update={"actividades":acts})
             project=clonar_estado(g["project_data"])
             project["guide_text"] = str(project.get("guide_text") or "") + "\nREVISION SOLICITADA: " + op.motivo + "\nPRESUPUESTO COMPLETO PARA EVITAR DUPLICIDADES:\n" + json.dumps([item_contexto_ia(x) for x in output],ensure_ascii=False)
-            priced=resolver_items(db,local_result,project,g["params"],api_key=api_key,model_name=model)
+            priced=resolver_items(db,local_result,project,g["params"],api_key=api_key,model_name=model,progress_callback=progress)
             mapping={str(x["code"]):x for x in priced}
             for idx,item in enumerate(output):
                 if item["item_id"] not in targets: continue
@@ -8269,7 +8324,7 @@ def preparar_propuesta_editor(g: dict, plan_data: dict, db, api_key: str, model:
         if op.id in job["completed"]:continue
         if progress:progress(15+int(idx/max(len(ops),1)*65),f"Reconstruyendo y costeando {op.id}: {op.motivo}")
         before=clonar_estado(job["items"])
-        after=ejecutar_operacion_editor(g,before,op,db,api_key,model)
+        after=ejecutar_operacion_editor(g,before,op,db,api_key,model,progress)
         old={x["item_id"]:x for x in before};new={x["item_id"]:x for x in after}
         # Agrupar las filas afectadas permite aplicar un subconjunto sin volver a consultar la IA.
         changed=[k for k in set(old)|set(new) if old.get(k)!=new.get(k)]
@@ -8278,15 +8333,9 @@ def preparar_propuesta_editor(g: dict, plan_data: dict, db, api_key: str, model:
                               "order":[x["item_id"] for x in after]})
         job["items"]=after;job["completed"].append(op.id)
     if progress:progress(85,"Auditando alcance, precios y actividades relacionadas")
-    if modo_ahorro() and not st.session_state.get('ai_selective_audit',False) and 'audit' not in job:
-        validar_items_editor(job['items'])
-        warnings=['Revisión de estructura y operaciones en Python. Confirma el alcance en la comparación antes de aplicar.']
-        for item in job['items']:
-            if item.get('costing_stale'):warnings.append('Análisis pendiente de revisar: '+titulo_comercial_item(item))
-        job['audit']={'hallazgos':warnings,'pendientes':[]}
     if "audit" not in job:
         audit=solicitar_json_editor(api_key,model,
-            "Audita esta revisión completa. Compara solicitud, alcance y recursos. Detecta duplicados, omisiones, cambios ajenos a la solicitud, costos compartidos y conversiones de unidades sin sustento. No generes cambios nuevos; devuelve hallazgos y pendientes.\n" + json.dumps({"solicitud":plan_data["request"],"contexto":contexto_editor(g,[key for op in plan.operaciones for key in op.ids]),"plan":plan.model_dump(),"propuesta":[item_contexto_ia(x,x["item_id"] in {key for group in job["groups"] for key in group["after"]}) for x in job["items"]]},ensure_ascii=False),AuditoriaEditorIA)
+            "Audita esta revisión completa. Compara solicitud, alcance y recursos. Detecta duplicados, omisiones, cambios ajenos a la solicitud, costos compartidos y conversiones de unidades sin sustento. No generes cambios nuevos; devuelve hallazgos y pendientes.\n" + json.dumps({"solicitud":plan_data["request"],"contexto":contexto_editor(g,[key for op in plan.operaciones for key in op.ids]),"plan":plan.model_dump(),"propuesta":[item_contexto_ia(x,x["item_id"] in {key for group in job["groups"] for key in group["after"]}) for x in job["items"]]},ensure_ascii=False),AuditoriaEditorIA,progress)
         job["audit"]=audit.model_dump()
     if progress:progress(100,"Propuesta lista para comparar")
     return {"fingerprint":plan_data["fingerprint"],"request":plan_data["request"],"groups":clonar_estado(job["groups"]),
@@ -8677,34 +8726,27 @@ def render_importar_editor(db, fallback_params: dict, key: str):
 def render_propuesta_editor(g: dict):
     proposal=g.get("edit_proposal")
     if not proposal:return
-    st.subheader("Comparar propuesta")
     if proposal["fingerprint"]!=firma_editor(g):
-        st.warning("Esta propuesta quedó desactualizada. Genera otra con el presupuesto actual.");return
-    options=[x["id"] for x in proposal["groups"]];labels={x["id"]:x["reason"] for x in proposal["groups"]}
-    signature=hashlib.sha256(json.dumps(proposal,sort_keys=True).encode()).hexdigest()[:10]
-    selected=st.multiselect("Operaciones que deseas aplicar",options,default=options,format_func=lambda x:f"{x}: {labels[x]}",key="accept_ops_"+signature)
+        st.info("El presupuesto cambió; solicita de nuevo la corrección.");return
+    selected=[x["id"] for x in proposal["groups"]]
     try:new_items=seleccionar_propuesta(g,proposal,selected)
-    except Exception as exc:st.warning(str(exc));return
+    except Exception as exc:st.error(str(exc));return
+    st.subheader("Cambios propuestos")
+    for group in proposal["groups"]:st.write("• "+group["reason"])
     diffs=diferencias_items(g["items"],new_items)
-    if diffs:st.dataframe(pd.DataFrame(diffs).drop(columns=["ID"]),use_container_width=True,hide_index=True)
-    else:st.caption("No hay cambios seleccionados.")
-    old=totales_cliente(g["items"],g["params"],g["project_data"]);new=totales_cliente(new_items,g["params"],g["project_data"])
-    c1,c2=st.columns(2);c1.metric("Cliente actual con IVA",formato_moneda(old["total"]));c2.metric("Cliente propuesto con IVA",formato_moneda(new["total"]),delta=formato_moneda(new["total"]-old["total"]))
-    area_rows=[]
-    for area in sorted({area_excel_item(x) for x in g["items"]+new_items}):
-        a=sum(x.get("sale_amount",0) for x in g["items"] if area_excel_item(x)==area and item_esta_incluido(x))
-        b=sum(x.get("sale_amount",0) for x in new_items if area_excel_item(x)==area and item_esta_incluido(x))
-        if a!=b:area_rows.append({"Área":area,"Interno actual":a,"Interno propuesto":b,"Diferencia":b-a})
-    if area_rows:st.dataframe(pd.DataFrame(area_rows),hide_index=True,use_container_width=True)
-    for warning in proposal.get("warnings") or []:st.warning(warning)
-    with st.expander("Valores completos antes y después"):
-        for row in diffs:
-            st.write(row["Actividad"])
-            prior=next((x for x in g["items"] if x["item_id"]==row["ID"]),None)
-            after=next((x for x in new_items if x["item_id"]==row["ID"]),None)
-            st.json({"antes":prior,"después":after},expanded=False)
+    if diffs:
+        st.dataframe(pd.DataFrame(diffs)[["Acción","Actividad","Interno anterior","Interno propuesto"]],hide_index=True,use_container_width=True)
+    old=calcular_financieros(g["items"],g["params"])["sale_before_tax"]
+    new=calcular_financieros(new_items,g["params"])["sale_before_tax"]
+    c1,c2=st.columns(2)
+    c1.metric("Proveedores · actual",formato_moneda(old))
+    c2.metric("Proveedores · propuesta",formato_moneda(new),delta=formato_moneda(new-old))
+    with st.expander("Revisar alcance de la propuesta"):
+        st.dataframe(dataframe_resumen(new_items),hide_index=True,use_container_width=True)
+        for warning in proposal.get("warnings") or []:st.write("• "+str(warning))
+    signature=hashlib.sha256(json.dumps(proposal,sort_keys=True).encode()).hexdigest()[:10]
     b1,b2=st.columns(2)
-    if b1.button("Aplicar cambios seleccionados",type="primary",disabled=not bool(selected),key="commit_"+signature):
+    if b1.button("Aplicar cambios",type="primary",disabled=not bool(diffs),key="commit_"+signature):
         try:aplicar_borrador_editor(g,new_items,proposal["request"]);st.rerun()
         except Exception as exc:st.error(str(exc))
     if b2.button("Descartar propuesta",key="discard_"+signature):
@@ -8715,106 +8757,43 @@ def render_propuesta_editor(g: dict):
 def render_editor_integral(g: dict, db, model: str):
     g["items"]=asegurar_identidades(g["items"])
     epoch=str(g.get("editor_epoch",0))+"_"+g["project_code"]
-    st.subheader("Área de edición")
-    tabs=st.tabs(["Presupuesto por áreas","Ficha y recursos","Revisar con IA","Gantt de obra","Importar e historial"])
-    selected_ids=[]
-    with tabs[0]:
-        areas=sorted({a["area"] for item in g["items"] for a in obtener_asignaciones_area_item(item)})
-        categories=sorted({x.get("category") or "" for x in g["items"]})
-        f1,f2=st.columns(2)
-        areas_selected=f1.multiselect("Áreas",areas,key="filter_area_"+epoch)
-        cats_selected=f2.multiselect("Partidas",categories,key="filter_cat_"+epoch)
-        search=st.text_input("Buscar concepto o descripción",key="filter_text_"+epoch)
-        visible=[x for x in g["items"] if (not areas_selected or any(a["area"] in areas_selected for a in obtener_asignaciones_area_item(x))) and (not cats_selected or x.get("category") in cats_selected) and (not search or normalizar_texto(search) in normalizar_texto(x.get("description")))]
-        st.caption("Marca actividades para la revisión con IA o el retiro por lote. Los filtros permiten seleccionar toda una cocina, baño o partida.")
-        check_all=st.checkbox("Marcar todas las actividades visibles",value=True,key="all_visible_"+epoch)
-        rows=[{"ID":x["item_id"],"Seleccionar":check_all,"Área":area_excel_item(x),"Partida":x.get("category"),"Actividad":titulo_comercial_item(x),"Descripción":x.get("description"),"Unidad":x.get("unit"),"Cantidad":float(x.get("quantity") or 0),"P.U. interno":float(x.get("unit_sale") or 0),"Incluida":item_esta_incluido(x)} for x in visible]
-        viewkey=hashlib.sha256(json.dumps([areas_selected,cats_selected,search,check_all]).encode()).hexdigest()[:8]
-        edited=st.data_editor(pd.DataFrame(rows,columns=["ID","Seleccionar","Área","Partida","Actividad","Descripción","Unidad","Cantidad","P.U. interno","Incluida"]),disabled=["ID","Actividad"],column_config={"ID":None,"Cantidad":st.column_config.NumberColumn(min_value=0.0),"P.U. interno":st.column_config.NumberColumn(min_value=0.0)},hide_index=True,use_container_width=True,key="grid_"+epoch+viewkey)
-        edited_rows=edited.to_dict("records")
-        selected_ids=[x["ID"] for x in edited_rows if x.get("Seleccionar")]
-        selected=[x for x in visible if x["item_id"] in selected_ids]
-        st.write(f"Seleccionadas: {len(selected)} · Importe interno: {formato_moneda(sum(x.get('sale_amount',0) for x in selected if item_esta_incluido(x)))}")
-        b1,b2=st.columns(2)
-        if b1.button("Preparar cambios de la tabla",key="preview_grid_"+epoch):
-            try:
-                mapping={x["item_id"]:x for x in g["items"]};modified={}
-                for row in edited_rows:
-                    old=mapping[row["ID"]]
-                    changes={}
-                    for label,field,key in [("Área","area_hint","area"),("Partida","category","partida"),("Descripción","description","descripcion_tecnica"),("Unidad","unit","unidad"),("Cantidad","quantity","cantidad"),("Incluida","included","included")]:
-                        current=area_excel_item(old) if label=="Área" else old.get(field)
-                        if row[label]!=current:changes[key]=row[label]
-                    price_changed=float(row["P.U. interno"])!=float(old["unit_sale"])
-                    if changes or price_changed:
-                        op=OperacionEditorIA(id="TABLA",accion="MODIFICAR",ids=[old["item_id"]],cambios=CambiosActividadIA(**changes),precio_tipo="INTERNO" if price_changed else "CONSERVAR",precio_unitario=float(row["P.U. interno"]) if price_changed else None,motivo="Cambios manuales en tabla")
-                        modified[old["item_id"]]=cambiar_item_editor(old,op,g["params"])
-                proposed=[modified.get(x["item_id"],x) for x in g["items"]]
-                g["edit_proposal"]=propuesta_manual(g,proposed,"Edición manual de tabla");st.rerun()
-            except Exception as exc:st.error(str(exc))
-        if b2.button("Preparar retiro de seleccionadas",disabled=not selected_ids,key="remove_batch_"+epoch):
-            proposed=[x for x in g["items"] if x["item_id"] not in selected_ids]
-            g["edit_proposal"]=propuesta_manual(g,proposed,f"Retirar {len(selected_ids)} actividades seleccionadas");st.rerun()
-        with st.expander("Mover actividades seleccionadas"):
-            position=st.number_input("Posición de destino",min_value=1,max_value=max(1,len(g["items"])),value=1,step=1,key="move_position_"+epoch)
-            if st.button("Preparar movimiento",disabled=not selected_ids,key="move_prepare_"+epoch):
-                try:
-                    op=OperacionEditorIA(id="MOVER",accion="MOVER",ids=selected_ids,posicion=int(position),motivo="Reordenar actividades seleccionadas")
-                    candidate=ejecutar_operacion_editor(g,g["items"],op,db,"",model)
-                    g["edit_proposal"]=propuesta_manual(g,candidate,op.motivo);st.rerun()
-                except Exception as exc:st.error(str(exc))
-        with st.expander("Resumen por área y partida"):
-            for area in areas:
-                st.markdown(f"**{area}**")
-                subset=[x for x in g["items"] if any(a["area"]==area for a in obtener_asignaciones_area_item(x))]
-                st.dataframe(pd.DataFrame([{"Partida":x["category"],"Actividad":titulo_comercial_item(x),"Cantidad":x["quantity"],"Interno":x["sale_amount"]} for x in subset]),hide_index=True,use_container_width=True)
-        with st.expander("Agregar actividad manual"):
-            title=st.text_input("Título",key="new_title_"+epoch)
-            description=st.text_area("Alcance y especificaciones",key="new_description_"+epoch)
-            c1,c2,c3=st.columns(3)
-            area=c1.text_input("Área nueva",value=areas_selected[0] if len(areas_selected)==1 else "General",key="new_area_"+epoch)
-            category=c2.selectbox("Partida nueva",SECCIONES_COMERCIALES_PREFERENTES,key="new_category_"+epoch)
-            unit=c3.text_input("Unidad nueva",value="PZA",key="new_unit_"+epoch)
-            qty=st.number_input("Cantidad nueva",min_value=0.0,value=1.0,key="new_quantity_"+epoch)
-            price=st.number_input("Precio interno unitario capturado",min_value=0.0,key="new_price_"+epoch)
-            st.caption("Para generar y costear varias actividades desde una descripción, utiliza Revisar con IA. La captura manual deja el costo de contratación pendiente.")
-            if st.button("Preparar actividad",key="new_prepare_"+epoch):
-                try:
-                    new=crear_item_manual(description,area,category,unit,qty,g["params"],title,internal_price=price)
-                    g["edit_proposal"]=propuesta_manual(g,g["items"]+[new],"Agregar actividad manual");st.rerun()
-                except Exception as exc:st.error(str(exc))
-    with tabs[1]:
-        render_ficha_editor(g,epoch)
-    with tabs[2]:
-        st.write(f"La revisión puede modificar las {len(selected_ids)} actividades seleccionadas y proponer nuevas actividades.")
-        request=st.text_area("Describe la corrección",height=160,placeholder="Cambia la barra a cuarzo, revisa su costo y agrega las adecuaciones de instalaciones que falten. Conserva lo demás.",key="edit_request_"+epoch)
-        if st.button("1. Analizar solicitud y preparar plan",type="primary",key="prepare_ai_"+epoch):
-            try:
-                if not request.strip():raise ValueError("Describe el cambio solicitado.")
-                key=get_api_key_runtime()
-                if not key:raise ValueError("Falta GEMINI_API_KEY.")
-                with st.spinner("Analizando alcance, recursos e historial..."):
-                    g["edit_plan"]=planificar_editor_ia(g,request,selected_ids,key,model)
-                    g.pop("edit_proposal",None);g.pop("edit_job",None)
-            except Exception as exc:st.error(str(exc))
-        plan_data=g.get("edit_plan")
-        if plan_data:
+    st.subheader("Revisar con IA")
+    request=st.text_area("¿Qué quieres cambiar?",height=110,
+        placeholder="Agrega protección y limpieza, elimina la cocina o revisa el precio del espejo. Conserva lo demás.",key="edit_request_"+epoch)
+    busy=bool(st.session_state.get("editing_in_progress"))
+    if st.button("Preparar cambios con IA",type="primary",disabled=busy,key="prepare_ai_"+epoch):
+        st.session_state["editing_in_progress"]=True
+        status=st.status("Preparando cambios",expanded=True)
+        bar=status.progress(0);log=status.empty();entries=[]
+        def progress(percent,message):
+            bar.progress(max(0,min(int(percent),100)))
+            if not entries or entries[-1]!=message:entries.append(str(message))
+            st.session_state["editing_log"]=entries[-160:]
+            log.code("\n".join(entries[-160:]),language=None,height=220)
+        try:
+            if not request.strip():raise ValueError("Describe el cambio solicitado.")
+            key=get_api_key_runtime()
+            if not key:raise ValueError("Falta GEMINI_API_KEY.")
+            plan_data=g.get("edit_plan")
+            if not plan_data or plan_data["request"]!=request or plan_data["fingerprint"]!=firma_editor(g):
+                progress(5,"Analizando tu solicitud y el presupuesto completo")
+                plan_data=planificar_editor_ia(g,request,[x["item_id"] for x in g["items"]],key,model,progress)
+                g["edit_plan"]=plan_data;g.pop("edit_proposal",None);g.pop("edit_job",None)
             plan=PlanEditorIA.model_validate(plan_data["plan"])
-            st.write(plan.resumen)
-            for question in plan.preguntas:st.warning(question)
-            for assumption in plan.supuestos:st.caption(assumption)
-            st.dataframe(pd.DataFrame([{"Operación":x.id,"Acción":x.accion,"Actividades":len(x.ids),"Precio":x.precio_tipo,"Motivo":x.motivo} for x in plan.operaciones]),hide_index=True,use_container_width=True)
-            if st.button("2. Construir y auditar propuesta",disabled=bool(plan.preguntas) or not plan.operaciones,key="build_ai_"+epoch):
-                bar=st.progress(0);message=st.empty()
-                def progress(percent,text):bar.progress(percent);message.write(text)
-                try:
-                    key=get_api_key_runtime()
-                    if not key:raise ValueError("Falta GEMINI_API_KEY.")
-                    g["edit_proposal"]=preparar_propuesta_editor(g,plan_data,db,key,model,progress)
-                    st.rerun()
-                except Exception as exc:st.error(str(exc));st.caption("El avance de las operaciones completas permanece en este borrador para reintentar.")
-    with tabs[3]:render_secuencia_editor(g,model,epoch)
-    with tabs[4]:render_importar_editor(db,g["params"],"workspace_import_"+epoch)
+            if plan.preguntas:
+                for question in plan.preguntas:st.info(question)
+                st.caption("Completa la instrucción de arriba y vuelve a preparar los cambios.")
+                status.update(label="Faltan datos para preparar el cambio",state="complete")
+            elif not plan.operaciones:
+                st.info(plan.resumen);status.update(label="No se propusieron cambios",state="complete")
+            else:
+                progress(12,plan.resumen)
+                g["edit_proposal"]=preparar_propuesta_editor(g,plan_data,db,key,model,progress)
+                status.update(label="Propuesta lista; revisa antes de aplicar",state="complete",expanded=False)
+        except Exception as exc:
+            status.update(label="No se completó la revisión",state="error")
+            st.error(str(exc));st.caption("Las operaciones terminadas se conservan para reintentar con la misma instrucción.")
+        finally:st.session_state["editing_in_progress"]=False
     render_propuesta_editor(g)
     if g.get("undo_stack") and st.button("Deshacer última edición",key="undo_"+epoch):
         try:
@@ -8827,6 +8806,10 @@ def render_editor_integral(g: dict, db, model: str):
             for key in ("edit_plan","edit_job","edit_proposal"):candidate.pop(key,None)
             g.clear();g.update(candidate);st.rerun()
         except Exception as exc:st.error(str(exc))
+
+    with st.expander("Programa de obra · Gantt"):
+        render_secuencia_editor(g,model,epoch)
+    render_importar_editor(db,g["params"],"workspace_import_"+epoch)
 
 
 def render_ficha_editor(g: dict, epoch: str):
@@ -8954,7 +8937,7 @@ def render_secuencia_editor(g: dict, model: str, epoch: str):
 
 
 # Los precios estimados requieren revisión antes de convertirse en referencias aprobadas.
-AI_ENGINE_VERSION = 'ahorro-1'  # Mantiene compatibles los análisis ya guardados.
+AI_ENGINE_VERSION = 'proveedores-lotes-2'  # No reutilizar estimaciones anteriores sin esta revisión.
 
 class GeminiPausa(RuntimeError):
     """Gemini no completó la solicitud; el trabajo terminado permanece guardado."""
@@ -9178,27 +9161,35 @@ def costear_lote_ahorro(activities, project, result, references, api_key, model,
     codes={a.codigo_sugerido for a in activities}
     context={'ubicacion':project.get('location'),'nivel':project.get('budget_level'),'guia':project.get('guide_text',''),
              'reglas':result.consideraciones_generales,'alcance_general':result.alcance_resumido,
-             'otras_actividades':[{'codigo':a.codigo_sugerido,'area':a.area,'titulo':a.titulo_comercial} for a in result.actividades if a.codigo_sugerido not in codes],
+             'otras_actividades':[actividad_compacta(a) for a in result.actividades if a.codigo_sugerido not in codes],
              'actividades':[actividad_compacta(a) for a in activities],
              'referencias':{code:references.get(code.upper(),{}).get('internal') for code in codes}}
-    prompt='''Construye análisis de recursos de contratación en MXN. Devuelve exactamente una actividad por código solicitado.
-Cada recurso es por UNA unidad de la actividad; Python hará las sumas. Mantén materiales, mano de obra,
-herrajes y logística según alcance. Solo instalación no incluye suministro del elemento.
-No inventes precios verificados, proveedores, URLs ni fechas: sin evidencia, fuente_precio="Estimación IA sin verificar",
-url_fuente="", confianza="Baja" y requiere_cotizacion=true. Indica hipótesis de rendimientos y geometría.
-Evita duplicar conexiones, LED, suministro y transporte entre actividades. Respeta lo existente y exclusiones.
-No apliques indirectos/utilidad/IVA de nuestra empresa. No repitas explicaciones: criterio breve por recurso.
+    prompt='''Construye análisis de costo DIRECTO del proveedor en MXN para cada actividad completa.
+Devuelve exactamente un código por actividad solicitada. Los recursos deben cubrir TODA su cantidad
+comercial, NO una unidad. Python dividirá los consumos entre la cantidad al terminar.
+Somos una empresa que SUBCONTRATA todo. No confundas el precio del accesorio con suministrarlo e instalarlo.
+Reconstruye materiales, mano de obra de taller y obra, herramientas, fijaciones, consumibles, transporte,
+protección específica y desperdicio físico según dimensiones y acabado. Solo instalación excluye suministro.
+LED: verificar tira, perfil/difusor si procede, fuente, conexiones, fijación y montaje.
+Espejos: espesor, corte, pulido, arco, soporte, adhesivos, manipulación, traslado e instalación.
+Logotipos: radio no es diámetro; considerar superficie real, corte, acabado, separadores, fuente LED y montaje.
+Mano de obra: estima horas de cuadrilla, preparación y traslado para el trabajo real. Expresa en
+minimo_mano_obra_lote el mínimo DIRECTO asignado a esta actividad, con criterio_minimo justificable.
+No cobres una visita o jornada completa en cada renglón si un mismo proveedor hace varias actividades:
+reparte ese costo entre actividades del mismo oficio y señala los códigos que lo comparten.
+Python añadirá únicamente la diferencia positiva entre ese mínimo y la mano de obra desglosada.
+No hay un mínimo universal en pesos ni un multiplicador de precio por nivel: justifica los recursos.
+No incluyas indirectos/utilidad del proveedor: Python los aplica después. No incluyas utilidad de
+nuestra empresa ni IVA. No uses una cotización de venta terminada como si fuera costo directo sin aclararla.
+Respeta exclusiones, instalaciones existentes y componentes incluidos en otro concepto.
+Sin evidencia, los precios son estimaciones pendientes de cotización. No inventes proveedores ni URLs.
 '''+json.dumps(context,ensure_ascii=False,separators=(',',':'))
-    output=solicitar_json_editor(api_key,model,prompt,CosteoPresupuestoIA,progress)
+    output=solicitar_json_editor(api_key,model,prompt,CosteoLotesIA,progress)
     received=[c.codigo for c in output.actividades]
     if len(received)!=len(codes) or set(received)!=codes:
         invalidar_ultima_respuesta_ia();raise ValueError('El lote omitió o duplicó códigos. Se conservaron los lotes anteriores; vuelve a intentar.')
-    # Sin consulta de fuentes no se aceptan URLs ni precios declarados como verificados.
-    for cost in output.actividades:
-        cost.confianza='Baja';cost.requiere_cotizacion=True
-        for resource in cost.recursos:
-            resource.fuente_precio='Estimación IA sin verificar';resource.url_fuente='';resource.fecha_precio=''
-    return output.actividades
+    by_code={a.codigo_sugerido:a for a in activities}
+    return [convertir_costeo_lote(cost,by_code[cost.codigo]) for cost in output.actividades]
 
 
 def obtener_costeos_ahorro(database,result,project,api_key,model,refs,force_codes,progress=None):
@@ -9206,7 +9197,8 @@ def obtener_costeos_ahorro(database,result,project,api_key,model,refs,force_code
     for act in result.actividades:
         key='cost:'+huella_ia({'v':AI_ENGINE_VERSION,'model':model,'activity':actividad_compacta(act),
             'location':project.get('location'),'level':project.get('budget_level'),'guide':project.get('guide_text'),
-            'original':project.get('description'),'rules':result.consideraciones_generales})
+            'original':project.get('description'),'rules':result.consideraciones_generales,
+            'scope':[actividad_compacta(a) for a in result.actividades]})
         keys[act.codigo_sugerido]=key
         template=None if act.codigo_sugerido.upper() in force_codes else aplicar_plantilla_python(database,act,project)
         cached=None if template or act.codigo_sugerido.upper() in force_codes else cache_ia_leer(key,database)
@@ -9244,14 +9236,20 @@ def obtener_costeos_ahorro(database,result,project,api_key,model,refs,force_code
         warnings=validar_costeo_python(cost)
         audits.append(AuditoriaCosteoActividadIA(codigo=cost.codigo,recursos_corregidos=cost.recursos,confianza=cost.confianza,
             requiere_cotizacion=cost.requiere_cotizacion or bool(warnings),hallazgos=['Validación matemática y de estructura en Python; sin auditoría técnica adicional de IA.']+warnings))
-    # La revisión técnica adicional es explícita y solo recibe los casos con alertas de Python.
-    flagged=[a for a,c in zip(result.actividades,costs) if validar_costeo_python(c)]
-    if flagged and st.session_state.get('ai_selective_audit',False):
+    # Toda estimación IA recibe una segunda lectura; las plantillas ya fueron revisadas por el usuario.
+    flagged=[a for a in result.actividades if sources[a.codigo_sugerido]!='PLANTILLA_PYTHON']
+    if flagged:
         for offset in range(0,len(flagged),3):
             acts=flagged[offset:offset+3];codes={a.codigo_sugerido for a in acts}
+            actualizar_progreso(progress,78,f'Revisando contratación y mínimos: {offset+1}–{offset+len(acts)} de {len(flagged)} actividades.')
             reviewed=auditar_costeos_detallados_ia(api_key,model,project,{},result.model_copy(update={'actividades':acts}),
-                CosteoPresupuestoIA(actividades=[c for c in costs if c.codigo in codes]),[],progress)
+                CosteoPresupuestoIA(actividades=[c for c in costs if c.codigo in codes]),
+                [{'codigo':a.codigo_sugerido,'alcance':actividad_compacta(a),'referencia':refs.get(a.codigo_sugerido.upper(),{}).get('internal'),
+                  'costeo_contexto':obtained[a.codigo_sugerido].model_dump()} for a in result.actividades],progress)
             for entry in reviewed.actividades:
+                entry.confianza='Baja';entry.requiere_cotizacion=True
+                for resource in entry.recursos_corregidos:
+                    resource.fuente_precio='Estimación IA sin verificar';resource.url_fuente='';resource.fecha_precio=''
                 validar_costeo_python(CosteoActividadIA(codigo=entry.codigo,recursos=entry.recursos_corregidos,confianza=entry.confianza,requiere_cotizacion=entry.requiere_cotizacion))
             revised={r.codigo:r for r in reviewed.actividades};audits=[revised.get(a.codigo,a) for a in audits]
             for code in codes:sources[code]='GEMINI_COSTEO_AUDITADO'
@@ -9324,61 +9322,29 @@ except Exception as exc:
     st.stop()
 
 st.session_state['ai_economy']=True
+st.session_state['ai_selective_audit']=True
 render_uso_gemini()
 
 with st.sidebar:
     st.header("Navegación")
     section = st.radio(
         "Sección",
-        ["Generar presupuesto", "Crear Excel", "Catálogo e historial"],
+        ["Generar presupuesto", "Catálogo e historial"],
         key="main_section",
         label_visibility="collapsed",
     )
 
     if section == "Generar presupuesto":
-        st.divider()
-        st.header("Parámetros")
-
-        indirect_pct = st.number_input(
-            "Indirectos (%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=10.0,
-            step=0.5,
-            key="indirect_pct",
-        )
-        profit_pct = st.number_input(
-            "Utilidad (%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=18.0,
-            step=0.5,
-            key="profit_pct",
-        )
-        iva_pct = st.number_input(
-            "IVA (%) · referencia posterior",
-            min_value=0.0,
-            max_value=100.0,
-            value=16.0,
-            step=1.0,
-            key="iva_pct",
-            disabled=True,
-        )
-        waste_pct = st.number_input(
-            "Desperdicio (%) · referencia sin aplicación",
-            min_value=0.0,
-            max_value=50.0,
-            value=4.0,
-            step=0.5,
-            key="waste_pct",
-            disabled=True,
-        )
+        indirect_pct = 10.0  # Proveedor; no margen de nuestra empresa.
+        profit_pct = 18.0
+        iva_pct = 16.0
+        waste_pct = 4.0  # Solo referencia; no se suma de nuevo.
 
         with st.expander("Configuración"):
             model_name = st.text_input(
                 "Modelo Gemini",
-                value="gemini-3.8-flash",
-                key="model_name",
+                value="gemini-3.5-flash-lite",
+                key="model_name_lite",
             )
 
         st.divider()
@@ -9407,7 +9373,7 @@ if section == "Catálogo e historial":
 def firma_generacion(project_data: dict, params: dict, model_name: str) -> str:
     """Firma estable para saber si un checkpoint corresponde a los mismos datos."""
     payload = {
-        "engine_version": "2026-09-29-v29-ahorro",  # Conserva checkpoints anteriores.
+        "engine_version": AI_ENGINE_VERSION,
         "project_data": project_data,
         "params": params,
         "model_name": model_name or "",
@@ -9974,20 +9940,21 @@ else:
             key=f"locked_level_{version}_{saved}",
         )
 
-    st.text_area(
-        "Descripción general de trabajos",
-        value=g["project_data"]["description"],
-        height=220,
-        disabled=True,
-        key=f"locked_description_{version}_{saved}",
-    )
-    st.text_area(
-        "Texto guía",
-        value=g["project_data"]["guide_text"] or "",
-        height=160,
-        disabled=True,
-        key=f"locked_guide_{version}_{saved}",
-    )
+    with st.expander("Datos de entrada"):
+        st.text_area(
+            "Descripción general de trabajos",
+            value=g["project_data"]["description"],
+            height=220,
+            disabled=True,
+            key=f"locked_description_{version}_{saved}",
+        )
+        st.text_area(
+            "Texto guía",
+            value=g["project_data"]["guide_text"] or "",
+            height=160,
+            disabled=True,
+            key=f"locked_guide_{version}_{saved}",
+        )
 
     # Este módulo termina en el Importe interno. La marca y el IVA se agregan
     # posteriormente, fuera de este presupuesto de negociación con subcontratistas.
@@ -9998,33 +9965,7 @@ else:
         formato_moneda(presupuesto_interno),
     )
 
-    with st.expander("Detalle interno"):
-        if any(not x.get("cost_known", True) for x in items):
-            st.warning("Faltan costos de contratación. Los costos, indirectos y utilidad objetivo mostrados son parciales.")
-        i1, i2, i3 = st.columns(3)
-        i1.metric("Costo directo", formato_moneda(financials["direct_cost"]))
-        i2.metric("Indirectos", formato_moneda(financials["indirect_cost"]))
-        i3.metric("Utilidad", formato_moneda(financials["profit"]))
-
-    with st.expander("Formación del precio cliente"):
-        internal_calc = financials["direct_cost"] + financials["indirect_cost"] + financials["profit"]
-        client_totals = totales_cliente(items, g["params"], g["project_data"])
-        client_base = client_totals["subtotal"]
-        st.table(pd.DataFrame([
-            {"Etapa": "Contratación estimada", "Importe MXN": financials["direct_cost"]},
-            {"Etapa": "Indirectos empresa", "Importe MXN": financials["indirect_cost"]},
-            {"Etapa": "Utilidad objetivo empresa", "Importe MXN": financials["profit"]},
-            {"Etapa": "Ajuste interno vigente", "Importe MXN": presupuesto_interno - internal_calc},
-            {"Etapa": "Interno vigente", "Importe MXN": presupuesto_interno},
-            {"Etapa": "Recargo y ajustes comerciales", "Importe MXN": client_base - presupuesto_interno},
-            {"Etapa": "Cliente antes de IVA", "Importe MXN": client_base},
-            {"Etapa": "Extras", "Importe MXN": client_totals["extras"]},
-            {"Etapa": "Descuentos", "Importe MXN": client_totals["discount"]},
-            {"Etapa": "IVA cliente", "Importe MXN": client_totals["tax"]},
-            {"Etapa": "Total cliente con IVA", "Importe MXN": client_totals["total"]},
-        ]))
-        st.caption("El recargo es sobre el interno vigente. Confirmar qué gastos y utilidad del subcontratista incluye el costo de contratación; no se añade otro porcentaje automáticamente.")
-    mostrar_revision_costos(items)
+    st.caption("Importe para proveedores, con sus indirectos y utilidad. Nuestra utilidad y el IVA se agregan en el Excel de plataforma.")
     df = dataframe_resumen(items)
     st.dataframe(
         df,
@@ -10054,13 +9995,7 @@ else:
         mime="application/zip",
         use_container_width=True,
     )
-    st.caption(
-        "El .zip incluye los dos archivos: el Excel interno de negociación "
-        "(01 Presupuesto / 02 Control Interno / 03 Trazabilidad / 04 Costos "
-        "por Área / Análisis de costos / Formación del precio / Revisión de costos) "
-        "el Excel formato cliente (Resumen + Partidas) y un TXT con los datos "
-        "proporcionados para generar el presupuesto."
-    )
+    st.caption("Incluye revisión interna con análisis de costos, formato plataforma y datos de entrada en TXT.")
 
     # -----------------------------------------------------
     # EDITOR CON PROPUESTAS Y SECUENCIA DE OBRA
