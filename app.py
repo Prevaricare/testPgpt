@@ -2210,8 +2210,10 @@ class RecursoCosteoIA(BaseModel):
 class ComponenteTecnicoIA(BaseModel):
     concepto: str
     categoria: str = Field(description="MATERIAL, HERRAJE, MANO_OBRA, CONSUMIBLE, EQUIPO o TRANSPORTE")
+    # Gemini/Google GenAI rechaza el exclusiveMinimum generado por Field(gt=0).
+    # Se usa ge=0 en el JSON Schema y se mantiene la regla estricta (>0) en Python.
     unidad: str
-    cantidad_lote: float = Field(gt=0, description="Consumo para TODA la actividad; no por unidad comercial")
+    cantidad_lote: float = Field(ge=0, description="Consumo para TODA la actividad; no por unidad comercial")
     criterio: str = Field(description="Despiece, geometría o rendimiento que justifica la cantidad")
     origen: str = Field(description="SOLICITADO o SUPUESTO; nunca presentar hipótesis como dato del usuario")
 
@@ -9456,7 +9458,8 @@ Devuelve exactamente un desarrollo por cada código solicitado, sin modificar la
         if not entry.descripcion_desarrollada.strip() or not entry.componentes or not entry.procesos:
             invalidar_ultima_respuesta_ia();raise ValueError('Desarrollo técnico incompleto: '+entry.codigo)
         for component in entry.componentes:
-            if (not math.isfinite(component.cantidad_lote) or not component.concepto.strip()
+            if (not math.isfinite(component.cantidad_lote) or component.cantidad_lote <= 0
+                or not component.concepto.strip()
                 or not component.unidad.strip() or not component.criterio.strip()
                 or component.origen not in {'SOLICITADO','SUPUESTO'}):
                 invalidar_ultima_respuesta_ia();raise ValueError('Componente técnico inválido: '+entry.codigo)
