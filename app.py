@@ -297,7 +297,7 @@ def seccion_ejecucion_item(item: dict) -> str:
 
 def ordenar_items_comercialmente(items: list[dict]) -> list[dict]:
     """
-    Ordena por fase macro de obra y después por orden_ejecucion auditado.
+    Respeta primero la secuencia constructiva; el oficio solo desempata.
     """
     preferred = {
         name: index for index, name in enumerate(SECCIONES_COMERCIALES_PREFERENTES)
@@ -314,7 +314,7 @@ def ordenar_items_comercialmente(items: list[dict]) -> list[dict]:
             section,
             preferred.get("OTROS TRABAJOS", 10),
         )
-        return (0 if item.get("editor_ordered") else phase, execution_order, idx)
+        return (execution_order, phase, idx)
 
     ordered = [dict(item) for _, item in sorted(enumerate(items), key=key)]
     for item in ordered:
@@ -367,17 +367,19 @@ def estructura_partidas_excel(items: list[dict]) -> list[dict]:
     section_numbers = {}
     section_counts = {}
     output = []
+    previous_section = None
+    block = 0
 
     for item in ordered:
         section = seccion_ejecucion_item(item)
 
-        if section not in section_numbers:
-            section_numbers[section] = len(section_numbers) + 1
-            section_counts[section] = 0
-
-        part_num = section_numbers[section]
-        section_counts[section] += 1
-        sub_num = section_counts[section]
+        if section != previous_section:
+            block += 1
+            previous_section = section
+            section_counts[block] = 0
+        part_num = block
+        section_counts[block] += 1
+        sub_num = section_counts[block]
 
         enriched = dict(item)
         enriched["part_number"] = part_num
@@ -899,7 +901,7 @@ CAMPOS_COSTEO_GUARDADOS = (
     "costing_warnings", "price_references", "requires_quote", "price_status",
     "manual_cost_adjustment", "manual_sale_adjustment", "analysis_unit_cost",
     "quantity_confidence", "costing_audit_findings", "price_source", "price_source_detail", "price_confidence",
-    "python_template", "item_id", "cost_known", "client_code", "client_chapter", "client_markup_pct", "client_tax_pct", "client_unit_price_override", "editor_ordered",
+    "sequence_predecessors", "sequence_condition", "sequence_method", "sequence_verified", "execution_order", "python_template", "item_id", "cost_known", "client_code", "client_chapter", "client_markup_pct", "client_tax_pct", "client_unit_price_override", "editor_ordered",
 )
 
 
@@ -2859,8 +2861,6 @@ def auditar_estructura_presupuesto_ia(
     Segunda pasada de Gemini dedicada solamente a partida, subpartida y secuencia.
     Evalúa todas las actividades juntas y no modifica costos ni alcance.
     """
-    if modo_ahorro():
-        return validar_estructura_python(result)
     if not result.actividades:
         return result
 
@@ -5549,12 +5549,13 @@ def recuperar_analisis_excel(workbook) -> dict:
             result[code] = json.loads("".join(text for _, text in sorted(pieces)))
         except (ValueError, TypeError):
             result[code] = {"costing_warnings": ["Metadatos del análisis no recuperables."]}
-    if "05 Análisis de costos" not in workbook.sheetnames:
+    resource_sheet = "03 Análisis de costos" if "03 Análisis de costos" in workbook.sheetnames else "05 Análisis de costos"
+    if resource_sheet not in workbook.sheetnames:
         for payload in result.values():
             payload.update(costing_stale=True, costing_stale_reason="La hoja de recursos fue eliminada del Excel.")
         return result
     resources = {}
-    for row in workbook["05 Análisis de costos"].iter_rows(min_row=4, max_col=15, values_only=True):
+    for row in workbook[resource_sheet].iter_rows(min_row=4, max_col=15, values_only=True):
         code, _, cat, concept, unit, qty, price, _, criterion, source, url, date, assumption, required, _ = row
         if not code or cat == "SIN DESGLOSE":
             continue
@@ -6279,6 +6280,8 @@ def crear_excel(
 
     agregar_hojas_costeo(wb, ordered_items, commercial_row_map, header_row + 1)
     actualizar_formacion_cliente(wb, ordered_items, params, project_data, commercial_row_map)
+    consolidar_excel_interno(wb)
+    agregar_diagrama_secuencia(wb, ordered_items)
     out = BytesIO()
     wb.save(out)
     out.seek(0)
@@ -8052,7 +8055,7 @@ def aplicar_borrador_editor(g: dict, new_items: list[dict], reason: str, schedul
     validar_items_editor(new_items)
     before = snapshot_editor(g)
     candidate = dict(g)
-    ordered_items = [dict(item, execution_order=(idx + 1) * 10, editor_ordered=True) for idx, item in enumerate(new_items)]
+    ordered_items = ordenar_items_comercialmente(new_items)
     candidate["items"] = asignar_codigos_jerarquicos(asegurar_identidades(ordered_items))
     candidate["result"] = resultado_de_items(g, candidate["items"]).model_dump()
     candidate["financials"] = calcular_financieros(candidate["items"], g["params"])
@@ -8337,6 +8340,7 @@ def preparar_propuesta_editor(g: dict, plan_data: dict, db, api_key: str, model:
         audit=solicitar_json_editor(api_key,model,
             "Audita esta revisión completa. Compara solicitud, alcance y recursos. Detecta duplicados, omisiones, cambios ajenos a la solicitud, costos compartidos y conversiones de unidades sin sustento. No generes cambios nuevos; devuelve hallazgos y pendientes.\n" + json.dumps({"solicitud":plan_data["request"],"contexto":contexto_editor(g,[key for op in plan.operaciones for key in op.ids]),"plan":plan.model_dump(),"propuesta":[item_contexto_ia(x,x["item_id"] in {key for group in job["groups"] for key in group["after"]}) for x in job["items"]]},ensure_ascii=False),AuditoriaEditorIA,progress)
         job["audit"]=audit.model_dump()
+    job["items"] = preparar_secuencia_automatica(job["items"], g["project_data"], api_key, model, progress)
     if progress:progress(100,"Propuesta lista para comparar")
     return {"fingerprint":plan_data["fingerprint"],"request":plan_data["request"],"groups":clonar_estado(job["groups"]),
             "items":clonar_estado(job["items"]),"warnings":plan.supuestos+job["audit"]["hallazgos"]+job["audit"]["pendientes"]}
@@ -8366,6 +8370,11 @@ def seleccionar_propuesta(g: dict, proposal: dict, selected: list[str]) -> list[
             else:current[key]=clonar_estado(item)
         order=group["order"]+[key for key in current if key not in group["order"]]
         output=[current[key] for key in order if key in current]
+    final_by_id={x["item_id"]:x for x in proposal.get("items",[])}
+    if set(selected)==known:
+        for item in output:
+            for field in ("execution_order","sequence_predecessors","sequence_condition","sequence_method","sequence_verified"):
+                if field in final_by_id.get(item["item_id"],{}):item[field]=copy.deepcopy(final_by_id[item["item_id"]][field])
     validar_items_editor(output)
     return output
 
@@ -8807,8 +8816,7 @@ def render_editor_integral(g: dict, db, model: str):
             g.clear();g.update(candidate);st.rerun()
         except Exception as exc:st.error(str(exc))
 
-    with st.expander("Programa de obra · Gantt"):
-        render_secuencia_editor(g,model,epoch)
+    st.caption("El Excel interno incluye automáticamente el diagrama de secuencia, sin fechas ni duraciones.")
     render_importar_editor(db,g["params"],"workspace_import_"+epoch)
 
 
@@ -8937,7 +8945,229 @@ def render_secuencia_editor(g: dict, model: str, epoch: str):
 
 
 # Los precios estimados requieren revisión antes de convertirse en referencias aprobadas.
-AI_ENGINE_VERSION = 'proveedores-lotes-2'  # No reutilizar estimaciones anteriores sin esta revisión.
+class NodoSecuenciaIA(BaseModel):
+    id: str
+    predecesoras: list[str] = Field(default_factory=list)
+    condicion: str = Field(max_length=240, description="Qué debe estar terminado o disponible y por qué permite iniciar")
+    metodo: str = Field(max_length=240, description="Cómo ejecutar o coordinar el trabajo; distinguir fabricación en taller de montaje si aplica")
+
+
+class SecuenciaLogicaIA(BaseModel):
+    actividades: list[NodoSecuenciaIA]
+
+
+def niveles_secuencia(items):
+    mapping={x['item_id']:x for x in items}
+    if len(mapping)!=len(items):raise ValueError('IDs repetidos en la secuencia.')
+    levels={};pending=set(mapping)
+    while pending:
+        ready=[]
+        for key in sorted(pending):
+            deps=set(mapping[key].get('sequence_predecessors') or [])
+            if not deps<=mapping.keys() or key in deps:raise ValueError('La secuencia contiene una dependencia inexistente o de sí misma.')
+            if deps<=levels.keys():ready.append(key)
+        if not ready:raise ValueError('La secuencia tiene un ciclo; revisa las dependencias.')
+        for key in ready:
+            deps=mapping[key].get('sequence_predecessors') or []
+            levels[key]=max((levels[p] for p in deps),default=-1)+1
+        pending.difference_update(ready)
+    return levels
+
+
+def preparar_secuencia_automatica(items, project, api_key, model, progress=None):
+    items=asegurar_identidades(items)
+    active=[x for x in items if item_esta_incluido(x)]
+    if not active:return items
+    actualizar_progreso(progress,91,'Preparando dependencias, ejecución y trabajos en paralelo para el Excel')
+    prompt='''Prepara la secuencia CONSTRUCTIVA de todas las actividades recibidas. No estimes fechas,
+días, duraciones ni precios. Devuelve exactamente un nodo por ID. predecesoras son IDs exactos
+que deben terminar antes de iniciar. No crees ciclos. No confundas el orden del listado o el oficio
+con una dependencia física. Permite trabajo paralelo solo cuando no hay dependencia técnica;
+explica condiciones de acceso, protección y coordinación de cuadrillas. Distingue fabricación
+fuera de obra del montaje: si una actividad integra ambos, describe qué preparación se puede
+adelantar, pero las dependencias del nodo deben proteger el montaje. No inventes actividades.
+condicion explica qué permite iniciar y por qué; metodo explica brevemente cómo se ejecuta.
+Considera protección antes de trabajos que dañan, instalaciones ocultas antes de cerrar,
+pruebas antes de entrega, limpieza final después de trabajos que ensucian. Aplica solo al alcance.
+'''+json.dumps({'proyecto':project.get('description'),'guia':project.get('guide_text'),
+    'actividades':[{'id':x['item_id'],'actividad':titulo_comercial_item(x),'descripcion':x['description'],
+        'area':area_excel_item(x),'cantidad':x['quantity'],'unidad':x['unit']} for x in active]},ensure_ascii=False)
+    output=solicitar_json_editor(api_key,model,prompt,SecuenciaLogicaIA,progress)
+    expected={x['item_id'] for x in active};received=[n.id for n in output.actividades]
+    if set(received)!=expected or len(received)!=len(expected):
+        invalidar_ultima_respuesta_ia();raise ValueError('La secuencia debe contener todas las actividades una sola vez.')
+    nodes={x.id:x for x in output.actividades};updated=[]
+    for item in items:
+        out=dict(item)
+        if out['item_id'] in nodes:
+            n=nodes[out['item_id']]
+            out.update(sequence_predecessors=list(dict.fromkeys(n.predecesoras)),sequence_condition=n.condicion,
+                       sequence_method=n.metodo,sequence_verified=True,editor_ordered=False)
+        updated.append(out)
+    try:levels=niveles_secuencia([x for x in updated if item_esta_incluido(x)])
+    except ValueError:
+        invalidar_ultima_respuesta_ia();raise
+    for item in updated:
+        if item['item_id'] in levels:item['execution_order']=(levels[item['item_id']]+1)*10
+    return ordenar_items_comercialmente(updated)
+
+
+def consolidar_excel_interno(wb):
+    """Reubica bloques y referencias sin perder fórmulas ni la recarga de versiones anteriores."""
+    from openpyxl.formula import Tokenizer
+    from openpyxl.cell.cell import MergedCell
+    control=wb['02 Control Interno'];review=wb['07 Revisión de costos']
+    formation_offset=control.max_row+4
+    areas_offset=review.max_row+4
+    mapping={'05 Análisis de costos':('03 Análisis de costos',0),
+             '06 Formación del precio':('02 Control Interno',formation_offset),
+             '07 Revisión de costos':('04 Revisión de costos',0),
+             '04 Costos por Área':('04 Revisión de costos',areas_offset)}
+    def shift_address(address,offset):
+        return re.sub(r'(\$?[A-Z]{1,3}\$?)(\d+)',lambda m:m[1]+str(int(m[2])+offset),address)
+    def formula(value,origin):
+        if not isinstance(value,str) or not value.startswith('='):return value
+        tokens=Tokenizer(value)
+        for token in tokens.items:
+            if token.type!='OPERAND' or token.subtype!='RANGE':continue
+            if '!' in token.value:
+                sheet,addr=token.value.rsplit('!',1);name=sheet.strip("'").replace("''", "'")
+                if name in mapping:
+                    dest,offset=mapping[name];token.value="'"+dest.replace("'","''")+"'!"+shift_address(addr,offset)
+            else:
+                offset=mapping.get(origin,(origin,0))[1]
+                if offset:token.value=shift_address(token.value,offset)
+        return '='+''.join(t.value for t in tokens.items)
+    # Rewrite before moving; each formula still knows its original worksheet.
+    for ws in wb:
+        for row in ws:
+            for cell in row:
+                if cell.data_type=='f':cell.value=formula(cell.value,ws.title)
+    def append_sheet(source,target,offset):
+        for row in source:
+            for cell in row:
+                if isinstance(cell,MergedCell):continue
+                dest=target.cell(cell.row+offset,cell.column,cell.value)
+                if cell.has_style:dest._style=copy.copy(cell._style) # same workbook
+                if cell.hyperlink:dest.hyperlink=copy.copy(cell.hyperlink)
+        for merged in source.merged_cells.ranges:
+            target.merge_cells(start_row=merged.min_row+offset,end_row=merged.max_row+offset,
+                               start_column=merged.min_col,end_column=merged.max_col)
+        for index,dim in source.row_dimensions.items():
+            target.row_dimensions[index+offset].height=dim.height
+        for row in range(offset+1,offset+source.max_row+1):
+            target.row_dimensions[row].height=max(target.row_dimensions[row].height or 24,48)
+    wb['06 Formación del precio']['C13']='Total para el cliente, incluida nuestra utilidad y el IVA.'
+    append_sheet(wb['06 Formación del precio'],control,formation_offset)
+    append_sheet(wb['04 Costos por Área'],review,areas_offset)
+    for name in ('03 Trazabilidad','04 Costos por Área','06 Formación del precio'):del wb[name]
+    wb['05 Análisis de costos'].title='03 Análisis de costos'
+    review.title='04 Revisión de costos'
+    # Essential columns stay visible; long provenance remains available by expanding the group.
+    resources=wb['03 Análisis de costos']
+    resources.column_dimensions.group('J','O',hidden=True)
+    review.column_dimensions.group('N','S',hidden=True)
+    for col in ('E','H','I','J','K'):review.column_dimensions[col].hidden=True
+    for col,width in {'A':12,'B':28,'C':17,'D':17,'F':18,'G':14,'L':36,'M':30}.items():review.column_dimensions[col].width=width
+    review['C3']='Costo directo analizado'
+    review['D3']='Costo directo vigente'
+    review['F3']='Referencia comparable'
+    review['G3']='Diferencia %'
+    review['L3']='Observaciones del análisis'
+    review['M3']='Cambios por revisar'
+    review.row_dimensions[3].height=34
+    review['A2']='Costo analizado, referencia y observaciones por actividad. Resumen por áreas al final.'
+    control['H2']='Costo directo, indirectos y utilidad del proveedor. Formación del precio cliente al final. Recursos en 03 y revisión en 04.'
+    wb['08 Metadatos de costos'].sheet_state='veryHidden'
+    for ws in (control,resources,review):
+        ws.print_area=f'A1:{"S" if ws==control else "I" if ws==resources else "M"}{ws.max_row}'
+        ws.page_setup.orientation='landscape';ws.page_setup.fitToWidth=1;ws.page_setup.fitToHeight=0
+
+
+def imagen_secuencia(items):
+    from PIL import Image, ImageDraw, ImageFont
+    import textwrap
+    active=asegurar_identidades([x for x in ordenar_items_comercialmente(items) if item_esta_incluido(x)])
+    prepared=bool(active) and all(x.get('sequence_verified') for x in active)
+    if prepared:
+        levels=niveles_secuencia(active)
+    else:
+        # Old/imported workbooks have an order, not confirmed dependencies; do not invent parallelism.
+        levels={x['item_id']:i for i,x in enumerate(active)}
+    def font(size,bold=False):
+        candidates=[f'/usr/share/fonts/truetype/dejavu/DejaVuSans{"-Bold" if bold else ""}.ttf',
+                    'DejaVuSans-Bold.ttf' if bold else 'DejaVuSans.ttf']
+        for path in candidates:
+            try:return ImageFont.truetype(path,size)
+            except OSError:pass
+        return ImageFont.load_default(size=size)
+    small=font(17);normal=font(19);bold=font(21,True);title=font(28,True)
+    positions={};texts={};y=150;width=1560;card_width=460;gap=30
+    for level in sorted(set(levels.values())):
+        nodes=[x for x in active if levels[x['item_id']]==level]
+        for start in range(0,len(nodes),3):
+            chunk=nodes[start:start+3];heights=[]
+            for n in chunk:
+                lines=[]
+                label=f"{n['code']} · {titulo_comercial_item(n)}"
+                lines+=textwrap.wrap(label,34)
+                lines+=textwrap.wrap('Área: '+area_excel_item(n),43)
+                if prepared:
+                    deps=[next(str(v['code']) for v in active if v['item_id']==d) for d in n.get('sequence_predecessors',[])]
+                    lines+=textwrap.wrap('Después de: '+(', '.join(deps) if deps else 'sin requisito previo dentro del presupuesto'),43)
+                    lines+=textwrap.wrap('Inicio: '+n.get('sequence_condition',''),43)
+                    lines+=textwrap.wrap('Cómo: '+n.get('sequence_method',''),43)
+                else:lines+=['Orden heredado. Dependencias', 'y condiciones por confirmar.']
+                texts[n['item_id']]=lines;heights.append(35+26*len(lines))
+            height=max(heights,default=120)
+            for col,n in enumerate(chunk):positions[n['item_id']]=(65+col*(card_width+gap),y,card_width,height)
+            y+=height+85
+    canvas=Image.new('RGB',(width,max(y+50,350)),'white');d=ImageDraw.Draw(canvas)
+    d.text((65,22),'SECUENCIA DE TRABAJOS',font=title,fill='#18324F')
+    subtitle='Flechas: requisitos de inicio. Mismo nivel: sin dependencia entre sí; coordinar acceso y cuadrillas.' if prepared else 'Secuencia de referencia del archivo importado. Solicita revisión con IA para definir dependencias.'
+    d.text((65,68),subtitle,font=small,fill='#48596C')
+    d.text((65,98),'La posición no representa fechas ni duración.',font=small,fill='#48596C')
+    for n in active:
+        if not prepared:continue
+        tx,ty,tw,th=positions[n['item_id']]
+        for index,dep in enumerate(n.get('sequence_predecessors') or []):
+            sx,sy,sw,sh=positions[dep];a=(sx+sw//2,sy+sh);b=(tx+tw//2,ty)
+            if levels[n['item_id']]==levels[dep]+1:
+                mid=a[1]+28
+                route=[a,(a[0],mid),(b[0],mid),b]
+            else:
+                lane=18+(index%3)*10
+                route=[a,(a[0],a[1]+20),(lane,a[1]+20),(lane,b[1]-20),(b[0],b[1]-20),b]
+            d.line(route,fill='#738CA4',width=3)
+            d.polygon([(b[0],b[1]),(b[0]-7,b[1]-12),(b[0]+7,b[1]-12)],fill='#738CA4')
+    for n in active:
+        x,yy,w,h=positions[n['item_id']]
+        d.rounded_rectangle((x,yy,x+w,yy+h),radius=12,fill='#F0F5FA',outline='#447499',width=2)
+        for index,line in enumerate(texts[n['item_id']]):
+            d.text((x+15,yy+15+index*26),line,font=bold if index==0 else normal,fill='#18324F')
+    out=BytesIO();canvas.save(out,format='PNG');out.seek(0)
+    return out,canvas.size
+
+
+def agregar_diagrama_secuencia(wb,items):
+    from openpyxl.drawing.image import Image as ExcelImage
+    ws=wb.create_sheet('05 Secuencia de trabajos')
+    data,size=imagen_secuencia(items)
+    img=ExcelImage(data);img.width=size[0]*.7;img.height=size[1]*.7
+    ws.add_image(img,'A1');ws.sheet_view.showGridLines=False
+    for col in range(1,16):ws.column_dimensions[get_column_letter(col)].width=10
+    rows=math.ceil(img.height/20)+1
+    for row in range(1,rows+1):ws.row_dimensions[row].height=15
+    ws.print_area=f'A1:O{rows}'
+    ws.sheet_properties.pageSetUpPr.fitToPage=True
+    ws.page_setup.orientation='landscape';ws.page_setup.paperSize=ws.PAPERSIZE_A3
+    ws.page_setup.fitToWidth=1;ws.page_setup.fitToHeight=0
+    ws.sheet_properties.tabColor='447499'
+    # Keep technical payload after the visible work sequence.
+    wb.move_sheet(ws,offset=-1)
+
+
+AI_ENGINE_VERSION = 'proveedores-secuencia-3'  # No reutilizar estimaciones anteriores sin esta revisión.
 
 class GeminiPausa(RuntimeError):
     """Gemini no completó la solicitud; el trabajo terminado permanece guardado."""
@@ -9830,6 +10060,9 @@ if "generated" not in st.session_state:
                     mensaje="Precios valuados y partidas convertidas en items.",
                 )
                 stage = 3
+
+            # Secuencia sin calendario: se incluye automáticamente en el Excel interno.
+            items = preparar_secuencia_automatica(items, project_data, api_key, model_name, ui_progress)
 
             # ETAPA 4 -------------------------------------------------------
             ui_progress(93, "Calculando importes y preparando el Excel")
