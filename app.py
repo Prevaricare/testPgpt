@@ -2211,7 +2211,7 @@ class ComponenteTecnicoIA(BaseModel):
     concepto: str
     categoria: str = Field(description="MATERIAL, HERRAJE, MANO_OBRA, CONSUMIBLE, EQUIPO o TRANSPORTE")
     unidad: str
-    cantidad_lote: float = Field(gt=0, description="Consumo para TODA la actividad; no por unidad comercial")
+    cantidad_lote: float = Field(ge=0, description="Consumo para TODA la actividad; no por unidad comercial")
     criterio: str = Field(description="Despiece, geometría o rendimiento que justifica la cantidad")
     origen: str = Field(description="SOLICITADO o SUPUESTO; nunca presentar hipótesis como dato del usuario")
 
