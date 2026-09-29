@@ -2328,7 +2328,7 @@ def error_gemini_transitorio(exc: Exception) -> bool:
     ))
 
 
-MAX_REINTENTOS_GEMINI = 3
+MAX_REINTENTOS_GEMINI = 50
 INTERVALO_GEMINI_SEG = 35
 
 
