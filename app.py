@@ -2369,7 +2369,8 @@ def error_gemini_transitorio(exc: Exception) -> bool:
 
 
 MAX_REINTENTOS_GEMINI = 50
-INTERVALO_GEMINI_SEG = 35
+INTERVALO_GEMINI_SEG = 5
+ESPERA_ERROR_GEMINI_SEG = 35
 
 
 def configuracion_gemini_razonada(
@@ -9279,7 +9280,7 @@ def pausa_reintento_ia(exc, attempt):
     if any(word in message for word in ('requestsperday','tokensperday','per_day','perday','daily quota','daily limit')):
         raise GeminiPausa('Cuota diaria de Gemini agotada. El avance terminado quedó guardado.') from exc
     matches=re.findall(r'(?:retrydelay[\s\"\x27:]+|retry in\s+)(\d+(?:\.\d+)?)',message)
-    return max([INTERVALO_GEMINI_SEG]+[float(x) for x in matches])
+    return max([ESPERA_ERROR_GEMINI_SEG]+[float(x) for x in matches])
 
 
 def esperar_turno_ia(model, progress_callback=None):
