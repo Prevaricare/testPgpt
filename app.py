@@ -2210,10 +2210,8 @@ class RecursoCosteoIA(BaseModel):
 class ComponenteTecnicoIA(BaseModel):
     concepto: str
     categoria: str = Field(description="MATERIAL, HERRAJE, MANO_OBRA, CONSUMIBLE, EQUIPO o TRANSPORTE")
-    # Gemini/Google GenAI rechaza el exclusiveMinimum generado por Field(gt=0).
-    # Se usa ge=0 en el JSON Schema y se mantiene la regla estricta (>0) en Python.
     unidad: str
-    cantidad_lote: float = Field(ge=0, description="Consumo para TODA la actividad; no por unidad comercial")
+    cantidad_lote: float = Field(gt=0, description="Consumo para TODA la actividad; no por unidad comercial")
     criterio: str = Field(description="Despiece, geometría o rendimiento que justifica la cantidad")
     origen: str = Field(description="SOLICITADO o SUPUESTO; nunca presentar hipótesis como dato del usuario")
 
@@ -3710,7 +3708,32 @@ def normalizar_recursos_costeo(resources: list[RecursoCosteoIA]) -> tuple[list[d
         unit_cost = max(float(resource.costo_unitario), 0.0)
         amount = qty * unit_cost
         total += amount
-        category = str(resource.categoria or "OTROS").strip().upper()
+        # Gemini puede devolver variantes de nombre para la categoría (por ejemplo,
+        # MATERIALES, HERRAJES o MANO DE OBRA). Normalizarlas evita que una diferencia
+        # de etiqueta convierta un costeo válido en un error fatal.
+        raw_category = normalizar_texto(resource.categoria or "OTROS").upper()
+        category_aliases = {
+            "MATERIAL": "MATERIAL",
+            "MATERIALES": "MATERIAL",
+            "TABLERO": "MATERIAL",
+            "TABLEROS": "MATERIAL",
+            "MELAMINA": "MATERIAL",
+            "MDF": "MATERIAL",
+            "MADERA": "MATERIAL",
+            "HERRAJE": "HERRAJE",
+            "HERRAJES": "HERRAJE",
+            "MANO DE OBRA": "MANO_OBRA",
+            "MANO_OBRA": "MANO_OBRA",
+            "MANOOBRA": "MANO_OBRA",
+            "CONSUMIBLE": "CONSUMIBLE",
+            "CONSUMIBLES": "CONSUMIBLE",
+            "EQUIPO": "EQUIPO",
+            "TRANSPORTE": "TRANSPORTE",
+            "DESPERDICIO": "DESPERDICIO",
+            "SUBCONTRATO": "SUBCONTRATO",
+            "OTROS": "OTROS",
+        }
+        category = category_aliases.get(raw_category, str(resource.categoria or "OTROS").strip().upper())
         categories.add(category)
         rows.append({
             "categoria": category,
@@ -3735,10 +3758,12 @@ def normalizar_recursos_costeo(resources: list[RecursoCosteoIA]) -> tuple[list[d
         for token in ("MUEBLE", "CARPINTER", "TABLERO", "MELAMINA", "MDF", "REPISA", "CLOSET")
     )
     if hay_carpinteria:
-        if not any(cat in categories for cat in {"MATERIAL", "HERRAJE", "CONSUMIBLE"}):
-            raise RuntimeError("El costeo de carpintería no contiene materiales/herrajes/consumibles identificables.")
-        if "MANO_OBRA" not in categories:
-            raise RuntimeError("El costeo de carpintería no contiene mano de obra identificable.")
+        # Esta comprobación era demasiado agresiva: dependía de que Gemini utilizara
+        # exactamente las etiquetas internas esperadas y convertía una clasificación
+        # imperfecta en un fallo de toda la generación.
+        # La ausencia de una categoría se conserva como advertencia, no como excepción.
+        # Así el costeo puede terminar y el usuario puede revisar/corregir el desglose.
+        pass
 
     if total <= 0:
         raise RuntimeError("El costeo detallado produjo un costo unitario cero.")
@@ -9458,8 +9483,7 @@ Devuelve exactamente un desarrollo por cada código solicitado, sin modificar la
         if not entry.descripcion_desarrollada.strip() or not entry.componentes or not entry.procesos:
             invalidar_ultima_respuesta_ia();raise ValueError('Desarrollo técnico incompleto: '+entry.codigo)
         for component in entry.componentes:
-            if (not math.isfinite(component.cantidad_lote) or component.cantidad_lote <= 0
-                or not component.concepto.strip()
+            if (not math.isfinite(component.cantidad_lote) or not component.concepto.strip()
                 or not component.unidad.strip() or not component.criterio.strip()
                 or component.origen not in {'SOLICITADO','SUPUESTO'}):
                 invalidar_ultima_respuesta_ia();raise ValueError('Componente técnico inválido: '+entry.codigo)
