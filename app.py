@@ -897,7 +897,7 @@ def actualizar_alertas_costeo(item: dict) -> dict:
 
 
 CAMPOS_COSTEO_GUARDADOS = (
-    "costing_breakdown", "costing_scope", "costing_stale", "costing_stale_reason",
+    "technical_development", "costing_breakdown", "costing_scope", "costing_stale", "costing_stale_reason",
     "costing_warnings", "price_references", "requires_quote", "price_status",
     "manual_cost_adjustment", "manual_sale_adjustment", "analysis_unit_cost",
     "quantity_confidence", "costing_audit_findings", "price_source", "price_source_detail", "price_confidence",
@@ -2207,7 +2207,33 @@ class RecursoCosteoIA(BaseModel):
     supuesto: str = Field(default="", description="Hipótesis de consumo, rendimiento o conversión de unidad de compra")
 
 
+class ComponenteTecnicoIA(BaseModel):
+    concepto: str
+    categoria: str = Field(description="MATERIAL, HERRAJE, MANO_OBRA, CONSUMIBLE, EQUIPO o TRANSPORTE")
+    unidad: str
+    cantidad_lote: float = Field(gt=0, description="Consumo para TODA la actividad; no por unidad comercial")
+    criterio: str = Field(description="Despiece, geometría o rendimiento que justifica la cantidad")
+    origen: str = Field(description="SOLICITADO o SUPUESTO; nunca presentar hipótesis como dato del usuario")
+
+
+class DesarrolloActividadIA(BaseModel):
+    codigo: str
+    descripcion_desarrollada: str
+    especificaciones_confirmadas: list[str]
+    supuestos: list[str]
+    datos_pendientes: list[str]
+    exclusiones: list[str]
+    componentes: list[ComponenteTecnicoIA]
+    procesos: list[str]
+    costos_compartidos: list[str] = Field(default_factory=list, description="Preparación, transporte o equipo compartidos y códigos involucrados")
+
+
+class DesarrolloLoteIA(BaseModel):
+    actividades: list[DesarrolloActividadIA]
+
+
 class CosteoActividadIA(BaseModel):
+    desarrollo_tecnico: dict = Field(default_factory=dict)
     codigo: str = Field(description="Código exacto de la actividad")
     recursos: list[RecursoCosteoIA] = Field(description="Desglose interno completo de recursos para una unidad de actividad")
     confianza: str = Field(description="Alta, Media o Baja")
@@ -3361,16 +3387,15 @@ referencia genérica representa un trabajo especial.
     )
 
 
+def modelo_para_costos(model_name=None):
+    # No sustituir una tarea técnica por Lite ni subir automáticamente a 3.7/3.8.
+    return model_name if model_name in {"gemini-3.5-flash", "gemini-3.6-flash"} else "gemini-3.5-flash"
+
+
 def _modelos_gemini_disponibles(model_name: str | None) -> list[str]:
-    modelos = []
-    for model in [
-        model_name,
-        "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
-    ]:
-        if model and model not in modelos:
-            modelos.append(model)
-    return modelos
+    if model_name in {"gemini-3.5-flash", "gemini-3.6-flash"}:
+        return [model_name] + [m for m in ("gemini-3.5-flash", "gemini-3.6-flash") if m != model_name]
+    return list(dict.fromkeys(m for m in (model_name, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite") if m))
 
 
 def costear_actividad_detalladamente_ia(
@@ -3388,6 +3413,7 @@ def costear_actividad_detalladamente_ia(
     costear materiales, herrajes, mano de obra, consumibles, equipo y logística antes
     de fijar el costo unitario final.
     """
+    model_name = modelo_para_costos(model_name)
     client = crear_cliente_ia(api_key)
     year = datetime.now().year
     budget_level = project_data.get("budget_level", "Medio-alto")
@@ -3514,7 +3540,7 @@ por recurso; no intentes sustituir el desglose por una cifra única.
                     CosteoActividadIA,
                     thinking_level="high",
                     max_output_tokens=32768,
-                    ground_with_search=True,
+                    ground_with_search=False,
                 ),
                 progress_callback=progress_callback,
                 etapa=f"Costeo detallado · {activity.codigo_sugerido}",
@@ -3538,6 +3564,7 @@ def auditar_costeos_detallados_ia(
     progress_callback=None,
 ) -> AuditoriaCosteoPresupuestoIA:
     """Segunda lectura: revisa el conjunto de hojas de costo y devuelve correcciones completas."""
+    model_name = modelo_para_costos(model_name)
     client = crear_cliente_ia(api_key)
     year = datetime.now().year
     budget_level = project_data.get("budget_level", "Medio-alto")
@@ -3553,6 +3580,7 @@ def auditar_costeos_detallados_ia(
         )
         compact_costings.append({
             "codigo": costing.codigo,
+            "desarrollo_tecnico": costing.desarrollo_tecnico,
             "recursos": recursos,
             "costo_unitario_calculado_python": round(costo_unitario_calculado, 2),
             "confianza": costing.confianza,
@@ -3577,9 +3605,11 @@ IMPORTANTE
 - El costo unitario definitivo lo calculará Python como suma de cantidad x costo_unitario de los recursos corregidos.
 - No apliques indirectos ni utilidad del proveedor: Python los añade después. Tampoco incluyas utilidad de nuestra empresa ni IVA. Si una referencia ya incluye margen del proveedor, no la confundas con costo directo.
 - Usa referencias internas validadas como anclas cuando sean realmente comparables, pero no las copies ciegamente.
-- Cuando un insumo o precio de mercado sea determinante y pueda verificarse, usa Google Search
-  para contrastar referencias vigentes en México/CDMX. La búsqueda complementa el criterio de costos,
-  pero no reemplaza el metrado físico.
+- Esta llamada no dispone de búsqueda web. No afirmes haber consultado fuentes ni inventes URLs.
+- Usa el desarrollo técnico y las referencias proporcionadas. Si faltan precios comprobables,
+  conserva confianza Baja y requiere_cotizacion=True. Verifica cada componente desarrollado.
+- Contrasta recursos equivalentes entre actividades; diferencias requieren una especificación
+  o condición de compra que las explique, no el simple hecho de estar en otro lote.
 - Respeta las especificaciones del proyecto y el nivel seleccionado.
 
 PROYECTO
@@ -3644,7 +3674,7 @@ Los demás códigos de las referencias son solo contexto, no requieren una salid
                     AuditoriaCosteoPresupuestoIA,
                     thinking_level="high",
                     max_output_tokens=32768,
-                    ground_with_search=True,
+                    ground_with_search=False,
                 ),
                 progress_callback=progress_callback,
                 etapa="Auditoría de costeos detallados",
@@ -3767,30 +3797,8 @@ def resolver_items(
                 52 + int((idx - 1) / total_acts * 23),
                 f"4/6 · Construyendo costeo físico {idx}/{total_acts}: {code}",
             )
-            costing = costear_actividad_detalladamente_ia(
-                api_key=api_key,
-                model_name=model_name,
-                project_data=project_data,
-                params=params,
-                activity=act,
-                internal_reference=(
-                    {
-                        "costo_unitario": float(internal["unit_cost"]),
-                        "fuente": internal["source"],
-                        "estado": internal["status"],
-                        "confianza": internal["confidence"],
-                        "coincidencia": internal["match_score"],
-                        "detalle": internal["source_detail"],
-                        "referencia_validada": internal.get("validated_reference"),
-                        "referencia_estimada_ia": internal.get("estimated_reference"),
-                    }
-                    if internal else None
-                ),
-                progress_callback=(
-                    (lambda _pct, msg: actualizar_progreso(progress_callback, 52 + int((idx - 1) / total_acts * 23), msg))
-                    if progress_callback is not None else None
-                ),
-            )
+            costing = costear_lote_ahorro([act], project_data, result, refs_by_code,
+                                          api_key, modelo_para_costos(model_name), progress_callback)[0]
             # Fuerza el código solicitado para evitar cualquier ambigüedad.
             costing = costing.model_copy(update={"codigo": code})
             costings.append(costing)
@@ -3890,6 +3898,7 @@ def resolver_items(
             "considerations": considerations,
             "costing_breakdown": resources,
             "costing_stale": False,
+            "technical_development": costings[idx - 1].desarrollo_tecnico,
             "costing_warnings": list(costings[idx - 1].advertencias),
             "costing_audit_findings": list(audited.hallazgos),
             "requires_quote": bool(audited.requiere_cotizacion),
@@ -5496,6 +5505,26 @@ def agregar_hojas_costeo(wb, items: list[dict], commercial_rows: dict, control_s
         review.cell(rr, 7).number_format = '0.0%'
         review.row_dimensions[rr].height = 85
 
+    # Resumen técnico en la misma hoja: tres filas por actividad, sin nuevas pestañas.
+    for item in items:
+        development=item.get('technical_development') or {}
+        if not development:
+            continue
+        components='; '.join(f"{c.get('concepto','')}: {c.get('cantidad_lote',0):g} {c.get('unidad','')} "
+                            f"[{c.get('origen','')}]. {c.get('criterio','')}"
+                            for c in development.get('componentes',[]))
+        technical_rows=[
+            ('Alcance desarrollado',development.get('descripcion_desarrollada',''),components),
+            ('Procesos y coordinación','; '.join(development.get('procesos',[])),
+             '; '.join(development.get('costos_compartidos',[]))),
+            ('Supuestos y pendientes','; '.join('Supuesto: '+v for v in development.get('supuestos',[])),
+             '; '.join('Pendiente: '+v for v in development.get('datos_pendientes',[]))+
+             '; '.join(' Excluye: '+v for v in development.get('exclusiones',[]))) ]
+        for label,detail,criterion in technical_rows:
+            analysis.append([item['code'],titulo_comercial_item(item),'DESARROLLO',label+': '+detail,
+                             None,None,None,None,criterion])
+            analysis.row_dimensions[analysis.max_row].height=110
+
     for sheet in (analysis, review):
         sheet.auto_filter.ref = f"A3:{get_column_letter(15 if sheet == analysis else 13)}{max(sheet.max_row, 3)}"
         for cells in sheet.iter_rows(min_row=4):
@@ -5558,7 +5587,7 @@ def recuperar_analisis_excel(workbook) -> dict:
     resources = {}
     for row in workbook[resource_sheet].iter_rows(min_row=4, max_col=15, values_only=True):
         code, _, cat, concept, unit, qty, price, _, criterion, source, url, date, assumption, required, _ = row
-        if not code or cat == "SIN DESGLOSE":
+        if not code or cat in {"SIN DESGLOSE", "DESARROLLO"}:
             continue
         if not isinstance(qty, (int, float)) or not isinstance(price, (int, float)) or qty < 0 or price < 0:
             raise ValueError(f"Recurso de {code} sin consumo/precio numérico. Recalcula y guarda el Excel antes de importarlo.")
@@ -8131,7 +8160,7 @@ def solicitar_json_editor(api_key: str, model_name: str, prompt: str, schema, pr
         try:
             response = generar_con_gemini_resistente(client=client, model=model, contents=prompt,
                 config=configuracion_gemini_razonada(schema, thinking_level="high", max_output_tokens=32768),
-                progress_callback=progress_callback, etapa="Revisión por etapas")
+                progress_callback=progress_callback, etapa={"DesarrolloLoteIA":"Desarrollo técnico previo", "CosteoLotesIA":"Cálculo de recursos del proveedor"}.get(schema.__name__, "Revisión por etapas"))
             return schema.model_validate_json(response.text)
         except Exception as exc:
             last_error = exc
@@ -9168,7 +9197,7 @@ def agregar_diagrama_secuencia(wb,items):
     wb.move_sheet(ws,offset=-1)
 
 
-AI_ENGINE_VERSION = 'proveedores-secuencia-3'  # No reutilizar estimaciones anteriores sin esta revisión.
+AI_ENGINE_VERSION = 'proveedores-desarrollo-4'  # No reutilizar estimaciones anteriores sin esta revisión.
 
 class GeminiPausa(RuntimeError):
     """Gemini no completó la solicitud; el trabajo terminado permanece guardado."""
@@ -9388,14 +9417,71 @@ def item_con_plantilla_python(item,template,params):
     return recalcular_item_financiero(out,params)
 
 
+def contexto_tecnico_proyecto(project, result):
+    return {'descripcion_original':project.get('description',''),
+            'ubicacion':project.get('location'), 'tipo':project.get('project_type'),
+            'nivel':project.get('budget_level'), 'guia':project.get('guide_text',''),
+            'dimensiones':project.get('dimensions_text',''),
+            'reglas':result.consideraciones_generales, 'alcance_general':result.alcance_resumido,
+            'todas_actividades':[actividad_compacta(a) for a in result.actividades]}
+
+
+def desarrollar_lote_tecnico(activities, project, result, api_key, model, progress=None):
+    context=contexto_tecnico_proyecto(project,result)
+    context['actividades_a_desarrollar']=[actividad_compacta(a) for a in activities]
+    prompt="""Desarrolla técnicamente las actividades solicitadas ANTES de estimar precios.
+NO incluyas precios, importes, márgenes ni IVA. Conserva códigos, alcance, cantidad y unidad comercial.
+Usa la descripción original y la guía como autoridad; no pierdas especificaciones al resumir.
+Distingue especificaciones confirmadas, supuestos y datos pendientes. No inventes medidas,
+acabados de lujo, puertas, cajones ni instalaciones adicionales como si fueran solicitados.
+Si falta información imprescindible, adopta una hipótesis explícita para un presupuesto preliminar
+con nivel coherente con el proyecto e identifica qué debe confirmarse. No detengas por ello el trabajo.
+Despieza cada entregable: materiales, cubierta, costados, respaldos, entrepaños, frentes,
+herrajes, fijaciones, consumibles, desperdicio físico, fabricación, acabado e instalación según corresponda.
+Incluye componentes LED, equipos o espejos solamente donde los exige el alcance.
+Para solo instalación excluye el suministro del elemento principal. Respeta conexiones existentes.
+Muestra geometría o rendimiento y cantidades de componentes para TODO el lote comercial.
+Procesos: preparación, fabricación en taller, acabado, transporte e instalación; describe cuadrilla
+u horas como hipótesis justificadas cuando corresponda. No dupliques mano de obra en procesos y componentes.
+Identifica logística compartida y componentes ya incluidos en otros códigos. No agregues costos repetidos.
+Devuelve exactamente un desarrollo por cada código solicitado, sin modificar las actividades comerciales.
+"""+json.dumps(context,ensure_ascii=False,separators=(',',':'))
+    output=solicitar_json_editor(api_key,modelo_para_costos(model),prompt,DesarrolloLoteIA,progress)
+    expected={a.codigo_sugerido for a in activities}
+    received=[a.codigo for a in output.actividades]
+    if len(received)!=len(expected) or set(received)!=expected:
+        invalidar_ultima_respuesta_ia()
+        raise ValueError('El desarrollo técnico omitió o duplicó actividades.')
+    for entry in output.actividades:
+        if not entry.descripcion_desarrollada.strip() or not entry.componentes or not entry.procesos:
+            invalidar_ultima_respuesta_ia();raise ValueError('Desarrollo técnico incompleto: '+entry.codigo)
+        for component in entry.componentes:
+            if (not math.isfinite(component.cantidad_lote) or not component.concepto.strip()
+                or not component.unidad.strip() or not component.criterio.strip()
+                or component.origen not in {'SOLICITADO','SUPUESTO'}):
+                invalidar_ultima_respuesta_ia();raise ValueError('Componente técnico inválido: '+entry.codigo)
+    return {entry.codigo:entry.model_dump() for entry in output.actividades}
+
+
 def costear_lote_ahorro(activities, project, result, references, api_key, model, progress=None):
+    model=modelo_para_costos(model)
+    actualizar_progreso(progress,55,'Desarrollando materiales, herrajes y procesos: '+', '.join(a.codigo_sugerido for a in activities))
+    developments=desarrollar_lote_tecnico(activities,project,result,api_key,model,progress)
     codes={a.codigo_sugerido for a in activities}
     context={'ubicacion':project.get('location'),'nivel':project.get('budget_level'),'guia':project.get('guide_text',''),
              'reglas':result.consideraciones_generales,'alcance_general':result.alcance_resumido,
              'otras_actividades':[actividad_compacta(a) for a in result.actividades if a.codigo_sugerido not in codes],
              'actividades':[actividad_compacta(a) for a in activities],
              'referencias':{code:references.get(code.upper(),{}).get('internal') for code in codes}}
+    context.update(contexto_tecnico_proyecto(project,result))
+    context['desarrollos_tecnicos']=developments
+    actualizar_progreso(progress,65,'Costeando el desarrollo técnico: '+', '.join(sorted(codes)))
     prompt='''Construye análisis de costo DIRECTO del proveedor en MXN para cada actividad completa.
+Costea el desarrollo técnico recibido, no la descripción breve. Cada componente y proceso necesario
+ha de estar cubierto por un recurso o por una inclusión explicada; no omitas cubierta ni herrajes.
+Conserva los supuestos y pendientes en advertencias. No conviertas un supuesto en especificación confirmada.
+Esta llamada NO tiene búsqueda web: usa referencias aportadas o declara estimación sin verificar.
+Compara insumos equivalentes con las otras actividades; justifica diferencias de calidad o presentación.
 Devuelve exactamente un código por actividad solicitada. Los recursos deben cubrir TODA su cantidad
 comercial, NO una unidad. Python dividirá los consumos entre la cantidad al terminar.
 Somos una empresa que SUBCONTRATA todo. No confundas el precio del accesorio con suministrarlo e instalarlo.
@@ -9420,15 +9506,28 @@ Sin evidencia, los precios son estimaciones pendientes de cotización. No invent
     if len(received)!=len(codes) or set(received)!=codes:
         invalidar_ultima_respuesta_ia();raise ValueError('El lote omitió o duplicó códigos. Se conservaron los lotes anteriores; vuelve a intentar.')
     by_code={a.codigo_sugerido:a for a in activities}
-    return [convertir_costeo_lote(cost,by_code[cost.codigo]) for cost in output.actividades]
+    converted=[]
+    for cost in output.actividades:
+        entry=convertir_costeo_lote(cost,by_code[cost.codigo])
+        development=developments[cost.codigo]
+        entry.desarrollo_tecnico=development
+        entry.advertencias += ['Desarrollo técnico: '+development['descripcion_desarrollada'],
+            'Procesos: '+'; '.join(development['procesos'])]
+        entry.advertencias += ['Supuesto: '+v for v in development['supuestos']]
+        entry.advertencias += ['Dato pendiente: '+v for v in development['datos_pendientes']]
+        converted.append(entry)
+    return converted
 
 
 def obtener_costeos_ahorro(database,result,project,api_key,model,refs,force_codes,progress=None):
+    model=modelo_para_costos(model)
     obtained={};sources={};pending=[];keys={}
     for act in result.actividades:
         key='cost:'+huella_ia({'v':AI_ENGINE_VERSION,'model':model,'activity':actividad_compacta(act),
             'location':project.get('location'),'level':project.get('budget_level'),'guide':project.get('guide_text'),
-            'original':project.get('description'),'rules':result.consideraciones_generales,
+            'original':project.get('description'),'dimensions':project.get('dimensions_text'),
+            'project_type':project.get('project_type'),'reference':refs.get(act.codigo_sugerido.upper(),{}).get('internal'),
+            'rules':result.consideraciones_generales,
             'scope':[actividad_compacta(a) for a in result.actividades]})
         keys[act.codigo_sugerido]=key
         template=None if act.codigo_sugerido.upper() in force_codes else aplicar_plantilla_python(database,act,project)
