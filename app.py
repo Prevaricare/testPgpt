@@ -6359,7 +6359,6 @@ def crear_excel(
     agregar_hojas_costeo(wb, ordered_items, commercial_row_map, header_row + 1)
     actualizar_formacion_cliente(wb, ordered_items, params, project_data, commercial_row_map)
     consolidar_excel_interno(wb)
-    agregar_diagrama_secuencia(wb, ordered_items)
     out = BytesIO()
     wb.save(out)
     out.seek(0)
