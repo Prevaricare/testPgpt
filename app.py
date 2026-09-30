@@ -2407,8 +2407,7 @@ def configuracion_gemini_razonada(
 ):
     """Configura Gemini para presupuestación con razonamiento y búsqueda de mercado opcional."""
     if modo_ahorro():
-        thinking_level="high"
-        max_output_tokens=min(max_output_tokens,16384)
+        max_output_tokens=min(max_output_tokens,32768)
         ground_with_search=False
     kwargs = {
         "max_output_tokens": max_output_tokens,
@@ -2463,9 +2462,21 @@ def generar_con_gemini_resistente(client,model,contents,config,progress_callback
             actualizar_progreso(progress_callback,0,f'{etapa} · nuevo intento después de {math.ceil(delay)} s')
             esperar_con_progreso(delay, progress_callback, 'Esperando antes del siguiente intento')
             continue
+        candidates=getattr(response,'candidates',None) or []
+        reason=str(getattr(candidates[0],'finish_reason','')) if candidates else ''
+        if 'MAX_TOKENS' in reason:
+            registrar_uso_ia(etapa,model,'TRUNCADA',time.monotonic()-started,response)
+            raise RespuestaGeminiIncompleta('Gemini alcanzó el límite de salida (MAX_TOKENS).')
+        if reason and not any(v in reason for v in ('STOP','UNSPECIFIED','None')):
+            raise RuntimeError('Gemini no terminó normalmente: '+reason)
+        if not getattr(response,'text',None):
+            raise RespuestaGeminiIncompleta('Gemini devolvió una respuesta vacía.')
+        try:
+            if hasattr(schema,'model_validate_json'):schema.model_validate_json(response.text)
+        except ValueError as exc:
+            registrar_uso_ia(etapa,model,'JSON_INVALIDO',time.monotonic()-started,response)
+            raise RespuestaGeminiIncompleta('Respuesta JSON incompleta o incompatible: '+str(exc)[:180]) from exc
         registrar_uso_ia(etapa,model,'OK',time.monotonic()-started,response)
-        if not getattr(response,'text',None):raise GeminiPausa('Gemini devolvió una respuesta vacía. El avance terminado quedó guardado.')
-        if hasattr(schema,'model_validate_json'):schema.model_validate_json(response.text)
         cache_ia_guardar(key,{'text':response.text})
         usage=getattr(response,'usage_metadata',None)
         entrada=getattr(usage,'prompt_token_count',None)
@@ -3779,6 +3790,7 @@ def resolver_items(
     api_key: str | None = None,
     model_name: str | None = None,
     progress_callback=None,
+    costeos_preparados=None,
 ) -> list[dict]:
     """Resuelve actividades mediante costeo detallado + segunda auditoría.
 
@@ -3787,7 +3799,7 @@ def resolver_items(
     """
     if not api_key:
         api_key = get_api_key_runtime()
-    if not api_key and not modo_ahorro():
+    if not api_key and not modo_ahorro() and costeos_preparados is None:
         raise RuntimeError("Falta GEMINI_API_KEY para finalizar la valuación de precios.")
     model_name = model_name or "gemini-3.5-flash-lite"
 
@@ -3808,7 +3820,16 @@ def resolver_items(
         db, result, project_data, params, force_new_price_codes=force_new_price_codes
     )
 
-    if modo_ahorro():
+    if costeos_preparados is not None:
+        by_code={c.codigo:c for c in costeos_preparados}
+        if set(by_code)!=set(codes) or len(by_code)!=len(costeos_preparados):
+            raise ValueError('Los recursos no corresponden a todas las actividades.')
+        costings=[by_code[a.codigo_sugerido] for a in result.actividades]
+        audit=AuditoriaCosteoPresupuestoIA(actividades=[AuditoriaCosteoActividadIA(
+            codigo=c.codigo,recursos_corregidos=c.recursos,confianza=c.confianza,
+            requiere_cotizacion=True,hallazgos=validar_costeo_python(c)) for c in costings])
+        cost_sources={c.codigo:'GEMINI_UNICO_PYTHON' for c in costings}
+    elif modo_ahorro():
         costings,audit,cost_sources=obtener_costeos_ahorro(db,result,project_data,api_key,model_name,refs_by_code,force_new_price_codes,progress_callback)
     else:
         cost_sources={a.codigo_sugerido:'GEMINI_COSTEO_AUDITADO' for a in result.actividades}
@@ -8186,8 +8207,8 @@ def solicitar_json_editor(api_key: str, model_name: str, prompt: str, schema, pr
     for model in _modelos_gemini_disponibles(model_name):
         try:
             response = generar_con_gemini_resistente(client=client, model=model, contents=prompt,
-                config=configuracion_gemini_razonada(schema, thinking_level="high", max_output_tokens=32768),
-                progress_callback=progress_callback, etapa={"DesarrolloLoteIA":"Desarrollo técnico previo", "CosteoLotesIA":"Cálculo de recursos del proveedor"}.get(schema.__name__, "Revisión por etapas"))
+                config=configuracion_gemini_razonada(schema, thinking_level="medium" if schema.__name__=="PresupuestoCompletoIA" else "high", max_output_tokens=32768),
+                progress_callback=progress_callback, etapa={"PresupuestoCompletoIA":"Presupuesto completo", "DesarrolloLoteIA":"Desarrollo técnico previo", "CosteoLotesIA":"Cálculo de recursos del proveedor"}.get(schema.__name__, "Revisión por etapas"))
             return schema.model_validate_json(response.text)
         except Exception as exc:
             last_error = exc
@@ -9224,7 +9245,7 @@ def agregar_diagrama_secuencia(wb,items):
     wb.move_sheet(ws,offset=-1)
 
 
-AI_ENGINE_VERSION = 'proveedores-desarrollo-4'  # No reutilizar estimaciones anteriores sin esta revisión.
+AI_ENGINE_VERSION = 'presupuesto-unico-5'  # No reutilizar estimaciones anteriores sin esta revisión.
 
 class GeminiPausa(RuntimeError):
     """Gemini no completó la solicitud; el trabajo terminado permanece guardado."""
@@ -9444,6 +9465,173 @@ def item_con_plantilla_python(item,template,params):
     return recalcular_item_financiero(out,params)
 
 
+class RespuestaGeminiIncompleta(RuntimeError):
+    """Respuesta que no debe guardarse ni convertirse en un presupuesto parcial."""
+
+
+class RecursoBreveIA(BaseModel):
+    categoria: str
+    concepto: str
+    unidad: str
+    cantidad: float = Field(ge=0, description='Consumo TOTAL de la actividad, no por unidad comercial')
+    precio: float = Field(ge=0, description='MXN por unidad del recurso; costo directo sin márgenes ni IVA')
+    criterio: str = Field(description='Metrado o rendimiento breve; supuestos explícitos')
+
+
+class ActividadCompletaIA(BaseModel):
+    codigo: str
+    area: str
+    partida: str
+    titulo: str
+    descripcion: str
+    unidad: str
+    cantidad: float = Field(ge=0)
+    recursos: list[RecursoBreveIA]
+    supuestos: str
+    predecesoras: list[str] = Field(description='Códigos de trabajos que deben terminar antes; sin ciclos')
+    ejecucion: str = Field(description='Condición para iniciar y método breve; sin fechas ni días')
+
+
+class PresupuestoCompletoIA(BaseModel):
+    actividades: list[ActividadCompletaIA]
+    completo: bool = Field(description='True solo cuando TODO el alcance solicitado ya está cubierto')
+    pendientes: list[str] = Field(description='Datos técnicos faltantes, no actividades omitidas')
+
+
+def referencias_prompt_unico(db, project):
+    if db is None or not hasattr(db,'fetchall'):
+        return []
+    words=set(normalizar_texto(project.get('description','')).split())
+    rows=db.fetchall('''SELECT c.description, c.unit, ph.unit_cost, ph.source, ph.status,
+        ph.created_at FROM concepts c JOIN price_history ph ON ph.concept_id=c.id
+        ORDER BY ph.created_at DESC, ph.id DESC LIMIT 200''')
+    ranked=[]
+    for record in rows:
+        row=dict(record)
+        score=len(words & set(normalizar_texto(row.get('description','')).split()))
+        if score>=2:ranked.append((score,row))
+    return [row for _,row in sorted(ranked,key=lambda pair:pair[0],reverse=True)[:12]]
+
+
+def validar_actividad_completa(activity):
+    if not activity.codigo.strip() or not activity.descripcion.strip() or not activity.area.strip() or not activity.unidad.strip():
+        raise ValueError('Actividad sin código, alcance, área o unidad.')
+    if not math.isfinite(activity.cantidad) or activity.cantidad<=0:
+        raise ValueError('Cantidad comercial no positiva: '+activity.codigo)
+    if not activity.recursos:
+        raise ValueError('Actividad sin recursos: '+activity.codigo)
+    for r in activity.recursos:
+        if (not math.isfinite(r.cantidad) or not math.isfinite(r.precio) or r.cantidad<=0 or r.precio<=0
+            or not r.concepto.strip() or not r.unidad.strip()):
+            raise ValueError('Recurso sin consumo/precio positivo: '+activity.codigo)
+    if not math.isfinite(sum(r.cantidad*r.precio for r in activity.recursos)):
+        raise ValueError('Importe no finito: '+activity.codigo)
+
+
+def generar_presupuesto_unico(api_key, model_name, project, db=None, progress=None):
+    context={'proyecto':project,'referencias_historicas':referencias_prompt_unico(db,project)}
+    base='''Genera un presupuesto preliminar COMPLETO de subcontratación en MXN con el contexto recibido.
+Una actividad por entregable independiente; conserva todas las áreas, dimensiones, cantidades,
+acabados y exclusiones del texto original. No fusiones muebles diferentes ni omitas trabajos.
+Desarrolla y costea en esta misma respuesta materiales, piezas, herrajes, consumibles, fabricación,
+acabado, mano de obra de taller/obra, transporte e instalación que realmente correspondan.
+En recursos, cantidad significa consumo TOTAL para toda la actividad comercial. Python divide
+una sola vez y calcula los importes. No devuelvas sumas ni porcentajes: Python aplica los indirectos
+ y utilidad del proveedor; utilidad de nuestra empresa e IVA van después solo al Excel cliente.
+No confundas un accesorio con su instalación ni un precio de venta terminado con costo directo.
+Respeta solo instalación y conexiones existentes. No asumas acabados baratos donde se solicitan altos.
+Muestra despiece y rendimiento en criterios breves. No inventes especificaciones confirmadas:
+identifica supuestos y datos pendientes. Incluye jornadas mínimas razonables según el conjunto de
+trabajos; distribuye transporte y preparación entre actividades del mismo oficio sin duplicarlos.
+Referencias históricas son anclas solo si coinciden alcance, unidad, ubicación y calidad; no prueban
+vigencia. No hay búsqueda web en esta llamada: no inventes fuentes, URLs ni cotizaciones.
+Usa categorías MATERIAL, HERRAJE, MANO_OBRA, CONSUMIBLE, EQUIPO, TRANSPORTE, DESPERDICIO, OTROS.
+Recursos compactos pero suficientes para explicar el costo; agrupa solo insumos menores compatibles.
+Descripción comercial clara; despiece interno en recursos. Evita repetir textos y explicaciones largas.
+Códigos únicos simples A001, A002... Predecesoras según ejecución constructiva y trabajos paralelos.
+Si se integran fabricación y montaje, las dependencias protegen el montaje y ejecucion explica qué
+puede adelantarse. No fechas ni duraciones. Si el alcance no cabe devuelve un bloque válido con
+completo=false; nunca cortes el JSON ni declares completo un presupuesto que omite actividades.
+'''
+    checkpoint_key='single-blocks:'+huella_ia({'engine':AI_ENGINE_VERSION,'model':modelo_para_costos(model_name),'context':context})
+    saved=cache_ia_leer(checkpoint_key) or {}
+    collected=[ActividadCompletaIA.model_validate(a) for a in saved.get('actividades',[])]
+    pending=list(saved.get('pendientes',[]));limit=saved.get('limit');failures=0
+    if saved.get('completo'):
+        return PresupuestoCompletoIA(actividades=collected,completo=True,pendientes=pending)
+    for page in range(100):
+        request={'contexto':context,'ya_generadas':[{'codigo':a.codigo,'area':a.area,'descripcion':a.descripcion,
+                 'unidad':a.unidad,'cantidad':a.cantidad} for a in collected]}
+        instruction='Devuelve todo el presupuesto en una respuesta.' if limit is None else f'Devuelve como máximo {limit} actividades pendientes, sin repetir las ya generadas. Conserva contexto y alcance completo.'
+        prompt=base+'\n'+instruction+'\n'+json.dumps(request,ensure_ascii=False,separators=(',',':'))
+        try:
+            output=solicitar_json_editor(api_key,modelo_para_costos(model_name),prompt,PresupuestoCompletoIA,progress)
+            previous={a.codigo for a in collected}
+            if not output.actividades or len({a.codigo for a in output.actividades})!=len(output.actividades):
+                raise ValueError('Bloque vacío o códigos duplicados.')
+            for activity in output.actividades:
+                validar_actividad_completa(activity)
+                if activity.codigo in previous:raise ValueError('Actividad repetida en la continuación.')
+        except (RespuestaGeminiIncompleta, ValueError) as exc:
+            invalidar_ultima_respuesta_ia()
+            failures+=1
+            if failures>3:
+                raise GeminiPausa('La respuesta sigue siendo inválida incluso reducida. Los bloques válidos permanecen guardados. '+str(exc)) from exc
+            limit=6 if limit is None else max(1,limit//2)
+            actualizar_progreso(progress,20,f'Respuesta incompleta o inválida; reduciendo a {limit} actividades por respuesta. '+str(exc)[:180])
+            continue
+        failures=0
+        collected.extend(output.actividades);pending.extend(output.pendientes)
+        cache_ia_guardar(checkpoint_key,{'actividades':[a.model_dump() for a in collected],
+            'pendientes':pending,'limit':limit or 6,'completo':output.completo})
+        actualizar_progreso(progress,60,f'{len(collected)} actividades recibidas y validadas en Python.')
+        if output.completo:
+            return PresupuestoCompletoIA(actividades=collected,completo=True,pendientes=list(dict.fromkeys(pending)))
+        if limit is None:limit=6
+    raise GeminiPausa('Se alcanzó el límite de bloques. El presupuesto no está completo; se conserva el avance válido.')
+
+
+def convertir_presupuesto_unico(output, project, params, db, progress=None):
+    acts=[];costs=[]
+    for index,a in enumerate(output.actividades,1):
+        validar_actividad_completa(a)
+        code=limpiar_codigo(a.codigo,f'A{index:03d}')
+        acts.append(ActividadIA(area=a.area,partida=a.partida,subpartida=a.titulo,codigo_sugerido=code,
+            orden_ejecucion=min(index,999),titulo_comercial=a.titulo,concepto_base=a.titulo,
+            descripcion_tecnica=a.descripcion,unidad=normalizar_unidad(a.unidad),cantidad=a.cantidad,
+            costo_unitario_estimado=0,porcentaje_materiales=0,porcentaje_mano_obra=0,porcentaje_otros=0,
+            desperdicio_materiales_pct=0,criterio_cantidad='Cantidad del alcance; supuestos: '+a.supuestos,
+            fundamento_inclusion='Descripción del proyecto',nivel_confianza_cantidad='Media',
+            nivel_confianza_precio='Baja',requiere_cotizacion=True,consideraciones=a.supuestos))
+        resources=[RecursoCosteoIA(categoria=r.categoria,concepto=r.concepto,unidad=r.unidad,
+            cantidad=r.cantidad/a.cantidad,costo_unitario=r.precio,obligatorio=True,
+            criterio=f'Lote {a.cantidad:g} {a.unidad}; consumo total {r.cantidad:g}. '+r.criterio) for r in a.recursos]
+        warnings=['Estimación preliminar sin cotización verificada.']+([a.supuestos] if a.supuestos else [])
+        categories={r['categoria'] for r in normalizar_recursos_costeo(resources)[0]}
+        if 'MANO_OBRA' not in categories:warnings.append('Confirmar si es solo suministro o falta mano de obra.')
+        costs.append(CosteoActividadIA(codigo=code,recursos=resources,confianza='Baja',requiere_cotizacion=True,advertencias=warnings))
+    result=PresupuestoIA(nombre_proyecto=project.get('name',''),actividad_principal=project.get('project_type',''),
+        alcance_resumido='Presupuesto generado con contexto completo y cálculo de recursos en Python.',
+        consideraciones_generales=['Precios preliminares pendientes de confirmar con proveedores.'],
+        datos_faltantes=output.pendientes,actividades=acts)
+    items=resolver_items(db,result,project,params,progress_callback=progress,costeos_preparados=costs)
+    # Identidades estables antes de numerar el Excel; no se solicita otra llamada para la secuencia.
+    id_by_code={a.codigo:uuid.uuid4().hex for a in output.actividades}
+    for item,a in zip(items,output.actividades):
+        item.update(item_id=id_by_code[a.codigo],sequence_predecessors=[id_by_code.get(c,c) for c in a.predecesoras],
+            sequence_condition=a.ejecucion,sequence_method=a.ejecucion,sequence_verified=True,editor_ordered=False)
+    try:
+        levels=niveles_secuencia(items)
+        for item in items:item['execution_order']=(levels[item['item_id']]+1)*10
+    except ValueError as exc:
+        # No inventar dependencias para ocultar una secuencia inválida.
+        for item in items:
+            item.update(sequence_predecessors=[],sequence_verified=False)
+            item['costing_warnings'].append('Secuencia pendiente de revisar: '+str(exc))
+        actualizar_progreso(progress,90,'Costos calculados. La secuencia requiere revisión; el Excel lo indicará.')
+    return result,ordenar_items_comercialmente(items)
+
+
 def contexto_tecnico_proyecto(project, result):
     return {'descripcion_original':project.get('description',''),
             'ubicacion':project.get('location'), 'tipo':project.get('project_type'),
@@ -9483,7 +9671,7 @@ Devuelve exactamente un desarrollo por cada código solicitado, sin modificar la
         if not entry.descripcion_desarrollada.strip() or not entry.componentes or not entry.procesos:
             invalidar_ultima_respuesta_ia();raise ValueError('Desarrollo técnico incompleto: '+entry.codigo)
         for component in entry.componentes:
-            if (not math.isfinite(component.cantidad_lote) or not component.concepto.strip()
+            if (not math.isfinite(component.cantidad_lote) or component.cantidad_lote<=0 or not component.concepto.strip()
                 or not component.unidad.strip() or not component.criterio.strip()
                 or component.origen not in {'SOLICITADO','SUPUESTO'}):
                 invalidar_ultima_respuesta_ia();raise ValueError('Componente técnico inválido: '+entry.codigo)
@@ -9700,8 +9888,8 @@ with st.sidebar:
         with st.expander("Configuración"):
             model_name = st.text_input(
                 "Modelo Gemini",
-                value="gemini-3.5-flash-lite",
-                key="model_name_lite",
+                value="gemini-3.5-flash",
+                key="model_name_main",
             )
 
         st.divider()
@@ -10093,103 +10281,23 @@ if "generated" not in st.session_state:
             checkpoint_result = old_checkpoint.get("result")
             checkpoint_items = old_checkpoint.get("items")
 
-            # ETAPA 1 -------------------------------------------------------
-            if stage >= 1 and checkpoint_result:
-                result = PresupuestoIA.model_validate(checkpoint_result)
-                ui_progress(25, "1/6 · Recuperando estructura ya generada")
+            if stage >= 3 and checkpoint_items and checkpoint_result:
+                result=PresupuestoIA.model_validate(checkpoint_result)
+                items=checkpoint_items
+                ui_progress(90,'Recuperando presupuesto ya calculado')
             else:
-                ui_progress(3, "Validando datos y preparando el proyecto")
-                ui_progress(4, "1/6 · Interpretando áreas, necesidades y trabajos implícitos")
-                ui_progress(8, "1/6 · Convirtiendo el mapa de necesidades en partidas")
-                scope_map = analizar_documento_necesidades_ia(
-                    api_key=api_key,
-                    model_name=model_name,
-                    project_data=project_data,
-                    params=params,
-                    progress_callback=lambda _pct, msg: ui_progress(6, msg),
-                )
-                ui_progress(10,f"Mapa interpretado: {len(scope_map.areas)} áreas y {len(scope_map.paquetes)} paquetes de trabajo")
-                result = generar_presupuesto_ia(
-                    api_key=api_key,
-                    model_name=model_name,
-                    project_data=project_data,
-                    params=params,
-                    scope_map=scope_map,
-                    progress_callback=lambda _pct, msg: ui_progress(12, msg),
-                )
-                ui_progress(25,f"Estructura generada: {len(result.actividades)} actividades")
-                guardar_checkpoint_generacion(
-                    stage=1,
-                    status="completada",
-                    input_signature=input_signature,
-                    result=result,
-                    mensaje="Mapa de necesidades interpretado y estructura base generada.",
-                )
-                stage = 1
-
-            # ETAPA 2 -------------------------------------------------------
-            checkpoint = st.session_state.get("generation_checkpoint") or {}
-            if stage >= 2 and checkpoint.get("result"):
-                result = PresupuestoIA.model_validate(checkpoint["result"])
-                ui_progress(45, "2/6 · Recuperando auditoría de partidas")
-            else:
-                ui_progress(38, "2/6 · Revisando partidas, subpartidas y secuencia de obra")
-                result = auditar_estructura_presupuesto_ia(
-                    api_key=api_key,
-                    model_name=model_name,
-                    project_data=project_data,
-                    result=result,
-                    progress_callback=lambda _pct, msg: ui_progress(40, msg),
-                )
-                ui_progress(45,f"Estructura revisada: {len(result.actividades)} actividades")
-                guardar_checkpoint_generacion(
-                    stage=2,
-                    status="completada",
-                    input_signature=input_signature,
-                    result=result,
-                    mensaje="Partidas, subpartidas y secuencia auditadas.",
-                )
-                stage = 2
-
-            # ETAPA 3 -------------------------------------------------------
-            checkpoint = st.session_state.get("generation_checkpoint") or {}
-            checkpoint_items = checkpoint.get("items")
-            if stage >= 3 and checkpoint_items:
-                items = checkpoint_items
-                ui_progress(78, "3/6 · Recuperando costeo ya completado")
-            else:
-                ui_progress(52, "3/6 · Buscando precios históricos internos")
-                # Dejamos explícito que estamos trabajando en esta etapa antes de
-                # entrar a Gemini. Si la etapa 3 falla, las etapas 1 y 2 siguen
-                # guardadas y la siguiente corrida comenzará aquí.
-                guardar_checkpoint_generacion(
-                    stage=2,
-                    status="etapa_3_en_curso",
-                    input_signature=input_signature,
-                    result=result,
-                    mensaje="Consultando referencias y valuando precios.",
-                )
-                items = resolver_items(
-                    db, result, project_data, params,
-                    api_key=api_key,
-                    model_name=model_name,
-                    progress_callback=lambda pct, msg: ui_progress(max(52, min(pct, 92)), msg),
-                )
-                if not items:
-                    raise RuntimeError("La IA no generó actividades utilizables.")
-                ui_progress(90,f"Costeo terminado: {len(items)} actividades con importes calculados")
-                guardar_checkpoint_generacion(
-                    stage=3,
-                    status="completada",
-                    input_signature=input_signature,
-                    result=result,
-                    items=items,
-                    mensaje="Precios valuados y partidas convertidas en items.",
-                )
-                stage = 3
-
-            # Secuencia sin calendario: se incluye automáticamente en el Excel interno.
-            items = preparar_secuencia_automatica(items, project_data, api_key, model_name, ui_progress)
+                output_data=old_checkpoint.get('single_output')
+                if output_data:
+                    output=PresupuestoCompletoIA.model_validate(output_data)
+                else:
+                    ui_progress(5,'Generando presupuesto completo: alcance, recursos y secuencia en una llamada')
+                    output=generar_presupuesto_unico(api_key,model_name,project_data,db,ui_progress)
+                    st.session_state['generation_checkpoint']['single_output']=output.model_dump()
+                    guardar_checkpoint_generacion(stage=1,status='respuesta_completa',input_signature=input_signature,
+                        mensaje='Respuesta completa guardada; calculando en Python.')
+                result,items=convertir_presupuesto_unico(output,project_data,params,db,ui_progress)
+                guardar_checkpoint_generacion(stage=3,status='completada',input_signature=input_signature,
+                    result=result,items=items,mensaje='Recursos, importes y secuencia procesados en Python.')
 
             # ETAPA 4 -------------------------------------------------------
             ui_progress(93, "Calculando importes y preparando el Excel")
