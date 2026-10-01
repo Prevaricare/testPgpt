@@ -2259,7 +2259,7 @@ def error_gemini_transitorio(exc: Exception) -> bool:
 
 
 MAX_REINTENTOS_GEMINI = 50
-DELAY_REINTENTO_GEMINI_SEG = 30
+DELAY_REINTENTO_GEMINI_SEG = 20
 
 
 def configuracion_gemini_razonada(
@@ -2304,15 +2304,18 @@ def generar_con_gemini_resistente(
     """
     Ejecuta una etapa Gemini sin abandonarla por saturación temporal.
 
-    Política: hasta 50 intentos para errores transitorios, esperando 30 s entre
-    cada intento. Los errores de modelo inexistente (404/NOT_FOUND) se propagan
-    inmediatamente para que el nivel superior pruebe otro modelo.
-
-    Importante: un 429/503 NO cambia de modelo de inmediato. Se insiste con el
-    mismo modelo porque estos errores suelen ser temporales y cambiar de modelo
-    prematuramente puede provocar mas solicitudes y consumir cuota sin necesidad.
+    Ante un 503/UNAVAILABLE, alterna inmediatamente entre Flash 3.8 y 3.7.
+    Si también falla el respaldo, espera 20 s y vuelve al modelo preferido.
+    Los 429 y otros errores transitorios esperan sin cambiar de modelo.
+    El límite cuenta llamadas totales, incluidos los intentos de respaldo.
+    Los errores definitivos se propagan al llamador.
     """
     ultimo_error = None
+    modelo_preferido = model
+    modelo_respaldo = {
+        "gemini-3.8-flash": "gemini-3.7-flash",
+        "gemini-3.7-flash": "gemini-3.8-flash",
+    }.get(model)
 
     for intento in range(1, max_reintentos_transitorios + 1):
         try:
@@ -2361,11 +2364,31 @@ def generar_con_gemini_resistente(
             if intento >= max_reintentos_transitorios:
                 raise
             siguiente = intento + 1
+            # Un 503 es saturación del servicio; un 429 es cuota y no activa
+            # el cambio inmediato. Se conserva el mismo prompt y configuración
+            # (incluida Google Search) al cambiar entre estos dos modelos.
+            error_msg = str(exc).upper()
+            error_code = str(getattr(exc, "code", ""))
+            saturado = (
+                error_code == "503" or "503" in error_msg
+                or "UNAVAILABLE" in error_msg
+            ) and not (error_code == "429" or "429" in error_msg
+                       or "RESOURCE_EXHAUSTED" in error_msg)
+            if modelo_respaldo and saturado and model == modelo_preferido:
+                model = modelo_respaldo
+                actualizar_progreso(
+                    progress_callback, 0,
+                    f"{etapa} · servicio saturado; probando {model} inmediatamente "
+                    f"(intento {siguiente}/{max_reintentos_transitorios}).",
+                )
+                continue
+            if modelo_respaldo and saturado and model == modelo_respaldo:
+                model = modelo_preferido
             actualizar_progreso(
                 progress_callback,
                 0,
                 (
-                    f"{etapa} · Gemini no respondió correctamente. "
+                    f"{etapa} · Gemini no respondió correctamente. Próximo modelo: {model}. "
                     f"Esperando {DELAY_REINTENTO_GEMINI_SEG} s antes del intento "
                     f"{siguiente}/{max_reintentos_transitorios}..."
                 ),
