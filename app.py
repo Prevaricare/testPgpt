@@ -7,6 +7,9 @@ import sqlite3
 import unicodedata
 import uuid
 import zipfile
+import traceback
+from html import escape
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from io import BytesIO, StringIO
@@ -2213,6 +2216,28 @@ def actualizar_progreso(progress_callback, porcentaje: int, mensaje: str):
         pass
 
 
+def limpiar_log_generacion(value) -> str:
+    """Oculta la credencial de Gemini en mensajes y trazas visibles."""
+    text = str(value)
+    key = get_api_key_runtime()
+    if key:
+        text = text.replace(str(key), "[API_KEY_OCULTA]")
+    return re.sub(r"AIza[0-9A-Za-z_-]{20,}", "[API_KEY_OCULTA]", text)
+
+
+def mostrar_log_generacion(placeholder, entries):
+    # Fondo claro propio: el registro sigue legible también con el tema oscuro.
+    body = escape("\n".join(entries))
+    placeholder.markdown(
+        '<div role="log" aria-live="polite" style="background:#f8fafc;'
+        'color:#172033;border:1px solid #cbd5e1;border-radius:8px;'
+        'padding:16px;max-height:360px;overflow:auto;white-space:pre-wrap;'
+        'overflow-wrap:anywhere;font:13px/1.6 monospace;">'
+        + body + '</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def error_gemini_modelo_no_disponible(exc: Exception) -> bool:
     """Detecta errores que indican que el modelo solicitado no está disponible."""
     msg = str(exc).upper()
@@ -2296,16 +2321,41 @@ def generar_con_gemini_resistente(
                 0,
                 f"{etapa} · {model} · intento {intento}/{max_reintentos_transitorios}",
             )
-            response = client.models.generate_content(
-                model=model, contents=contents, config=config
-            )
+            started = time.monotonic()
+            if progress_callback is None:
+                response = client.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+            else:
+                # Solo la llamada HTTP trabaja en otro hilo. Streamlit y sus
+                # callbacks se ejecutan siempre en el hilo principal.
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    pending = executor.submit(
+                        client.models.generate_content,
+                        model=model, contents=contents, config=config,
+                    )
+                    while not wait([pending], timeout=5).done:
+                        elapsed = int(time.monotonic() - started)
+                        actualizar_progreso(
+                            progress_callback, 0,
+                            f"{etapa} · {model} · esperando respuesta de Gemini ({elapsed} s).",
+                        )
+                    response = pending.result()
             if not getattr(response, "text", None):
                 raise RuntimeError(
                     f"Gemini ({model}) devolvió una respuesta vacía."
                 )
+            actualizar_progreso(
+                progress_callback, 0,
+                f"{etapa} · {model} · respuesta recibida en {time.monotonic() - started:.1f} s; validando datos.",
+            )
             return response
         except Exception as exc:
             ultimo_error = exc
+            actualizar_progreso(
+                progress_callback, 0,
+                f"ERROR Gemini · {etapa} · {model} · {type(exc).__name__}: {exc}",
+            )
             if error_gemini_modelo_no_disponible(exc) or not error_gemini_transitorio(exc):
                 raise
             if intento >= max_reintentos_transitorios:
@@ -2320,7 +2370,15 @@ def generar_con_gemini_resistente(
                     f"{siguiente}/{max_reintentos_transitorios}..."
                 ),
             )
-            time.sleep(DELAY_REINTENTO_GEMINI_SEG)
+            deadline = time.monotonic() + DELAY_REINTENTO_GEMINI_SEG
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                time.sleep(min(5, remaining))
+                remaining = max(0, int(deadline - time.monotonic() + 0.999))
+                actualizar_progreso(
+                    progress_callback, 0,
+                    f"{etapa} · reintento {siguiente}/{max_reintentos_transitorios} en {remaining} s.",
+                )
 
     raise ultimo_error if ultimo_error else RuntimeError("Error desconocido de Gemini.")
 
@@ -7680,36 +7738,24 @@ if "generated" not in st.session_state:
             st.stop()
 
         st.session_state["generation_in_progress"] = True
-        overlay = st.empty()
-        overlay.markdown(
-            """
-            <style>
-            div[data-testid="stAppViewContainer"]::before {
-                content: "Generando presupuesto...";
-                position: fixed;
-                inset: 0;
-                background: rgba(255,255,255,0.78);
-                z-index: 999999;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 1.15rem;
-                font-weight: 600;
-                color: #222;
-                pointer-events: all;
-                cursor: wait;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
+        st.subheader("Generación del presupuesto")
+        st.caption("El registro se actualiza en cada etapa y cada 5 segundos mientras Gemini responde.")
         progress_bar = st.progress(0)
         progress_text = st.empty()
+        log_placeholder = st.empty()
+        st.session_state["generation_log"] = []
+        st.session_state.pop("generation_error_trace", None)
+        progress_state = {"pct": 0}
 
         def ui_progress(pct: int, message: str):
-            # La UI principal conserva solo una barra: la información de estado va debajo.
-            progress_bar.progress(max(0, min(int(pct), 100)))
-            progress_text.markdown(f"**{pct}%** · {message}")
+            # El porcentaje representa etapas completadas; no retrocede al esperar.
+            progress_state["pct"] = max(progress_state["pct"], max(0, min(int(pct), 100)))
+            message = limpiar_log_generacion(message)
+            entries = st.session_state["generation_log"]
+            entries.append(f"[{datetime.now():%H:%M:%S}] {message}")
+            progress_bar.progress(progress_state["pct"])
+            progress_text.text(f"{progress_state['pct']}% · {message}")
+            mostrar_log_generacion(log_placeholder, entries)
 
         try:
             input_signature = firma_generacion(project_data, params, model_name)
@@ -7735,7 +7781,6 @@ if "generated" not in st.session_state:
             else:
                 ui_progress(3, "Validando datos y preparando el proyecto")
                 ui_progress(4, "1/6 · Interpretando áreas, necesidades y trabajos implícitos")
-                ui_progress(8, "1/6 · Convirtiendo el mapa de necesidades en partidas")
                 scope_map = analizar_documento_necesidades_ia(
                     api_key=api_key,
                     model_name=model_name,
@@ -7743,6 +7788,7 @@ if "generated" not in st.session_state:
                     params=params,
                     progress_callback=lambda _pct, msg: ui_progress(6, msg),
                 )
+                ui_progress(8, "1/6 · Mapa de necesidades listo; convirtiéndolo en partidas")
                 result = generar_presupuesto_ia(
                     api_key=api_key,
                     model_name=model_name,
@@ -7853,10 +7899,10 @@ if "generated" not in st.session_state:
         except Exception as exc:
             st.session_state["generation_in_progress"] = False
             checkpoint = st.session_state.get("generation_checkpoint") or {}
-            st.session_state["generation_last_error"] = str(exc)
-            overlay.empty()
-            progress_text.empty()
-            progress_bar.empty()
+            st.session_state["generation_last_error"] = limpiar_log_generacion(exc)
+            st.session_state["generation_error_trace"] = limpiar_log_generacion(traceback.format_exc())
+            ui_progress(progress_state["pct"], f"ERROR del programa · {type(exc).__name__}: {exc}")
+            st.text(st.session_state["generation_error_trace"])
             stage = int(checkpoint.get("stage") or 0)
             if error_gemini_transitorio(exc):
                 st.error(
@@ -7867,8 +7913,10 @@ if "generated" not in st.session_state:
             else:
                 st.error(
                     "No fue posible completar la generación. "
-                    f"Se conservó el avance hasta la etapa {stage}/4. Detalle: {exc}"
+                    f"Se conservó el avance hasta la etapa {stage}/4. Detalle: {limpiar_log_generacion(exc)}"
                 )
+        finally:
+            st.session_state["generation_in_progress"] = False
 
 
 # =========================================================
@@ -7883,6 +7931,15 @@ else:
     financials = g["financials"]
     version = int(g.get("version") or 1)
     saved = bool(g.get("saved"))
+
+    if st.session_state.get("generation_log"):
+        with st.expander("Registro de generación", expanded=False):
+            mostrar_log_generacion(st.empty(), st.session_state["generation_log"])
+            st.download_button(
+                "Descargar registro", data="\n".join(st.session_state["generation_log"]),
+                file_name="registro_generacion.txt", mime="text/plain",
+                key="download_generation_log",
+            )
 
     st.subheader(g["project_code"])
     if saved:
