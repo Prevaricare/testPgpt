@@ -21,6 +21,7 @@ import streamlit as st
 from google import genai
 from google.genai import types
 from openpyxl import Workbook, load_workbook
+from openpyxl.comments import Comment
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -2125,6 +2126,105 @@ class CosteoPresupuestoIA(BaseModel):
     actividades: list[CosteoActividadIA]
 
 
+class PrecioCompactoIA(BaseModel):
+    codigo: str
+    costo_unitario: float = Field(gt=0, description="MXN sin IVA por unidad comercial; solo para conceptos simples")
+    confianza: str
+    requiere_cotizacion: bool
+    fundamento: str = Field(description="Base del precio y supuestos; breve")
+    fuentes: list[str] = Field(default_factory=list, description="URLs de referencias consultadas; nunca inventarlas")
+    recursos: list[RecursoCosteoIA] = Field(default_factory=list, description="Solo conceptos complejos; cantidades por UNA unidad comercial")
+
+
+class PreciosCompactosIA(BaseModel):
+    precios: list[PrecioCompactoIA]
+
+
+def actividad_precio_complejo(actividad) -> bool:
+    texto = normalizar_texto(" ".join(str(getattr(actividad, field, '') or '')
+                                     for field in ('partida', 'subpartida', 'titulo_comercial', 'descripcion_tecnica')))
+    return any(word in texto for word in (
+        'carpinter', 'mueble', 'closet', 'vestidor', 'repisa', 'canceler',
+        'herreria', 'estructura', 'a medida', 'especial'))
+
+
+def buscar_precio_validado_exacto(db, actividad):
+    """Reutiliza solo costos positivos, recientes, con unidad/alcance idénticos."""
+    for row in db.price_candidates(actividad.unidad):
+        if (str(row.get('status') or '').upper() not in
+                {'VALIDADO', 'COSTO_REAL', 'COTIZADO_PROVEEDOR'}):
+            continue
+        if normalizar_unidad(row.get('unit')) != normalizar_unidad(actividad.unidad):
+            continue
+        if normalizar_texto(row.get('description')) != normalizar_texto(actividad.descripcion_tecnica):
+            continue
+        try:
+            recorded = datetime.fromisoformat(str(row.get('created_at') or '').replace('Z', '+00:00'))
+            if recorded.tzinfo is None:
+                recorded = recorded.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - recorded).days
+            cost = float(row['unit_cost'])
+            if not 0 <= age <= 180 or not 0 < cost < float('inf'):
+                continue
+        except (ValueError, TypeError, KeyError):
+            continue
+        return row
+    return None
+
+
+def revisar_precios_compactos_ia(api_key, model_name, project_data, packets,
+                                progress_callback=None):
+    """Revisa hasta cinco conceptos sin repetir el documento original ni auditar todo."""
+    prompt = f"""
+Fija costos unitarios de SUBCONTRATACIÓN para estos conceptos de remodelación.
+Mercado: {project_data.get('location') or 'CDMX'}, México, {datetime.now().year}.
+Nivel: {project_data.get('budget_level', 'Medio-alto')}.
+Costos en MXN sin IVA, indirectos ni utilidad de nuestra empresa.
+Devuelve exactamente un precio por código. No cambies unidades ni cantidades.
+Respeta especificaciones e inclusiones. El costo inicial y referencias IA no son evidencia.
+Usa Google Search para referencias actuales de proveedores; indica URLs reales.
+Comprueba unidad de compra, presentación, IVA, fecha, suministro e instalación.
+No uses precio de material como costo de servicio instalado. Si no puedes verificarlo,
+marca cotización y confianza baja, explica supuestos, sin inventar fuentes.
+Para desglose_requerido=true devuelve recursos esenciales (materiales, herrajes,
+mano de obra, consumibles y logística cuando apliquen) POR UNA unidad comercial.
+Python sumará cantidad por costo de recursos; evita doble conteo de desperdicio.
+Para conceptos simples basta el costo integrado y su fundamento, recursos=[].
+No inventes geometría como dato confirmado: declara las hipótesis y pide cotización.
+Responde compacto, sin razonamiento extenso.
+CONCEPTOS
+{json.dumps(packets, ensure_ascii=False, separators=(',', ':'))}
+"""
+    client = genai.Client(api_key=api_key)
+    for model in _modelos_gemini_disponibles(model_name):
+        try:
+            response = generar_con_gemini_resistente(
+                client, model, prompt,
+                configuracion_gemini_razonada(PreciosCompactosIA, thinking_level="low",
+                                              max_output_tokens=12288, ground_with_search=True),
+                progress_callback=progress_callback, etapa="2/3 · Revisando precios de mercado",
+            )
+            result = PreciosCompactosIA.model_validate_json(response.text)
+            expected = {p['codigo'].upper() for p in packets}
+            received = [p.codigo.strip().upper() for p in result.precios]
+            if len(received) != len(set(received)) or set(received) != expected:
+                raise RuntimeError("La revisión de precios devolvió códigos omitidos, duplicados o desconocidos.")
+            # Guarda también las fuentes efectivamente devueltas por Google Search.
+            grounded = set()
+            for candidate in getattr(response, 'candidates', None) or []:
+                metadata = getattr(candidate, 'grounding_metadata', None)
+                for chunk in getattr(metadata, 'grounding_chunks', None) or []:
+                    web = getattr(chunk, 'web', None)
+                    uri = getattr(web, 'uri', None)
+                    if uri:
+                        grounded.add(uri)
+            return result, sorted(grounded)
+        except Exception as exc:
+            if not error_gemini_modelo_no_disponible(exc):
+                raise
+    raise RuntimeError("Ningún modelo configurado está disponible para revisar precios.")
+
+
 class AuditoriaCosteoActividadIA(BaseModel):
     codigo: str = Field(description="Código exacto de la actividad auditada")
     recursos_corregidos: list[RecursoCosteoIA] = Field(description="Hoja de costeo corregida; sustituye completamente la anterior")
@@ -2258,7 +2358,7 @@ def error_gemini_transitorio(exc: Exception) -> bool:
     ))
 
 
-MAX_REINTENTOS_GEMINI = 50
+MAX_REINTENTOS_GEMINI = 6
 DELAY_REINTENTO_GEMINI_SEG = 20
 
 
@@ -2406,539 +2506,65 @@ def generar_con_gemini_resistente(
     raise ultimo_error if ultimo_error else RuntimeError("Error desconocido de Gemini.")
 
 
-def analizar_documento_necesidades_ia(
-    api_key: str,
-    model_name: str,
-    project_data: dict,
-    params: dict,
-    progress_callback=None,
-) -> MapaAlcanceIA:
-    """Primera pasada: convierte un briefing narrativo en un mapa estructurado de alcance.
 
-    Esta pasada no fija precios ni genera el presupuesto final. Su función es evitar que
-    necesidades como "ocultar el área de lavado" o "integrar una estación de café" se pierdan
-    al convertir un documento de interiorismo en actividades contratables.
-    """
+
+def generar_presupuesto_ia(api_key, model_name, project_data, params,
+                          progress_callback=None) -> PresupuestoIA:
+    """Una sola lectura del alcance; las referencias de precios se revisan después."""
     client = genai.Client(api_key=api_key)
-    year = datetime.now().year
-    budget_level = project_data.get("budget_level", "Medio-alto")
-
     prompt = f"""
-Actúa como ANALISTA SENIOR DE ALCANCE para una empresa de remodelación e interiorismo en Ciudad de México.
-Vas a recibir un documento narrativo de necesidades, no un catálogo de conceptos. Tu trabajo es convertirlo
-en un MAPA ESTRUCTURADO DE LO QUE REALMENTE DEBERÁ RESOLVERSE antes de generar las partidas y precios.
+Eres presupuestista de remodelación e interiorismo en México. La empresa subcontrata.
+Genera conceptos comerciales claros a partir del alcance, no una fila por recurso.
+Ubicación: {project_data.get('location') or 'CDMX'}. Año: {datetime.now().year}.
+Cliente: {project_data['name']}. Tipo: {project_data['project_type']}.
+Nivel: {project_data.get('budget_level', 'Medio-alto')}.
+{criterio_nivel_presupuesto(project_data.get('budget_level', 'Medio-alto'))}
 
-NO GENERES PRECIOS. NO GENERES EL EXCEL. NO ELIMINES NECESIDADES PORQUE PAREZCAN "DE DISEÑO".
-
-PRINCIPIOS
-1. Lee el documento completo primero y vuelve a revisarlo buscando dependencias y trabajos implícitos.
-2. Distingue entre: necesidad del cliente, restricción, solución probable y trabajo realmente presupuestable.
-3. Una necesidad puede requerir varias disciplinas. Ejemplo: "ocultar e integrar el área de lavado"
-   puede implicar carpintería/mobiliario, herrajes, preparación y eventualmente ajustes eléctricos;
-   no la reduzcas a una sola palabra.
-4. "Evaluar", "revisar" o "considerar" no significa automáticamente ejecutar. Marca como trabajo probable
-   solo aquello que razonablemente deba contemplarse para resolver el objetivo; deja la incertidumbre en nivel_certeza.
-5. No agregues trabajos decorativos no respaldados por el documento.
-6. Conserva las áreas explícitas y sus m². Si una necesidad afecta una zona concreta, asígnala a esa zona.
-7. Detecta entregables independientes aunque estén dentro de la misma habitación.
-8. Para muebles o elementos a medida, identifica su función, componentes previsibles y dependencias; no los
-   conviertas todavía en precios.
-9. Identifica faltantes de información que podrían cambiar materialmente el metrado, pero no bloquees el análisis.
-10. Devuelve un mapa que sirva como contexto para otra IA que posteriormente generará partidas comerciales.
-
-TIPO DE PROYECTO: {project_data['project_type']}
-UBICACIÓN: {project_data['location'] or 'No indicada'}
-NIVEL: {budget_level}
-AÑO: {year}
-
-DOCUMENTO ORIGINAL
+ALCANCE ORIGINAL
 {project_data['description']}
+CONDICIONES
+{project_data.get('guide_text') or 'Sin condiciones adicionales.'}
 
-GUÍA ADICIONAL
-{project_data['guide_text'] or 'Sin instrucciones adicionales.'}
-
-PARÁMETROS ECONÓMICOS: NO LOS USES PARA FIJAR PRECIOS EN ESTA ETAPA.
+REGLAS
+1. Incluye trabajos pedidos y complementarios indispensables; señala lo inferido.
+   No agregues decoración, trámites ni trabajos opcionales sin justificación.
+2. Separa áreas y muebles distintos. Conserva materiales, dimensiones, acabados,
+   herrajes, accesos y condiciones importantes dentro de cada descripción:
+   la revisión de precios recibirá únicamente esos conceptos, no este documento.
+3. Usa partidas por fase de obra, subpartidas breves y códigos únicos.
+   Protecciones antes de demoliciones; limpieza final al cierre. Evita duplicados.
+4. Cantidades justificadas: M2, ML, M3, PZA, PTO, JGO o LOTE. No inventes medidas.
+   Si falta información, declara el supuesto y marca confianza baja/cotización.
+5. Estima costo UNITARIO integrado de subcontratación en MXN sin IVA, indirectos
+   ni utilidad de nuestra empresa. Incluye suministro/instalación solo si aplican.
+   No confundas precio de material con servicio instalado o costo por unidad con total.
+6. El nivel afecta especificaciones; no multipliques arbitrariamente los precios.
+   Porcentajes de materiales/mano de obra/otros son informativos y suman 100.
+   El desperdicio ya está incluido y no se suma otra vez.
+7. Criterios y advertencias breves. Devuelve solo el objeto estructurado.
 """
-
-    last_error = None
     for model in _modelos_gemini_disponibles(model_name):
         try:
             response = generar_con_gemini_resistente(
-                client=client, model=model, contents=prompt,
-                config=configuracion_gemini_razonada(
-                    MapaAlcanceIA, thinking_level="high", max_output_tokens=24576
-                ),
-                progress_callback=progress_callback,
-                etapa="0/4 · Interpretando necesidades y alcance",
+                client, model, prompt,
+                configuracion_gemini_razonada(PresupuestoIA, thinking_level="low",
+                                              max_output_tokens=16384),
+                progress_callback=progress_callback, etapa="1/3 · Generando partidas",
             )
-            return MapaAlcanceIA.model_validate_json(response.text)
+            result = PresupuestoIA.model_validate_json(response.text)
+            if not result.actividades:
+                raise RuntimeError("Gemini devolvió un presupuesto sin actividades.")
+            codes = [a.codigo_sugerido.strip().upper() for a in result.actividades]
+            if len(codes) != len(set(codes)) or not all(codes):
+                raise RuntimeError("Gemini devolvió códigos vacíos o duplicados.")
+            return result
         except Exception as exc:
-            last_error = exc
             if not error_gemini_modelo_no_disponible(exc):
                 raise
-    raise RuntimeError(f"No fue posible interpretar el documento de necesidades: {last_error}")
-
-
-def generar_presupuesto_ia(
-    api_key: str,
-    model_name: str,
-    project_data: dict,
-    params: dict,
-    progress_callback=None,
-    scope_map: MapaAlcanceIA | None = None,
-) -> PresupuestoIA:
-    client = genai.Client(api_key=api_key)
-    year = datetime.now().year
-    budget_level = project_data.get("budget_level", "Medio-alto")
-    level_criterion = criterio_nivel_presupuesto(budget_level)
-
-    scope_map_text = json.dumps(scope_map.model_dump() if scope_map else {}, ensure_ascii=False, separators=(",", ":"))
-
-    prompt = f"""
-Actúa como un INGENIERO DE COSTOS SENIOR y EDITOR DE PRESUPUESTOS COMERCIALES de una
-empresa de remodelación e interiorismo de alto nivel en Ciudad de México. La empresa
-SUBCONTRATA prácticamente todas las actividades.
-
-ESTILO COMERCIAL DE LA EMPRESA — OBLIGATORIO
-El presupuesto final debe parecer escrito por un presupuestista humano con experiencia,
-no por una IA que simplemente reescribe el briefing. Usa esta estructura mental:
-
-PARTIDA
-  Área
-    Actividad puntual con acción + elemento + medida/especificación + alcance incluido.
-
-Ejemplos de referencia del estilo de la empresa:
-- "Desmontaje y retiro de mueble de almacenamiento antiguo de piso a techo de 6.75m2."
-- "Instalación de 1 pto eléctrico para extractor de aire junto a ventana, incluye ranurado, cableado y adaptaciones/resanes menores en muro."
-- "Aplicación de pintura lavable en muros de 18m2."
-- "Fabricación e instalación de banca de entrada para calzado de 0.60ml."
-- "Fabricación e instalación de mueble para TV y escritorio de 3.58ml, con gabinetes inferiores y repisas de madera."
-- "Suministro e instalación de espejo de 0.78m2 (1.30 x 0.60m)."
-- "Suministro de 1 sofá en L de 5.5ml, con tapiz textil color beige/gris, diseño modular divisible en 3 sillones."
-
-REGLAS DERIVADAS DEL ESTILO
-1. No conviertas el presupuesto en una lista plana. Conserva la estructura PARTIDA → ÁREA → ACTIVIDADES.
-2. Una actividad = un alcance comercial que un proveedor pueda entender y cotizar.
-3. En la misma área, separa muebles o suministros que sean físicamente distintos.
-4. Junta solamente tareas homogéneas que naturalmente se cotizan como un mismo servicio y comparten preparación,
-   ejecución y acabado; por ejemplo, pintura de muros de una misma área puede ir junta.
-5. Empieza las descripciones con verbos comerciales claros: "Fabricación e instalación", "Suministro e instalación",
-   "Suministro", "Aplicación", "Instalación", "Desmontaje y retiro".
-6. Conserva medidas, cantidades, colores, materiales, acabados, ubicación, diseño y referencias a showroom/muestras
-   cuando el usuario las haya dado. No sustituyas una especificación por una genérica.
-7. La descripción debe ser suficientemente completa para cotización, pero NO debe convertirse en un APU ni enumerar
-   tableros, tornillos, horas de mano de obra o herramientas; esos elementos son internos.
-8. Para un mueble a medida, identifica externamente su función y forma de contratación; el desglose físico de materiales,
-   herrajes, mano de obra, transporte y consumibles se hace después en la hoja interna de costeo.
-9. No agregues partidas de proyecto, ingeniería, permisos o trabajos constructivos solo por rutina. Inclúyelos únicamente
-   cuando el alcance realmente los justifique.
-10. Las "Consideraciones generales" son instrucciones transversales: conviértelas en actividades solo cuando representen
-    un costo real que deba presupuestarse (por ejemplo protección general o limpieza final); no conviertas cada frase
-    de coordinación en un concepto.
-11. No expongas cadenas de pensamiento. El razonamiento debe ocurrir internamente y la salida debe ser estructurada.
-
-
-CONFIGURACIÓN FIJA DE LA EMPRESA
-- Referencia de mercado: Ciudad de México, {year}.
-- Nivel comercial seleccionado: {budget_level}.
-- Criterio del nivel: {level_criterion}
-- El nivel afecta especificaciones, calidad y solución constructiva; NO apliques
-  un multiplicador arbitrario a todos los precios.
-- Cuando el alcance lo haga razonablemente necesario, contempla proyecto
-  ejecutivo, ingenierías, licencias, permisos o trámites aplicables.
-- Después de esta etapa Python buscará referencias históricas internas. Las referencias
-  internas validadas se usarán como anclas de máxima prioridad y se entregarán a una segunda
-  etapa de Gemini para la valuación final.
-- Los conceptos deben poder presentarse al cliente y servir para solicitar
-  cotizaciones a subcontratistas.
-
-DATOS DEL PROYECTO
-Cliente: {project_data['name']}
-Ubicación: {project_data['location'] or 'No indicada'}
-Tipo de obra: {project_data['project_type']}
-Nivel de presupuesto: {budget_level}
-
-DESCRIPCIÓN GENERAL DE LOS TRABAJOS
-{project_data['description']}
-
-CONSIDERACIONES GENERALES DEL PROYECTO
-{project_data['guide_text'] or 'Sin consideraciones adicionales.'}
-
-MAPA ESTRUCTURADO DE NECESIDADES — PRIMERA PASADA DE IA
-{scope_map_text}
-
-Usa este mapa como capa intermedia de interpretación. No lo copies ciegamente: contrástalo con el
-documento original y corrige cualquier interpretación incorrecta. Es obligatorio preservar las necesidades
-explícitas del documento y convertir los paquetes pertinentes en actividades contratables.
-
-PARÁMETROS COMERCIALES
-Indirectos: {params['indirect_pct']:.2f}%
-Utilidad: {params['profit_pct']:.2f}%
-IVA: {params['iva_pct']:.2f}%
-Desperdicio general de referencia: {params['waste_pct']:.2f}%
-
-REVISIÓN DEL ALCANCE
-1. Antes de generar conceptos, revisa el proyecto completo y detecta:
-   a) trabajos solicitados explícitamente;
-   b) trabajos previos indispensables;
-   c) trabajos complementarios necesarios para entregar correctamente lo pedido;
-   d) proyecto, ingenierías, licencias o permisos previsibles por el tipo de obra.
-2. DESGLOSA LOS TRABAJOS POR ÁREA Y POR ALCANCE CONTRATABLE. No conviertas el
-   presupuesto en un APU ni generes una fila por material, herramienta o cuadrilla,
-   pero tampoco combines trabajos de espacios distintos solamente porque sean del
-   mismo oficio. Cada actividad debe pertenecer a UNA sola área física específica.
-
-   REGLA OBLIGATORIA DE ÁREAS:
-   - Si existe Cocina, Baño 1, Baño 2 y Baño 3, la albañilería de cada espacio debe
-     aparecer como actividades independientes, aunque técnicamente sea el mismo oficio.
-   - Aplica el mismo criterio a pintura, instalaciones, acabados, demolición, cancelería,
-     carpintería y cualquier otro trabajo cuando el alcance corresponda a áreas distintas.
-   - Usa area="General" únicamente para trabajos que realmente abarcan el proyecto
-     completo o no pertenecen a un espacio particular, por ejemplo protección general,
-     acarreos generales, limpieza final o trámites globales.
-   - No repartas porcentualmente una sola actividad entre varias áreas. Si un trabajo se
-     ejecuta en varias áreas identificables, crea una actividad independiente por área.
-   - Dentro de una misma área puedes mantener integrado un alcance que naturalmente se
-     cotice como un solo servicio, siempre que siga siendo claro qué se está contratando.
-
-   REGLA ADICIONAL — CARPINTERÍA Y MOBILIARIO:
-   Los muebles, módulos o elementos de carpintería DISTINTOS no deben agruparse
-   dentro de una sola actividad únicamente por pertenecer al mismo espacio o al
-   mismo proveedor. Cada tipo, modelo, diseño, función, especificación o dimensión
-   materialmente distinta debe convertirse en una actividad independiente con su
-   propio costo unitario.
-
-   - Si existen varias unidades IDÉNTICAS, pueden mantenerse en una sola actividad
-     usando cantidad mayor a 1.
-   - Si existen unidades diferentes, deben separarse aunque estén en la misma área.
-   - No uses LOTE para mezclar muebles distintos cuando el usuario permita
-     identificar cada mueble o tipo de mueble.
-   - Para mobiliario individual usa preferentemente PZA cuando sea coherente con
-     la forma de cotización.
-   - titulo_comercial y subpartida deben permitir reconocer qué mueble se está
-     cobrando sin tener que leer toda la descripcion_tecnica.
-
-   Ejemplo conceptual: si el alcance indica dos muebles de un tipo y uno de otro
-   tipo, genera dos actividades: una con cantidad 2 para el primer tipo y otra
-   con cantidad 1 para el segundo. No combines ambos tipos en una sola actividad.
-
-3. Convierte cada paquete de alcance relevante del mapa en una o varias actividades contratables.
-   Si un paquete contiene entregables físicamente distintos, SEPÁRALOS. Ejemplo: una estación de café,
-   un cerramiento para ocultar lavado y un copete para refrigerador son tres elementos diferentes aunque estén
-   en la misma zona.
-4. No omitas un trabajo indispensable solo porque no fue escrito literalmente. Si la inclusión es inferida,
-   indícalo brevemente en fundamento_inclusion o consideraciones.
-5. No agregues trabajos opcionales o decorativos ajenos al alcance.
-6. Para instrucciones verbales como "evaluar", "revisar" o "considerar", distingue entre inspección/diagnóstico,
-   suministro e instalación. No cotices una ejecución definitiva si el documento solo pide evaluar, salvo que
-   exista suficiente contexto para inferir que la corrección es parte del alcance.
-
-PARTIDAS Y SUBPARTIDAS
-4.1. ESTILO DE REDACCIÓN: cada actividad debe poder copiarse directamente a un presupuesto humano.
-     Estructura preferida: VERBO/ACCIÓN + ELEMENTO + MEDIDA + ESPECIFICACIÓN + INCLUYE.
-     Ejemplos: "Desmontaje y retiro de mueble de almacenamiento antiguo de piso a techo de 6.75m2.";
-     "Fabricación e instalación de mueble tipo coffee station de 1.00ml.";
-     "Aplicación de pintura lavable en muros de 18m2.";
-     "Suministro e instalación de espejo de 0.78m2 (1.30 x 0.60m)."
-     No copies literalmente los ejemplos salvo que correspondan al proyecto; úsalos como patrón.
-
-4.2. AGRUPACIÓN: no mezcles en una sola actividad muebles, suministros o trabajos físicamente distintos.
-     Sí agrupa tareas homogéneas de un mismo servicio y área cuando el proveedor las cotizaría juntas.
-
-4.3. MUEBLES: usa "Fabricación e instalación de..." para carpintería hecha a medida; "Suministro..." para piezas
-     compradas; "Suministro e instalación..." cuando ambas cosas formen parte del alcance.
-
-5. Usa preferentemente, cuando correspondan:
-   - PROYECTO Y TRÁMITES
-   - PRELIMINARES Y PROTECCIONES
-   - DESMONTAJES Y DEMOLICIONES
-   - ALBAÑILERÍA Y ESTRUCTURA
-   - INSTALACIONES ELÉCTRICAS
-   - INSTALACIONES HIDROSANITARIAS
-   - ACABADOS Y RECUBRIMIENTOS
-   - CARPINTERÍA
-   - CANCELERÍA Y HERRERÍA
-   - EXTERIORES Y AMENIDADES
-   - LIMPIEZA Y ENTREGA
-   Puedes crear otras partidas si el proyecto realmente lo requiere.
-   Clasifica cada actividad por la NATURALEZA PRINCIPAL del trabajo y por el
-   elemento o sistema que realmente se entrega. No uses palabras secundarias,
-   propiedades del material o adjetivos técnicos para decidir la partida.
-   PRELIMINARES Y PROTECCIONES se usa únicamente cuando el propósito principal
-   sea preparar o proteger TEMPORALMENTE la obra.
-   LIMPIEZA Y ENTREGA se reserva únicamente para limpieza final y cierre.
-6. orden_ejecucion debe representar la secuencia constructiva real del conjunto.
-   No copies el orden en que el usuario enumeró las tareas. Considera dependencias
-   entre actividades y deja la limpieza/entrega al final.
-7. subpartida se muestra en el Excel. Debe ser corta, legible, sin numeración y
-   normalmente de 1 a 5 palabras. Ejemplos: Licencias, Pisos, Muros, Frentes,
-   Módulo Refri, Barra, Retiros.
-8. titulo_comercial debe ser corto y apto para cliente. Puede repetirse si el
-   mismo tipo de trabajo corresponde a áreas distintas.
-9. area debe identificar exactamente el espacio de ejecución: Cocina, Baño 1,
-   Baño 2, Recámara 1, Fachada, etc. Usa General solo cuando corresponda realmente.
-10. descripcion_tecnica debe indicar qué se hace, dónde, especificación principal
-   y qué incluye, sin volverse excesivamente larga. Menciona el área también dentro
-   de la descripción para que el concepto siga siendo entendible fuera del Excel.
-11. concepto_base DEBE ser un nombre extremadamente simple y genérico para tu base
-   de datos histórica. Evita medidas, colores específicos o áreas. Ejemplos correctos:
-   "Cocina integral acabados premium", "Mueble de TV carpintería a medida",
-   "Pintura vinílica interior".
-12. codigo_sugerido es interno.
-
-CANTIDADES Y METRAJES
-10. Calcula M2, ML, M3, PZA u otras cantidades cuando las dimensiones aportadas
-    permitan hacerlo de forma justificable. En muebles o módulos de carpintería
-    claramente individualizables, conserva por separado cada tipo distinto y usa
-    la cantidad para repetir únicamente unidades realmente equivalentes.
-11. Si el usuario pide "promediar", utiliza una estimación razonable y explica
-    brevemente el criterio.
-12. Si faltan datos, NO dejes vacíos cantidad ni unidad. Analiza el contexto completo
-    del proyecto, del área y de la actividad y completa con una aproximación profesional.
-    Si existe base suficiente usa M2, ML o M3; para elementos individuales usa PZA;
-    para conjuntos coherentes usa JGO; para trabajos globales o imposibles de metrar
-    razonablemente usa LOTE. Indica el criterio y la confianza. No inventes precisión falsa.
-13. Al finalizar, TODA actividad debe tener unidad, cantidad y costo_unitario_estimado
-    mayores o iguales a cero. Un cero solo es válido cuando el alcance o el texto guía
-    lo exige explícitamente, por ejemplo una demolición indicada a costo cero.
-
-ACABADOS Y ESPECIFICACIONES
-14. Los acabados, materiales, herrajes, calidad, dimensiones, diseño y condiciones
-    especiales mencionados por el usuario forman PARTE DEL CONCEPTO que se va a valuar.
-    No los ignores ni los dejes como notas aisladas. La descripcion_tecnica debe incluir
-    las especificaciones que cambian materialmente el costo y costo_unitario_estimado
-    debe reflejar esas especificaciones.
-15. Si un acabado o solución particular eleva o reduce el costo, modifica la estimación
-    de esa actividad, no el presupuesto completo mediante un multiplicador general.
-
-COSTOS Y MERCADO
-16. costo_unitario_estimado es una primera estimación del COSTO integrado de
-    SUBCONTRATACIÓN, antes de indirectos, utilidad e IVA. Debe representar un paquete
-    que razonablemente podría cotizar un proveedor, incluyendo materiales, mano de obra,
-    equipo, desperdicio aplicable, logística y costos normales del servicio cuando correspondan.
-17. Los costos deben ser razonables para el mercado de CDMX en {year} y coherentes con
-    las especificaciones reales del concepto y con el nivel {budget_level}. No uses
-    multiplicadores generales por nivel.
-18. En trabajos especializados o muy variables, usa una estimación prudente,
-    requiere_cotizacion=True y confianza de precio baja.
-19. No calcules indirectos, utilidad, venta, margen ni IVA; Python lo hará.
-
-DESGLOSE INTERNO
-17. porcentaje_materiales, porcentaje_mano_obra y porcentaje_otros son una
-    DESCOMPOSICIÓN ESTIMADA e informativa del costo integrado y deben sumar
-    aproximadamente 100 %. No cambian el costo total.
-18. En servicios profesionales, trámites o paquetes donde no sea razonable
-    separar materiales y mano de obra, asigna la mayor parte a porcentaje_otros
-    en vez de inventar una división.
-19. desperdicio_materiales_pct es una referencia sobre materiales. El costo
-    integrado ya debe contemplar desperdicio aplicable; NO se suma nuevamente.
-
-PROYECTO EJECUTIVO Y TRÁMITES
-20. Evalúa automáticamente ampliaciones, modificaciones estructurales, nuevas
-    losas, escaleras, cambios relevantes de fachada, instalaciones mayores y
-    otras obras que razonablemente requieran proyecto, ingenierías o permisos.
-21. Incluye esos conceptos solamente cuando sean previsibles para el alcance.
-    Para una remodelación pequeña no agregues trámites por rutina.
-
-CONTROL DE CALIDAD
-22. No dupliques conceptos dentro de la MISMA área y con el mismo alcance.
-    El mismo oficio en áreas distintas NO es un duplicado y debe permanecer separado.
-23. Para cada actividad da criterio_cantidad y fundamento_inclusion breves.
-24. Concentra incertidumbres en datos_faltantes sin bloquear una estimación útil.
-26. No expongas cadenas de pensamiento ni razonamiento interno.
-27. CONTROL FINAL OBLIGATORIO: antes de responder revisa que no exista ninguna actividad
-    con area vacía, descripcion vacía, unidad vacía, cantidad vacía o costo_unitario_estimado
-    omitido. Si faltan datos, completa con el mejor criterio profesional disponible y
-    documenta brevemente la inferencia en criterio_cantidad o consideraciones.
-"""
-
-    modelos = []
-    for model in [
-        model_name,
-        "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-    ]:
-        if model and model not in modelos:
-            modelos.append(model)
-
-    last_error = None
-    for model in modelos:
-        try:
-            response = generar_con_gemini_resistente(
-                client=client, model=model, contents=prompt,
-                config=configuracion_gemini_razonada(
-                    PresupuestoIA, thinking_level="high", max_output_tokens=32768
-                ),
-                progress_callback=progress_callback,
-                etapa="1/4 · Generación del presupuesto",
-            )
-            if not response.text:
-                raise RuntimeError(f"Gemini ({model}) devolvió una respuesta vacía.")
-            return PresupuestoIA.model_validate_json(response.text)
-        except Exception as exc:
-            last_error = exc
-            model_error = error_gemini_modelo_no_disponible(exc)
-            if model_error or error_gemini_transitorio(exc):
-                continue
-            raise
-
-    raise RuntimeError(
-        f"No fue posible usar un modelo Gemini disponible. Último error: {last_error}"
-    )
+    raise RuntimeError("Ningún modelo configurado está disponible para generar partidas.")
 
 
 
-def auditar_estructura_presupuesto_ia(
-    api_key: str,
-    model_name: str,
-    project_data: dict,
-    result: PresupuestoIA,
-    progress_callback=None,
-) -> PresupuestoIA:
-    """
-    Segunda pasada de Gemini dedicada solamente a partida, subpartida y secuencia.
-    Evalúa todas las actividades juntas y no modifica costos ni alcance.
-    """
-    if not result.actividades:
-        return result
-
-    client = genai.Client(api_key=api_key)
-    activities = [
-        {
-            "codigo": act.codigo_sugerido,
-            "area": act.area,
-            "partida_actual": act.partida,
-            "subpartida_actual": act.subpartida,
-            "titulo_actual": act.titulo_comercial,
-            "descripcion_actual": act.descripcion_tecnica,
-            "concepto_base_actual": act.concepto_base,
-            "unidad": act.unidad,
-            "cantidad": float(act.cantidad),
-            "orden_actual": act.orden_ejecucion,
-        }
-        for act in result.actividades
-    ]
-
-    prompt = f"""
-Actúa como AUDITOR Y EDITOR FINAL DE PARTIDAS, REDACCIÓN COMERCIAL Y SECUENCIA DE OBRA.
-
-Revisa el presupuesto COMPLETO como un conjunto. NO cambies el número de actividades,
-las cantidades ni las unidades. Sí puedes corregir los campos de presentación comercial:
-- partida;
-- subpartida;
-- titulo_comercial;
-- descripcion_tecnica;
-- concepto_base;
-- orden_ejecucion.
-
-No cambies el alcance técnico real de la actividad: mejora únicamente su clasificación y redacción
-para que sea más clara, cotizable y consistente con el estilo de la empresa.
-
-PROYECTO
-Tipo: {project_data['project_type']}
-Ubicación: {project_data['location']}
-Descripción:
-{project_data['description']}
-
-ACTIVIDADES
-{json.dumps(activities, ensure_ascii=False, separators=(',', ':'))}
-
-CRITERIOS
-1. Clasifica por la naturaleza principal del trabajo y por el elemento, sistema
-   u oficio que realmente se entrega.
-2. No clasifiques usando palabras incidentales de la descripción, propiedades
-   del producto, tratamientos, resistencias, garantías o adjetivos técnicos.
-3. PRELIMINARES Y PROTECCIONES se reserva para trabajos temporales de preparación,
-   protección de áreas, trazos o instalaciones provisionales.
-4. LIMPIEZA Y ENTREGA se reserva para limpieza final, retiro de protecciones,
-   puesta a punto y cierre de obra.
-5. Un elemento permanente debe quedar en la partida que mejor represente el
-   trabajo permanente ejecutado.
-6. No copies el orden en que el usuario escribió las tareas. Revisa dependencias
-   constructivas reales entre todas las actividades.
-7. Trabajos previos deben anteceder a lo que depende de ellos; demoliciones a las
-   reconstrucciones; preparaciones e instalaciones ocultas a cierres y acabados;
-   elementos finales a sus soportes terminados; limpieza y entrega al final.
-8. Asigna orden_ejecucion creciente con espacios entre valores (10, 20, 30...).
-9. Actividades del mismo oficio pueden pertenecer a áreas distintas. No las trates
-   como duplicadas ni homogeneices su clasificación de forma que se pierda la
-   distinción entre Cocina, Baño 1, Baño 2, Recámara, etc.
-10. En CARPINTERÍA/MOBILIARIO considera además que actividades separadas pueden
-   representar muebles distintos del mismo espacio. No homogeneices títulos o
-   subpartidas de forma que se pierda la distinción entre esos muebles.
-11. Redacta en el estilo comercial de la empresa: acción + elemento + medida/especificación + alcance incluido.
-   Ejemplos de patrón: "Fabricación e instalación de mueble para TV y escritorio de 3.58ml, con gabinetes
-   inferiores y repisas de madera."; "Suministro e instalación de espejo de 0.78m2 (1.30 x 0.60m).";
-   "Aplicación de pintura lavable en muros de 18m2."; "Desmontaje y retiro de mueble de almacenamiento
-   antiguo de piso a techo de 6.75m2." No copies un ejemplo si no corresponde al proyecto.
-12. Evita títulos genéricos como "Carpintería", "Mueble", "Acabados" o "Instalación" cuando pueda
-   identificarse el objeto real. El título debe reconocer el elemento que se está cobrando.
-13. Devuelve exactamente una entrada por cada código recibido y conserva el código, cantidad y unidad.
-
-No incluyas explicaciones adicionales.
-"""
-
-    models = []
-    for model in [
-        model_name,
-        "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-    ]:
-        if model and model not in models:
-            models.append(model)
-
-    for model in models:
-        try:
-            response = generar_con_gemini_resistente(
-                client=client, model=model, contents=prompt,
-                config=configuracion_gemini_razonada(
-                    AuditoriaEstructuraIA, thinking_level="high", max_output_tokens=16384
-                ),
-                progress_callback=progress_callback,
-                etapa="2/4 · Auditoría de estructura",
-            )
-            if not response.text:
-                continue
-
-            audit = AuditoriaEstructuraIA.model_validate_json(response.text)
-            by_code = {
-                str(x.codigo or "").strip().upper(): x
-                for x in audit.actividades
-            }
-
-            updated = []
-            for act in result.actividades:
-                correction = by_code.get(
-                    str(act.codigo_sugerido or "").strip().upper()
-                )
-                if correction is None:
-                    updated.append(act)
-                    continue
-
-                updated.append(
-                    act.model_copy(
-                        update={
-                            "partida": normalizar_seccion_comercial(correction.partida),
-                            "subpartida": correction.subpartida.strip() or act.subpartida,
-                            "titulo_comercial": correction.titulo_comercial.strip() or act.titulo_comercial,
-                            "descripcion_tecnica": correction.descripcion_tecnica.strip() or act.descripcion_tecnica,
-                            "concepto_base": correction.concepto_base.strip() or act.concepto_base,
-                            "orden_ejecucion": int(correction.orden_ejecucion),
-                        }
-                    )
-                )
-
-            return result.model_copy(update={"actividades": updated})
-        except Exception:
-            # Es una capa adicional de calidad; si falla un modelo se prueba el
-            # siguiente y, si todos fallan, se conserva la primera clasificación.
-            continue
-
-    return result
 
 
 def sincronizar_items_con_estructura(
@@ -3052,7 +2678,7 @@ REGLAS DEL EDITOR
                 model=model,
                 contents=prompt,
                 config=configuracion_gemini_razonada(
-                    RevisionPresupuestoIA, thinking_level="high", max_output_tokens=32768
+                    RevisionPresupuestoIA, thinking_level="low", max_output_tokens=16384
                 ),
                 progress_callback=progress_callback,
                 etapa="2/4 · Interpretando cambios",
@@ -3132,184 +2758,10 @@ def buscar_precio_interno(db: Database, actividad: ActividadIA) -> dict | None:
 
 
 
-def _preparar_referencias_para_valuacion(
-    db: Database,
-    result: PresupuestoIA,
-    project_data: dict,
-    params: dict,
-    force_new_price_codes: set[str] | None = None,
-) -> tuple[list[dict], dict[str, dict]]:
-    force_new_price_codes = {
-        str(x).strip().upper() for x in (force_new_price_codes or set())
-    }
-    packets = []
-    refs_by_code = {}
-
-    for idx, act in enumerate(result.actividades, start=1):
-        code = limpiar_codigo(act.codigo_sugerido, f"CON-{idx:03d}")
-        force_new = code.upper() in force_new_price_codes
-        internal = None if force_new else buscar_precio_interno(db, act)
-
-        packet = {
-            "codigo": code,
-            "area": act.area,
-            "partida": act.partida,
-            "subpartida": act.subpartida,
-            "titulo_comercial": act.titulo_comercial,
-            "descripcion_tecnica": act.descripcion_tecnica,
-            "unidad": act.unidad,
-            "cantidad": float(act.cantidad),
-            "nivel_confianza_cantidad": act.nivel_confianza_cantidad,
-            "requiere_cotizacion_inicial": bool(act.requiere_cotizacion),
-            "costo_estimado_inicial_gemini": float(act.costo_unitario_estimado),
-            "referencia_interna": None,
-        }
-
-        if internal:
-            packet["referencia_interna"] = {
-                "costo_unitario": float(internal["unit_cost"]),
-                "fuente": internal["source"],
-                "estado": internal["status"],
-                "confianza": internal["confidence"],
-                "coincidencia": internal["match_score"],
-                "detalle": internal["source_detail"],
-                "es_costo_real_validado": internal["status"]
-                in {"VALIDADO", "COSTO_REAL", "COTIZADO_PROVEEDOR"},
-            }
-
-        packets.append(packet)
-        refs_by_code[code.upper()] = {
-            "internal": internal,
-        }
-
-    return packets, refs_by_code
 
 
 
 
-def valorar_precios_ia(
-    api_key: str,
-    model_name: str,
-    project_data: dict,
-    params: dict,
-    result: PresupuestoIA,
-    reference_packets: list[dict],
-    progress_callback=None,
-) -> ValuacionPreciosIA:
-    """Segunda etapa: Gemini fija el costo final recomendado de subcontratación."""
-    client = genai.Client(api_key=api_key)
-    year = datetime.now().year
-    budget_level = project_data.get("budget_level", "Medio-alto")
-    level_criterion = criterio_nivel_presupuesto(budget_level)
-
-    prompt = f"""
-Actúa como INGENIERO DE COSTOS SENIOR especializado en remodelación residencial y
-comercial en Ciudad de México. Esta es la SEGUNDA ETAPA de un presupuesto.
-
-Tu trabajo es fijar el COSTO UNITARIO FINAL RECOMENDADO DE SUBCONTRATACIÓN de cada
-actividad. Ese costo es el importe que razonablemente podría cobrar un proveedor
-por ejecutar el paquete descrito, antes de los indirectos y utilidad de nuestra
-empresa y antes de IVA.
-
-NO hagas APU ni desglose por material, cuadrilla o herramienta. Evalúa cada paquete
-comercial completo.
-
-PROYECTO
-Cliente: {project_data['name']}
-Ubicación: {project_data['location'] or 'No indicada'}
-Tipo: {project_data['project_type']}
-Nivel: {budget_level}
-Criterio de nivel: {level_criterion}
-Año de referencia: {year}
-
-DESCRIPCIÓN ORIGINAL
-{project_data['description']}
-
-TEXTO GUÍA
-{project_data['guide_text'] or 'Sin instrucciones adicionales.'}
-
-PARÁMETROS FINANCIEROS (NO LOS APLIQUES)
-Indirectos empresa: {params['indirect_pct']:.2f}%
-Utilidad empresa: {params['profit_pct']:.2f}%
-IVA: {params['iva_pct']:.2f}%
-
-REGLAS DE VALUACIÓN
-1. El costo final debe corresponder a SUBCONTRATACIÓN en CDMX, no al precio de venta
-   de nuestra empresa.
-2. La estimación inicial de Gemini es un punto de partida, NO una orden. Revísala y
-   corrígela cuando las especificaciones, dimensiones, complejidad o referencias lo exijan.
-3. Una referencia interna marcada como COSTO_REAL, VALIDADO o COTIZADO_PROVEEDOR es la
-   evidencia más importante. Úsala como ancla cuando realmente corresponda al mismo alcance,
-   pero verifica que la descripción, unidad y especificación sean comparables.
-4. Referencias internas de IA no validadas son solamente evidencia secundaria.
-5. Los acabados y especificaciones escritos en la descripción son OBLIGATORIOS para el precio.
-   No presupuestes una cocina, baño, vestidor, fachada, carpintería o cancelería genérica si
-   el usuario especificó materiales, herrajes, calidad, dimensiones, diseño o sistemas particulares.
-6. El nivel Económico/Medio/Medio-alto/Alto modifica PRINCIPALMENTE materiales, acabados,
-   herrajes, accesorios y soluciones cuya calidad cambia el costo. NO apliques un multiplicador
-   general al proyecto y NO subas o bajes automáticamente demolición, albañilería básica,
-   trámites, limpieza, acarreos o trabajos base cuando su especificación no cambia.
-7. Considera costos normales de subcontratación: materiales, mano de obra, equipo, desperdicio
-   aplicable, transporte/logística, fijaciones, consumibles, coordinación y riesgo razonable del
-   proveedor cuando formen parte natural del servicio.
-8. No uses precios artificialmente bajos por intentar encontrar una coincidencia exacta. Cuando
-   un trabajo sea especializado o tenga alta variabilidad, usa una estimación prudente y marca
-   requiere_cotizacion=True.
-9. Respeta la unidad y cantidad recibidas. No cambies cantidades ni unidades en esta etapa.
-10. No calcules indirectos, utilidad, margen, 30% de marca ni IVA. Python hará esos cálculos.
-11. Devuelve exactamente UNA valuación por cada código recibido. Ningún código puede quedar fuera.
-
-ACTIVIDADES Y REFERENCIAS
-{json.dumps(reference_packets, ensure_ascii=False, separators=(',', ':'))}
-
-Antes de responder revisa especialmente cocina, carpintería, baños, cancelería, fachada,
-acabados especiales y cualquier concepto con especificaciones particulares. No asumas que una
-referencia genérica representa un trabajo especial.
-"""
-
-    models = []
-    for model in [
-        model_name,
-        "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-    ]:
-        if model and model not in models:
-            models.append(model)
-
-    last_error = None
-    for model in models:
-        try:
-            response = generar_con_gemini_resistente(
-                client=client, model=model, contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json", response_schema=ValuacionPreciosIA
-                ),
-                progress_callback=progress_callback,
-                etapa="4/4 · Valuación final de precios",
-            )
-            if not response.text:
-                raise RuntimeError(f"Gemini ({model}) devolvió una respuesta vacía.")
-            valuation = ValuacionPreciosIA.model_validate_json(response.text)
-            expected = {p["codigo"].upper() for p in reference_packets}
-            received = {v.codigo.strip().upper() for v in valuation.valuaciones}
-            missing = expected - received
-            if missing:
-                raise RuntimeError(
-                    "La valuación de Gemini omitió códigos: " + ", ".join(sorted(missing))
-                )
-            return valuation
-        except Exception as exc:
-            last_error = exc
-            model_error = error_gemini_modelo_no_disponible(exc)
-            if model_error or error_gemini_transitorio(exc):
-                continue
-            raise
-
-    raise RuntimeError(
-        f"No fue posible usar un modelo Gemini disponible para la valuación. Último error: {last_error}"
-    )
 
 
 def _modelos_gemini_disponibles(model_name: str | None) -> list[str]:
@@ -3326,284 +2778,8 @@ def _modelos_gemini_disponibles(model_name: str | None) -> list[str]:
     return modelos
 
 
-def costear_actividad_detalladamente_ia(
-    api_key: str,
-    model_name: str,
-    project_data: dict,
-    params: dict,
-    activity: ActividadIA,
-    internal_reference: dict | None = None,
-    progress_callback=None,
-) -> CosteoActividadIA:
-    """Construye una hoja interna de costo por recursos para UNA unidad de actividad.
-
-    La salida no se muestra al cliente. Su finalidad es obligar al modelo a metrar y
-    costear materiales, herrajes, mano de obra, consumibles, equipo y logística antes
-    de fijar el costo unitario final.
-    """
-    client = genai.Client(api_key=api_key)
-    year = datetime.now().year
-    budget_level = project_data.get("budget_level", "Medio-alto")
-    level_criterion = criterio_nivel_presupuesto(budget_level)
-
-    reference_text = json.dumps(internal_reference or {}, ensure_ascii=False, separators=(",", ":"))
-    prompt = f"""
-Actúa como un PRESUPUESTISTA SENIOR y ESPECIALISTA EN COSTOS DE CARPINTERÍA, INTERIORISMO
-Y REMODELACIÓN en Ciudad de México. Vas a construir la HOJA INTERNA DE COSTEO de una
-sola actividad. Esta hoja será revisada por otro modelo antes de convertirse en precio.
-
-OBJETIVO
-No des un precio aproximado por ML/M2/PZA de forma directa. Primero reconstruye lo que
-REALMENTE tendría que comprar, fabricar, transportar, instalar y pagar un subcontratista
-para ejecutar esta actividad. Después expresa cada recurso por separado.
-
-REGLA CRÍTICA
-- Las cantidades de "recursos" deben corresponder a UNA SOLA UNIDAD de la actividad principal.
-- La actividad principal puede estar expresada por ML, M2, PZA, PTO o LOTE, pero eso NO significa que debas
-  costearla con un precio unitario genérico. Reconstruye primero su contenido físico.
-- Si solo existe un área global (por ejemplo 6.75 M2 de un mueble) y faltan ancho/alto/profundidad, conserva la
-  unidad/cantidad comercial, formula una geometría constructiva profesional para el costeo interno y registra la
-  hipótesis; no cambies silenciosamente la cantidad comercial.
-- Distingue entre superficie comercial y consumo real de fabricación: un mueble de 6.75 M2 de frente puede requerir
-  muchos más M2 de tablero por laterales, divisiones, puertas, entrepaños, respaldo, zoclo, etc.
-- Si la actividad es PZA, un recurso debe cubrir una pieza completa.
-- Si es ML, M2, M3, etc., los recursos deben expresarse por UN ML/M2/M3.
-- No uses una sola línea "mueble completo" ni "materiales varios" cuando sea posible identificar
-  los componentes reales.
-- Para muebles, piensa como fabricante: tableros/paneles, entrepaños, respaldos, zoclos,
-  cantos, herrajes, fijaciones, consumibles, mano de obra de despiece/canteado/armado/instalación,
-  transporte y otros costos normales del proveedor.
-- Para repisas, por ejemplo, identifica explícitamente la cantidad de repisas, laterales/divisiones,
-  sistema de fijación o soporte, acabado/canto y horas de fabricación e instalación. No supongas que una repisa
-  es simplemente 1 ML de tablero.
-- Para pintura, descompón internamente preparación/resanes/sellador/pintura y mano de obra según el alcance;
-  la actividad comercial puede seguir siendo una sola "Aplicación de pintura...".
-- Para instalaciones eléctricas, considera internamente mecanismo/accesorios, caja, cableado, tubería o canalización,
-  ranurado, resane y mano de obra cuando correspondan; la partida comercial debe seguir siendo clara y compacta.
-- Para suministros de mobiliario, considera internamente costo de compra, traslado, protección, armado o instalación
-  si el alcance los incluye.
-- Considera merma/desperdicio físicamente razonable dentro de la cantidad del recurso o como
-  una línea explícita de categoría DESPERDICIO. No vuelvas a sumar un desperdicio global después.
-- No incluyas utilidad ni indirectos de NUESTRA empresa. Solo el costo de subcontratación.
-- Un costo puede incluir gastos normales del propio subcontratista cuando formen parte natural
-  de contratar ese servicio.
-- No inventes una precisión falsa: cuando falten datos críticos, usa una hipótesis profesional
-  y deja una advertencia.
-- Cuando el costo de un material, herraje o insumo sea material para el total, usa la búsqueda
-  de Google disponible en Gemini para contrastar precios vigentes en México/CDMX y referencias de
-  proveedores o distribuidores. No uses la búsqueda como sustituto del metrado físico.
-
-EJEMPLO DE RAZONAMIENTO DESEADO
-Si el usuario pide un mueble de repisas de 3 ML x 2 M de alto, no respondas solo "3 ML x $X".
-Analiza, por ejemplo, cuántos entrepaños caben razonablemente, qué paneles verticales requiere,
-qué fijación necesita, qué cantidad de tablero y canto se consume, cuántas horas de fabricación
-/ armado / instalación hacen falta, y qué transporte o consumibles son normales. La cantidad y
-material exactos deben adaptarse al alcance real, no copiar este ejemplo literalmente.
-
-PROYECTO
-Cliente: {project_data['name']}
-Ubicación: {project_data['location'] or 'No indicada'}
-Tipo: {project_data['project_type']}
-Nivel: {budget_level}
-Criterio: {level_criterion}
-Año de referencia: {year}
-
-DESCRIPCIÓN ORIGINAL
-{project_data['description']}
-
-GUÍA
-{project_data['guide_text'] or 'Sin instrucciones adicionales.'}
-
-PARÁMETROS ECONÓMICOS (SOLO CONTEXTO, NO APLICAR)
-Indirectos empresa: {params['indirect_pct']:.2f}%
-Utilidad empresa: {params['profit_pct']:.2f}%
-IVA: {params['iva_pct']:.2f}%
-
-ACTIVIDAD A COSTEAR
-{json.dumps({
-    'codigo': activity.codigo_sugerido,
-    'area': activity.area,
-    'partida': activity.partida,
-    'subpartida': activity.subpartida,
-    'titulo_comercial': activity.titulo_comercial,
-    'descripcion_tecnica': activity.descripcion_tecnica,
-    'unidad': activity.unidad,
-    'cantidad_actividad': float(activity.cantidad),
-    'criterio_cantidad': activity.criterio_cantidad,
-    'nivel_confianza_cantidad': activity.nivel_confianza_cantidad,
-    'estimacion_inicial_debil': float(activity.costo_unitario_estimado),
-    'composicion_inicial': {
-        'materiales_pct': float(activity.porcentaje_materiales),
-        'mano_obra_pct': float(activity.porcentaje_mano_obra),
-        'otros_pct': float(activity.porcentaje_otros),
-        'desperdicio_pct': float(activity.desperdicio_materiales_pct),
-    },
-}, ensure_ascii=False, separators=(',', ':'))}
-
-REFERENCIA HISTÓRICA INTERNA (solo si existe; no la copies ciegamente)
-{reference_text}
-
-ANTES DE RESPONDER, REVISA DOS VECES TU PROPIO COSTEO:
-1) ¿Faltó algún componente físico o servicio necesario?
-2) ¿Las cantidades corresponden a UNA unidad de la actividad y no a toda la obra?
-3) ¿Incluiste fijaciones/herrajes/consumibles/instalación cuando aplican?
-4) ¿La mano de obra tiene horas o una cantidad equivalente defendible?
-5) ¿El transporte/logística tiene sentido para el paquete?
-6) ¿Hay doble conteo entre materiales y desperdicio?
-7) ¿El costo resultante es razonable para subcontratación en CDMX y para el nivel especificado?
-
-Devuelve SOLO la hoja estructurada. El total lo calculará Python sumando cantidad x costo_unitario
-por recurso; no intentes sustituir el desglose por una cifra única.
-"""
-
-    last_error = None
-    for model in _modelos_gemini_disponibles(model_name):
-        try:
-            response = generar_con_gemini_resistente(
-                client=client,
-                model=model,
-                contents=prompt,
-                config=configuracion_gemini_razonada(
-                    CosteoActividadIA,
-                    thinking_level="high",
-                    max_output_tokens=32768,
-                    ground_with_search=True,
-                ),
-                progress_callback=progress_callback,
-                etapa=f"Costeo detallado · {activity.codigo_sugerido}",
-            )
-            return CosteoActividadIA.model_validate_json(response.text)
-        except Exception as exc:
-            last_error = exc
-            if not error_gemini_modelo_no_disponible(exc):
-                raise
-    raise RuntimeError(f"No fue posible construir el costeo detallado de {activity.codigo_sugerido}: {last_error}")
 
 
-def auditar_costeos_detallados_ia(
-    api_key: str,
-    model_name: str,
-    project_data: dict,
-    params: dict,
-    result: PresupuestoIA,
-    costings: CosteoPresupuestoIA,
-    references: list[dict],
-    progress_callback=None,
-) -> AuditoriaCosteoPresupuestoIA:
-    """Segunda lectura: revisa el conjunto de hojas de costo y devuelve correcciones completas."""
-    client = genai.Client(api_key=api_key)
-    year = datetime.now().year
-    budget_level = project_data.get("budget_level", "Medio-alto")
-
-    compact_costings = []
-    for costing in costings.actividades:
-        recursos = []
-        for resource in costing.recursos:
-            recursos.append(resource.model_dump())
-        costo_unitario_calculado = sum(
-            float(r.get("cantidad") or 0.0) * float(r.get("costo_unitario") or 0.0)
-            for r in recursos
-        )
-        compact_costings.append({
-            "codigo": costing.codigo,
-            "recursos": recursos,
-            "costo_unitario_calculado_python": round(costo_unitario_calculado, 2),
-            "confianza": costing.confianza,
-            "requiere_cotizacion": costing.requiere_cotizacion,
-            "advertencias": costing.advertencias,
-        })
-
-    prompt = f"""
-Actúa como un AUDITOR DE COSTOS DE SEGUNDA LECTURA. No estás generando un presupuesto desde cero:
-estás verificando hojas de costeo ya construidas por otro presupuestista.
-
-OBJETIVO
-Revisa actividad por actividad y también el presupuesto completo para detectar omisiones,
-doble conteo, cantidades mal dimensionadas, mano de obra insuficiente, herrajes/fijaciones
-faltantes, logística omitida, desperdicios mal aplicados o precios unitarios incoherentes.
-Cuando detectes un problema, corrige la hoja completa de recursos de esa actividad.
-
-IMPORTANTE
-- No conviertas esto en un simple precio por ML/M2/PZA.
-- Conserva el carácter de costeo físico: cada recurso debe tener concepto, unidad, cantidad y costo.
-- Las cantidades de recursos son por UNA unidad de la actividad principal.
-- El costo unitario definitivo lo calculará Python como suma de cantidad x costo_unitario de los recursos corregidos.
-- No apliques indirectos, utilidad ni IVA de nuestra empresa.
-- Usa referencias internas validadas como anclas cuando sean realmente comparables, pero no las copies ciegamente.
-- Cuando un insumo o precio de mercado sea determinante y pueda verificarse, usa Google Search
-  para contrastar referencias vigentes en México/CDMX. La búsqueda complementa el criterio de costos,
-  pero no reemplaza el metrado físico.
-- Respeta las especificaciones del proyecto y el nivel seleccionado.
-
-PROYECTO
-Cliente: {project_data['name']}
-Ubicación: {project_data['location'] or 'No indicada'}
-Tipo: {project_data['project_type']}
-Nivel: {budget_level}
-Año: {year}
-
-DESCRIPCIÓN ORIGINAL
-{project_data['description']}
-
-HOJAS DE COSTEO GENERADAS
-{json.dumps(compact_costings, ensure_ascii=False, separators=(',', ':'))}
-
-REFERENCIAS INTERNAS POR ACTIVIDAD
-{json.dumps(references, ensure_ascii=False, separators=(',', ':'))}
-
-ACTIVIDADES DEL PRESUPUESTO
-{json.dumps([
-    {
-        'codigo': a.codigo_sugerido,
-        'area': a.area,
-        'titulo': a.titulo_comercial,
-        'descripcion': a.descripcion_tecnica,
-        'unidad': a.unidad,
-        'cantidad': float(a.cantidad),
-    }
-    for a in result.actividades
-], ensure_ascii=False, separators=(',', ':'))}
-
-REVISA EN ESPECIAL CARPINTERÍA/MOBILIARIO:
-- que no se haya valuado solo por ML;
-- que el despiece físico sea creíble para las dimensiones;
-- que entrepaños, costados, respaldos, zoclos, cantos y herrajes estén contemplados cuando correspondan;
-- que la fabricación y la instalación tengan tiempo razonable;
-- que fijaciones y consumibles no desaparezcan;
-- que transporte/logística no se ignore cuando sea normal;
-- que un mismo componente no se haya contado dos veces.
-
-Devuelve exactamente una actividad auditada por cada código recibido.
-"""
-
-    last_error = None
-    for model in _modelos_gemini_disponibles(model_name):
-        try:
-            response = generar_con_gemini_resistente(
-                client=client,
-                model=model,
-                contents=prompt,
-                config=configuracion_gemini_razonada(
-                    AuditoriaCosteoPresupuestoIA,
-                    thinking_level="high",
-                    max_output_tokens=32768,
-                    ground_with_search=True,
-                ),
-                progress_callback=progress_callback,
-                etapa="Auditoría de costeos detallados",
-            )
-            audit = AuditoriaCosteoPresupuestoIA.model_validate_json(response.text)
-            expected = {a.codigo_sugerido.strip().upper() for a in result.actividades}
-            received = {a.codigo.strip().upper() for a in audit.actividades}
-            missing = expected - received
-            if missing:
-                raise RuntimeError("La auditoría de costos omitió códigos: " + ", ".join(sorted(missing)))
-            return audit
-        except Exception as exc:
-            last_error = exc
-            if not error_gemini_modelo_no_disponible(exc):
-                raise
-    raise RuntimeError(f"No fue posible auditar los costeos detallados: {last_error}")
 
 
 def normalizar_recursos_costeo(resources: list[RecursoCosteoIA]) -> tuple[list[dict], float]:
@@ -3650,182 +2826,93 @@ def normalizar_recursos_costeo(resources: list[RecursoCosteoIA]) -> tuple[list[d
     return rows, round(total, 2)
 
 
-def resolver_items(
-    db: Database,
-    result: PresupuestoIA,
-    project_data: dict,
-    params: dict,
-    force_new_price_codes: set[str] | None = None,
-    api_key: str | None = None,
-    model_name: str | None = None,
-    progress_callback=None,
-) -> list[dict]:
-    """Resuelve actividades mediante costeo detallado + segunda auditoría.
-
-    El precio unitario final ya no proviene de una aproximación directa por ML/M2/PZA:
-    Python suma una hoja interna de recursos construida y luego revisada por Gemini.
-    """
-    if not api_key:
-        api_key = get_api_key_runtime()
-    if not api_key:
-        raise RuntimeError("Falta GEMINI_API_KEY para finalizar la valuación de precios.")
-    model_name = model_name or "gemini-3.8-flash"
-
-    force_new_price_codes = {
-        str(x).strip().upper() for x in (force_new_price_codes or set())
-    }
-
-    actualizar_progreso(progress_callback, 50, "3/6 · Consultando historial interno")
-    reference_packets, refs_by_code = _preparar_referencias_para_valuacion(
-        db, result, project_data, params, force_new_price_codes=force_new_price_codes
-    )
-
-    # Primera lectura profunda: una hoja de costo independiente por actividad.
-    costings = []
-    total_acts = max(len(result.actividades), 1)
-    for idx, act in enumerate(result.actividades, start=1):
+def resolver_items(db, result, project_data, params, force_new_price_codes=None,
+                  api_key=None, model_name=None, progress_callback=None) -> list[dict]:
+    """Costos exactos validados primero; los faltantes se revisan en lotes de cinco."""
+    forced = {str(code).strip().upper() for code in (force_new_price_codes or set())}
+    prices, pending = {}, []
+    actualizar_progreso(progress_callback, 50, "2/3 · Buscando costos históricos validados")
+    for idx, act in enumerate(result.actividades, 1):
         code = limpiar_codigo(act.codigo_sugerido, f"CON-{idx:03d}")
-        ref_data = refs_by_code.get(code.upper(), {})
-        internal = ref_data.get("internal")
-        actualizar_progreso(
-            progress_callback,
-            52 + int((idx - 1) / total_acts * 23),
-            f"4/6 · Construyendo costeo físico {idx}/{total_acts}: {code}",
-        )
-        costing = costear_actividad_detalladamente_ia(
-            api_key=api_key,
-            model_name=model_name,
-            project_data=project_data,
-            params=params,
-            activity=act,
-            internal_reference=(
-                {
-                    "costo_unitario": float(internal["unit_cost"]),
-                    "fuente": internal["source"],
-                    "estado": internal["status"],
-                    "confianza": internal["confidence"],
-                    "coincidencia": internal["match_score"],
-                    "detalle": internal["source_detail"],
-                }
-                if internal else None
-            ),
-            progress_callback=(
-                (lambda _pct, msg: actualizar_progreso(progress_callback, 52 + int((idx - 1) / total_acts * 23), msg))
-                if progress_callback is not None else None
-            ),
-        )
-        # Fuerza el código solicitado para evitar cualquier ambigüedad.
-        costing = costing.model_copy(update={"codigo": code})
-        costings.append(costing)
+        if code in prices or any(p['codigo'] == code for p in pending):
+            raise RuntimeError(f"Código repetido después de normalizar: {code}")
+        reference = None if code.upper() in forced else buscar_precio_validado_exacto(db, act)
+        if reference:
+            prices[code] = dict(cost=float(reference['unit_cost']),
+                concept_id=reference['concept_id'], source='BASE_INTERNA',
+                status=reference['status'], confidence='Alta', resources=[],
+                quote=False, detail=f"Costo validado de alcance y unidad idénticos; fecha {reference['created_at']}.")
+            actualizar_progreso(progress_callback, 52, f"{code} · costo histórico validado reutilizado")
+        else:
+            hint = None if code.upper() in forced else buscar_precio_interno(db, act)
+            pending.append(dict(codigo=code, descripcion=act.descripcion_tecnica,
+                titulo=act.titulo_comercial, area=act.area, unidad=act.unidad,
+                cantidad=float(act.cantidad), criterio_cantidad=act.criterio_cantidad,
+                supuestos=act.consideraciones, desglose_requerido=actividad_precio_complejo(act),
+                costo_inicial=float(act.costo_unitario_estimado),
+                referencia=(dict(costo=hint['unit_cost'], estado=hint['status'],
+                                 detalle=hint['source_detail']) if hint else None)))
 
-    costings_bundle = CosteoPresupuestoIA(actividades=costings)
-    actualizar_progreso(progress_callback, 77, "5/6 · Segunda lectura: auditando materiales, herrajes, mano de obra y logística")
-    audit = auditar_costeos_detallados_ia(
-        api_key=api_key,
-        model_name=model_name,
-        project_data=project_data,
-        params=params,
-        result=result,
-        costings=costings_bundle,
-        references=reference_packets,
-        progress_callback=(
-            (lambda _pct, msg: actualizar_progreso(progress_callback, 80, msg))
-            if progress_callback is not None else None
-        ),
-    )
+    if pending:
+        api_key = api_key or get_api_key_runtime()
+        if not api_key:
+            raise RuntimeError("Falta GEMINI_API_KEY para revisar los precios pendientes.")
+    for start in range(0, len(pending), 5):
+        batch = pending[start:start + 5]
+        pct = 55 + int(start / max(len(pending), 1) * 35)
+        actualizar_progreso(progress_callback, pct,
+            f"2/3 · Revisando lote {start // 5 + 1}/{(len(pending) + 4) // 5}: {len(batch)} conceptos")
+        checked, grounded = revisar_precios_compactos_ia(
+            api_key, model_name or 'gemini-3.8-flash', project_data, batch,
+            progress_callback=(lambda _pct, msg: actualizar_progreso(progress_callback, pct, msg)))
+        packets = {p['codigo'].upper(): p for p in batch}
+        for price in checked.precios:
+            code = price.codigo.strip().upper()
+            packet = packets[code]
+            if packet['desglose_requerido'] and not price.recursos:
+                raise RuntimeError(f"{code}: falta desglose esencial para comprobar el precio complejo.")
+            resources, cost = normalizar_recursos_costeo(price.recursos) if price.recursos else ([], float(price.costo_unitario))
+            if not 0 < cost < float('inf'):
+                raise RuntimeError(f"{code}: costo unitario inválido.")
+            # Las URLs escritas por el modelo son declaradas; las de grounding
+            # sí constan en la respuesta de búsqueda, sin garantizar comparabilidad.
+            declared = [url for url in price.fuentes if url.startswith(('https://', 'http://'))]
+            detail = price.fundamento
+            if declared:
+                detail += ' | Referencias declaradas: ' + ', '.join(declared)
+            if grounded:
+                detail += ' | Fuentes de búsqueda del lote: ' + ', '.join(grounded)
+            else:
+                detail += ' | Sin evidencia de búsqueda devuelta por la API; confirmar con proveedor.'
+            prices[code] = dict(cost=cost, concept_id=None, source='IA_ESTIMADO',
+                status='ESTIMADO_IA', confidence=(price.confianza if grounded else 'Baja'),
+                quote=price.requiere_cotizacion or not grounded, resources=resources, detail=detail)
+            actualizar_progreso(progress_callback, pct, f"{code} · costo revisado: ${cost:,.2f}/{packet['unidad']}")
 
-    audit_by_code = {x.codigo.strip().upper(): x for x in audit.actividades}
     items = []
-
-    for idx, act in enumerate(result.actividades, start=1):
-        fallback = f"CON-{idx:03d}"
-        requested_code = limpiar_codigo(act.codigo_sugerido, fallback)
-        audited = audit_by_code.get(requested_code.upper())
-        if audited is None:
-            raise RuntimeError(f"La auditoría de costos no devolvió {requested_code}.")
-
-        resources, unit_cost = normalizar_recursos_costeo(audited.recursos_corregidos)
-
-        ref_data = refs_by_code.get(requested_code.upper(), {})
-        internal = ref_data.get("internal")
-        concept_id = internal.get("concept_id") if internal else None
-        quantity = max(float(act.cantidad), 0.0)
-        indirect_unit = unit_cost * params["indirect_pct"] / 100.0
-        profit_unit = (unit_cost + indirect_unit) * params["profit_pct"] / 100.0
-        sale_unit = unit_cost + indirect_unit + profit_unit
-        direct_amount = quantity * unit_cost
-        sale_amount = quantity * sale_unit
-        benefit_amount = sale_amount - direct_amount
-        sale_margin_pct = (benefit_amount / sale_amount * 100.0) if sale_amount else 0.0
-
+    for idx, act in enumerate(result.actividades, 1):
+        code = limpiar_codigo(act.codigo_sugerido, f"CON-{idx:03d}")
+        price = prices[code.upper()]
         considerations = act.consideraciones.strip()
-        if audited.requiere_cotizacion:
-            suffix = "Requiere cotización de proveedor."
-            considerations = (considerations + " | " if considerations else "") + suffix
-        if audited.hallazgos:
-            summary = " | ".join(str(x).strip() for x in audited.hallazgos if str(x).strip())
-            if summary:
-                considerations = (considerations + " | " if considerations else "") + "Auditoría de costeo: " + summary
-
-        detail_parts = [
-            "Costo unitario calculado por hoja de recursos + segunda auditoría IA.",
-            f"Recursos internos auditados: {len(resources)} líneas; suma matemática Python: ${unit_cost:,.2f}/{act.unidad}.",
-        ]
-        if internal:
-            detail_parts.append(
-                f"Referencia interna: ${float(internal['unit_cost']):,.2f}/{act.unidad} "
-                f"({internal['source']}, coincidencia {internal['match_score']:.0%})."
-            )
-
-        item_data = {
-            "concept_id": concept_id,
-            "area_hint": normalizar_nombre_area(act.area),
-            "category": normalizar_seccion_comercial(act.partida),
-            "subcategory": act.subpartida.strip(),
-            "code": requested_code,
-            "execution_order": int(act.orden_ejecucion),
-            "commercial_title": act.titulo_comercial.strip(),
-            "concepto_base": act.concepto_base.strip(),
-            "description": act.descripcion_tecnica.strip(),
-            "unit": act.unidad.strip().upper(),
-            "quantity": quantity,
-            "unit_cost": unit_cost,
-            "direct_amount": direct_amount,
-            "unit_indirect": indirect_unit,
-            "unit_profit": profit_unit,
-            "unit_sale": sale_unit,
-            "sale_amount": sale_amount,
-            "benefit_amount": benefit_amount,
-            "sale_margin_pct": sale_margin_pct,
-            "price_source": "GEMINI_COSTEO_AUDITADO",
-            "price_source_detail": " | ".join(detail_parts),
-            "price_status": "ESTIMADO_IA_COSTEO_AUDITADO",
-            "price_confidence": audited.confianza,
-            "material_share_pct": act.porcentaje_materiales,
-            "labor_share_pct": act.porcentaje_mano_obra,
-            "other_share_pct": act.porcentaje_otros,
-            "waste_reference_pct": act.desperdicio_materiales_pct,
-            "included": True,
-            "contract_lot": "1",
-            "quantity_confidence": act.nivel_confianza_cantidad,
-            "quantity_criterion": act.criterio_cantidad.strip(),
-            "inclusion_basis": act.fundamento_inclusion.strip(),
-            "considerations": considerations,
-            # Se conserva internamente en session/checkpoint; el Excel no muestra este detalle.
-            "costing_breakdown": resources,
-        }
-        item_data = aplicar_composicion_costo(item_data)
-        item_data["area_allocations"] = [{
-            "area": normalizar_nombre_area(act.area),
-            "porcentaje": 100.0,
-            "cantidad_referencia": quantity,
-            "criterio": "Área específica indicada por Gemini para esta actividad.",
-            "confianza": "Alta",
-        }]
-        items.append(item_data)
-
-    actualizar_progreso(progress_callback, 92, "6/6 · Calculando precios de venta y cerrando presupuesto")
-    return items
+        if price['quote'] or act.requiere_cotizacion:
+            considerations += (' | ' if considerations else '') + 'Requiere cotización de proveedor.'
+        item = dict(concept_id=price['concept_id'], area_hint=normalizar_nombre_area(act.area),
+            category=act.partida, subcategory=act.subpartida, code=code,
+            execution_order=act.orden_ejecucion, commercial_title=act.titulo_comercial,
+            concepto_base=act.concepto_base, description=act.descripcion_tecnica,
+            unit=normalizar_unidad(act.unidad), quantity=float(act.cantidad), unit_cost=price['cost'],
+            price_source=price['source'], price_source_detail=price['detail'],
+            price_status=price['status'], price_confidence=price['confidence'],
+            material_share_pct=act.porcentaje_materiales, labor_share_pct=act.porcentaje_mano_obra,
+            other_share_pct=act.porcentaje_otros, waste_reference_pct=act.desperdicio_materiales_pct,
+            included=True, contract_lot='1', quantity_confidence=act.nivel_confianza_cantidad,
+            quantity_criterion=act.criterio_cantidad, inclusion_basis=act.fundamento_inclusion,
+            considerations=considerations, costing_breakdown=price['resources'],
+            area_allocations=[dict(area=normalizar_nombre_area(act.area), porcentaje=100.0,
+                cantidad_referencia=float(act.cantidad), criterio='Área indicada en el alcance.')])
+        items.append(recalcular_item_financiero(item, params))
+    actualizar_progreso(progress_callback, 92, "2/3 · Precios revisados y totales calculados en Python")
+    return ordenar_items_comercialmente(items)
 
 
 
@@ -5286,16 +4373,6 @@ def crear_excel(
       de este módulo, en la etapa posterior de venta al cliente.
       Considerar permite activar/desactivar cada actividad sin borrar la fila.
 
-    02 Control Interno:
-      control editable de costo subcontratado, desglose unitario y precio interno
-      objetivo frente al Importe interno de 01 Presupuesto.
-
-    03 Trazabilidad:
-      fuentes, criterios y consideraciones.
-
-    04 Costos por Área:
-      revisión interna simplificada calculada únicamente con áreas y metrajes
-      explícitos del texto inicial. No aplica IVA ni 30 % de marca.
     """
     wb = Workbook()
     # Forzar recálculo al abrir/guardar para que Excel y hojas compatibles
@@ -5432,6 +4509,13 @@ def crear_excel(
             float(item["sale_amount"]) / quantity if quantity else 0.0
         )
         ws.cell(row, 7, initial_unit_price)
+        ws.cell(row, 7).comment = Comment(
+            f"Fuente: {item.get('price_source') or 'Sin fuente'}\n"
+            f"Confianza: {item.get('price_confidence') or 'Sin dato'}\n"
+            f"{item.get('price_source_detail') or ''}\n"
+            f"{item.get('considerations') or ''}",
+            "Presupuesto",
+        )
         ws.cell(row, 8, f"=F{row}*G{row}")
 
         # I controla si la actividad participa o no en el presupuesto.
@@ -5547,408 +4631,17 @@ def crear_excel(
     ws.page_margins.top = 0.45
     ws.page_margins.bottom = 0.45
 
-    # -----------------------------------------------------
-    # 02 CONTROL INTERNO
-    # -----------------------------------------------------
-    wc = wb.create_sheet("02 Control Interno")
-    wc.sheet_view.showGridLines = False
-
-    # Paleta por bloques para que la hoja pueda leerse de izquierda a derecha:
-    # alcance -> desglose -> subcontratación -> presupuesto interno.
-    cost_blue = "5B9BD5"
-    cost_blue_light = "DDEBF7"
-    subcontract_gold = "BF9000"
-    subcontract_light = "FFF2CC"
-    sale_green = "548235"
-    sale_green_light = "E2F0D9"
-    profit_green = "375623"
-    profit_green_light = "E2F0D9"
-
-    wc.merge_cells("A1:S1")
-    wc["A1"] = "CONTROL INTERNO DEL PRESUPUESTO"
-    wc["A1"].font = Font(size=15, bold=True, color=white)
-    wc["A1"].fill = PatternFill("solid", fgColor=internal_blue)
-
-    wc["A2"] = "Parámetro"
-    wc["B2"] = "Valor"
-    for cell in ("A2", "B2"):
-        wc[cell].font = Font(bold=True, color=white)
-        wc[cell].fill = PatternFill("solid", fgColor=internal_blue)
-
-    wc["A3"] = "Indirectos"
-    wc["B3"] = params["indirect_pct"] / 100.0
-    wc["A4"] = "Utilidad objetivo"
-    wc["B4"] = params["profit_pct"] / 100.0
-    wc["A5"] = "IVA"
-    wc["B5"] = params["iva_pct"] / 100.0
-    wc["A6"] = "Desperdicio general de referencia"
-    wc["B6"] = params["waste_pct"] / 100.0
-    wc["A7"] = "Nivel de presupuesto"
-    wc["B7"] = project_data.get("budget_level", "Medio-alto")
-    for rr in range(3, 7):
-        wc.cell(rr, 2).number_format = "0.00%"
-
-    # Resumen ejecutivo de negociación. Se completa después de crear las filas
-    # para que responda tanto al precio subcontratado como al selector Sí/No de 01.
-    wc.merge_cells("D2:F2")
-    wc["D2"] = "RESUMEN DE SUBCONTRATACIÓN"
-    wc["D2"].font = Font(bold=True, color=white)
-    wc["D2"].fill = PatternFill("solid", fgColor=profit_green)
-    for col in range(5, 7):
-        wc.cell(2, col).fill = PatternFill("solid", fgColor=profit_green)
-    summary_labels = [
-        "Costo subcontratado activo",
-        "Importe interno activo",
-        "Diferencia vs interno",
-    ]
-    for rr, label in enumerate(summary_labels, start=3):
-        wc.cell(rr, 4, label)
-        wc.cell(rr, 4).font = Font(bold=True)
-        wc.cell(rr, 4).fill = PatternFill("solid", fgColor=profit_green_light)
-        wc.cell(rr, 5).fill = PatternFill("solid", fgColor=profit_green_light)
-
-    # Encabezados agrupados por función.
-    group_row = 8
-    header_row = 9
-    groups = [
-        (1, 9, "IDENTIFICACIÓN Y ALCANCE", internal_blue),
-        (10, 14, "DESGLOSE DE COSTO UNITARIO", cost_blue),
-        (15, 16, "SUBCONTRATACIÓN", subcontract_gold),
-        (17, 19, "PRESUPUESTO INTERNO", sale_green),
-    ]
-    for start_col, end_col, label, color in groups:
-        wc.merge_cells(
-            start_row=group_row,
-            start_column=start_col,
-            end_row=group_row,
-            end_column=end_col,
-        )
-        cell = wc.cell(group_row, start_col, label)
-        cell.font = Font(bold=True, color=white)
-        cell.fill = PatternFill("solid", fgColor=color)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        for col in range(start_col + 1, end_col + 1):
-            wc.cell(group_row, col).fill = PatternFill("solid", fgColor=color)
-
-    headers = [
-        "Código",
-        "Área",
-        "Partida",
-        "Subpartida",
-        "Título comercial",
-        "Descripción",
-        "Unidad",
-        "Lote",
-        "Cant.",
-        "Materiales est. unit.",
-        "M.O. est. unit.",
-        "Otros / integrado est. unit.",
-        "Costo base estimado unit.",
-        "Desperdicio ref. unit.",
-        "Precio subcontratista unit.",
-        "Importe subcontratista",
-        "P.U. interno calculado",
-        "P.U. interno vigente",
-        "Importe interno",
-    ]
-
-    group_fills = {
-        **{col: internal_blue for col in range(1, 10)},
-        **{col: cost_blue for col in range(10, 15)},
-        **{col: subcontract_gold for col in range(15, 17)},
-        **{col: sale_green for col in range(17, 20)},
-    }
-    for col, header in enumerate(headers, 1):
-        c = wc.cell(header_row, col, header)
-        c.font = Font(bold=True, color=white)
-        c.fill = PatternFill("solid", fgColor=group_fills[col])
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    for idx, item in enumerate(ordered_items, start=header_row + 1):
-        commercial_row = commercial_row_map.get(item["code"])
-        values = [
-            item["code"],
-            area_excel_item(item),
-            item.get("partida_excel") or nombre_partida_excel(item.get("category")),
-            item.get("subpartida_excel") or nombre_subpartida_excel(item),
-            titulo_comercial_item(item),
-            item["description"],
-            item["unit"],
-            str(item.get("contract_lot") or "1"),
-        ]
-        for col, val in enumerate(values, 1):
-            wc.cell(idx, col, val)
-
-        # Cantidad e Importe interno vigentes provienen de 01 Presupuesto.
-        if commercial_row:
-            wc.cell(idx, 9, f"='01 Presupuesto'!F{commercial_row}")
-        else:
-            wc.cell(idx, 9, float(item["quantity"]))
-
-        # Desglose de referencia. J:L son editables para ajustar una estimación
-        # interna; M se recalcula automáticamente como suma de esos componentes.
-        wc.cell(idx, 10, float(item.get("material_unit_est", 0.0)))
-        wc.cell(idx, 11, float(item.get("labor_unit_est", 0.0)))
-        wc.cell(idx, 12, float(item.get("other_unit_est", item["unit_cost"])))
-        wc.cell(idx, 13, f"=SUM(J{idx}:L{idx})")
-        wc.cell(idx, 14, float(item.get("waste_reference_unit", 0.0)))
-
-        # Este es el control principal de negociación con el subcontratista.
-        # Se inicializa con el costo directo actual, pero queda como valor editable.
-        wc.cell(idx, 15, float(item["unit_cost"]))
-        wc.cell(idx, 16, f"=I{idx}*O{idx}")
-
-        # Precio interno objetivo: costo del subcontratista más indirectos y utilidad.
-        wc.cell(idx, 17, f"=O{idx}*(1+$B$3)*(1+$B$4)")
-        if commercial_row:
-            wc.cell(idx, 18, f"='01 Presupuesto'!G{commercial_row}")
-            wc.cell(idx, 19, f"='01 Presupuesto'!H{commercial_row}")
-        else:
-            wc.cell(idx, 18, float(item["unit_sale"]))
-            wc.cell(idx, 19, float(item["sale_amount"]))
-
-        wc.cell(idx, 9).number_format = "0.00"
-        for col in [10, 11, 12, 13, 14, 15, 16, 17, 18, 19]:
-            wc.cell(idx, col).number_format = '$#,##0.00'
-
-        for col in range(1, 20):
-            cell = wc.cell(idx, col)
-            cell.alignment = Alignment(
-                vertical="top",
-                wrap_text=col in {2, 3, 4, 5, 6},
-                horizontal="center" if col in {7, 8, 9} else "left",
-            )
-            cell.border = Border(bottom=thin_gray)
-
-        for col in range(10, 20):
-            wc.cell(idx, col).alignment = Alignment(horizontal="right", vertical="top")
-
-        # Colores de captura y lectura rápida.
-        for col in (10, 11, 12):
-            wc.cell(idx, col).fill = PatternFill("solid", fgColor=cost_blue_light)
-        wc.cell(idx, 13).fill = PatternFill("solid", fgColor=formula_fill)
-        wc.cell(idx, 14).fill = PatternFill("solid", fgColor=cost_blue_light)
-        wc.cell(idx, 15).fill = PatternFill("solid", fgColor=subcontract_light)
-        wc.cell(idx, 16).fill = PatternFill("solid", fgColor=subcontract_light)
-        for col in (17, 18, 19):
-            wc.cell(idx, col).fill = PatternFill("solid", fgColor=sale_green_light)
-
-    # Totales de negociación activos: consideran únicamente filas con Sí en 01.
-    active_cost_terms = []
-    for control_row, item in enumerate(ordered_items, start=header_row + 1):
-        commercial_row = commercial_row_map.get(item["code"])
-        if commercial_row:
-            active_cost_terms.append(
-                f"IF('01 Presupuesto'!I{commercial_row}=\"Sí\",P{control_row},0)"
-            )
-    active_cost_formula = "+".join(active_cost_terms) if active_cost_terms else "0"
-    wc["E3"] = f"={active_cost_formula}"
-    wc["E4"] = f"='01 Presupuesto'!H{internal_detail_row}"
-    wc["E5"] = "=E4-E3"
-    for cell in ("E3", "E4", "E5"):
-        wc[cell].number_format = '$#,##0.00'
-        wc[cell].font = Font(bold=True)
-
-    widths = [
-        14, 18, 26, 22, 30, 56, 10, 10, 10,
-        18, 18, 21, 20, 19, 22, 21, 19, 19,
-    ]
-    for col, width in enumerate(widths, 1):
-        wc.column_dimensions[get_column_letter(col)].width = width
-
-    wc.row_dimensions[group_row].height = 22
-    wc.row_dimensions[header_row].height = 40
-    wc.auto_filter.ref = f"A{header_row}:S{header_row + len(ordered_items)}"
-
-    # -----------------------------------------------------
-    # 03 TRAZABILIDAD
-    # -----------------------------------------------------
-    wt = wb.create_sheet("03 Trazabilidad")
-    wt.sheet_view.showGridLines = False
-    wt.merge_cells("A1:N1")
-    wt["A1"] = "TRAZABILIDAD DE CONCEPTOS Y PRECIOS"
-    wt["A1"].font = Font(size=15, bold=True, color=white)
-    wt["A1"].fill = PatternFill("solid", fgColor=internal_blue)
-
-    trace_headers = [
-        "Partida",
-        "Subpartida",
-        "Título comercial",
-        "Código",
-        "Descripción",
-        "Unidad",
-        "Cantidad",
-        "Fuente precio",
-        "Detalle de fuente",
-        "Confianza",
-        "Criterio de cantidad",
-        "Fundamento de inclusión",
-        "Consideraciones",
-        "Área calculada",
-    ]
-    for col, header in enumerate(trace_headers, 1):
-        c = wt.cell(2, col, header)
-        c.font = Font(bold=True, color=white)
-        c.fill = PatternFill("solid", fgColor=internal_blue)
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    for idx, item in enumerate(ordered_items, start=3):
-        values = [
-            item.get("partida_excel") or nombre_partida_excel(item.get("category")),
-            item.get("subpartida_excel") or nombre_subpartida_excel(item),
-            titulo_comercial_item(item),
-            item["code"],
-            item["description"],
-            item["unit"],
-            item["quantity"],
-            item["price_source"],
-            item["price_source_detail"],
-            item["price_confidence"],
-            item["quantity_criterion"],
-            item["inclusion_basis"],
-            item["considerations"],
-            descripcion_areas_item(item),
-        ]
-        for col, val in enumerate(values, 1):
-            cell = wt.cell(idx, col, val)
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-            cell.border = Border(bottom=thin_gray)
-
-        wt.cell(idx, 7).number_format = "0.00"
-        if item["price_source"] in {
-            "IA_ESTIMADO",
-            "GEMINI_VALORADO",
-            "GEMINI_COSTEO_AUDITADO",
-            "HISTORICO_IA",
-        }:
-            wt.cell(idx, 8).fill = PatternFill("solid", fgColor=trace_orange)
-            wt.cell(idx, 9).fill = PatternFill("solid", fgColor=trace_orange)
-
-    trace_widths = [23, 25, 28, 14, 62, 10, 11, 22, 70, 14, 48, 48, 52, 38]
-    for col, width in enumerate(trace_widths, 1):
-        wt.column_dimensions[get_column_letter(col)].width = width
-
-    # -----------------------------------------------------
-    # 04 COSTOS POR ÁREA - REVISIÓN INTERNA SIMPLE
-    # -----------------------------------------------------
-    wa = wb.create_sheet("04 Costos por Área")
-    wa.sheet_view.showGridLines = False
-
-    wa.merge_cells("A1:C1")
-    wa["A1"] = "COSTOS INTERNOS POR ÁREA"
-    wa["A1"].font = Font(size=15, bold=True, color=white)
-    wa["A1"].fill = PatternFill("solid", fgColor=internal_blue)
-
-    area_names = []
-    for item in ordered_items:
-        for allocation in obtener_asignaciones_area_item(item):
-            if allocation["area"] not in area_names:
-                area_names.append(allocation["area"])
-    if AREA_GENERAL in area_names:
-        area_names = [x for x in area_names if x != AREA_GENERAL] + [AREA_GENERAL]
-    if not area_names:
-        area_names = [AREA_GENERAL]
-
-    wa["A2"] = "Área"
-    wa["B2"] = "Importe interno"
-    for cell in ("A2", "B2"):
-        wa[cell].font = Font(bold=True, color=white)
-        wa[cell].fill = PatternFill("solid", fgColor=internal_blue)
-
-    summary_rows = {}
-    for area in area_names:
-        rr = 3 + len(summary_rows)
-        summary_rows[area] = rr
-        wa.cell(rr, 1, area)
-
-    total_summary_area_row = 3 + len(area_names)
-    wa.cell(total_summary_area_row, 1, "TOTAL INTERNO")
-    wa.cell(total_summary_area_row, 1).font = Font(bold=True, color=brown)
-    wa.cell(total_summary_area_row, 1).fill = PatternFill("solid", fgColor=brown_light)
-    wa.cell(total_summary_area_row, 2, f"='01 Presupuesto'!H{internal_detail_row}")
-    wa.cell(total_summary_area_row, 2).number_format = '$#,##0.00'
-    wa.cell(total_summary_area_row, 2).font = Font(bold=True, color=brown)
-    wa.cell(total_summary_area_row, 2).fill = PatternFill("solid", fgColor=brown_light)
-
-    current_row = total_summary_area_row + 2
-    area_total_cells = {}
-
-    for area in area_names:
-        wa.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=3)
-        wa.cell(current_row, 1, area.upper())
-        wa.cell(current_row, 1).font = Font(bold=True, color=white)
-        wa.cell(current_row, 1).fill = PatternFill("solid", fgColor=internal_blue)
-        current_row += 1
-
-        for col, header in enumerate(["Partida", "Concepto", "Importe interno"], 1):
-            wa.cell(current_row, col, header)
-            wa.cell(current_row, col).font = Font(bold=True)
-            wa.cell(current_row, col).fill = PatternFill("solid", fgColor=gray_light)
-        current_row += 1
-
-        first_area_item_row = current_row
-        for item in ordered_items:
-            commercial_row = commercial_row_map.get(item["code"])
-            if not commercial_row:
-                continue
-            for allocation in obtener_asignaciones_area_item(item):
-                if allocation["area"] != area:
-                    continue
-                wa.cell(current_row, 1, item.get("partida_excel") or nombre_partida_excel(item.get("category")))
-                wa.cell(current_row, 2, titulo_comercial_item(item))
-                wa.cell(
-                    current_row,
-                    3,
-                    f"=IF('01 Presupuesto'!I{commercial_row}=\"Sí\",'01 Presupuesto'!H{commercial_row}*{float(allocation['porcentaje']) / 100.0:.8f},0)",
-                )
-                wa.cell(current_row, 3).number_format = '$#,##0.00'
-                for col in range(1, 4):
-                    wa.cell(current_row, col).alignment = Alignment(vertical="top", wrap_text=col in {1, 2})
-                    wa.cell(current_row, col).border = Border(bottom=thin_gray)
-                current_row += 1
-
-        if current_row == first_area_item_row:
-            wa.cell(current_row, 2, "Sin conceptos asignables de forma verificable.")
-            current_row += 1
-
-        area_total_row = current_row
-        wa.cell(area_total_row, 1, f"Total {area}")
-        wa.cell(area_total_row, 1).font = Font(bold=True)
-        wa.cell(area_total_row, 3, f"=SUM(C{first_area_item_row}:C{area_total_row - 1})")
-        wa.cell(area_total_row, 3).number_format = '$#,##0.00'
-        wa.cell(area_total_row, 3).font = Font(bold=True)
-        area_total_cells[area] = f"C{area_total_row}"
-        current_row += 2
-
-    for area, rr in summary_rows.items():
-        wa.cell(rr, 2, f"={area_total_cells[area]}")
-        wa.cell(rr, 2).number_format = '$#,##0.00'
-
-    wa.column_dimensions["A"].width = 30
-    wa.column_dimensions["B"].width = 48
-    wa.column_dimensions["C"].width = 22
-    wa.sheet_properties.pageSetUpPr.fitToPage = True
-    wa.page_setup.orientation = "portrait"
-    wa.page_setup.fitToWidth = 1
-    wa.page_setup.fitToHeight = 0
-    wa.page_margins.left = 0.3
-    wa.page_margins.right = 0.3
-    wa.page_margins.top = 0.45
-    wa.page_margins.bottom = 0.45
-
     out = BytesIO()
     wb.save(out)
-    out.seek(0)
     return out.getvalue()
 
 
 # =========================================================
-# EXCEL — FORMATO CLIENTE (Resumen + Partidas)
+# EXCEL — FORMATO CLIENTE (Partidas y totales)
 # =========================================================
 
 # Estilo tomado directamente del archivo de ejemplo (AQUI PRO). Se deja como
-# constante para que ambas hojas (Resumen y Partidas) luzcan idénticas al
-# ejemplo y para no repetir literales de color por toda la función.
+# constante para conservar el formato cliente y evitar repetir colores.
 _CLIENTE_HEADER_FILL = PatternFill(fill_type="solid", fgColor="FF37241B")
 _CLIENTE_HEADER_FONT = Font(name="Calibri", size=12, bold=True, color="FFEEEEEE")
 _CLIENTE_DATA_FONT = Font(name="Calibri", size=12, bold=False, color="FF37241B")
@@ -5965,7 +4658,7 @@ def crear_excel_formato_cliente(
     margin_pct: float | None = None,
 ) -> bytes:
     """
-    Libro con el formato "cliente" (dos hojas: Resumen y Partidas), calcado
+    Libro con el formato "cliente" (una hoja: Partidas con totales), basado
     del ejemplo proporcionado por la empresa.
 
     Reutiliza estructura_partidas_excel(...) -- la misma función que arma
@@ -5990,48 +4683,8 @@ def crear_excel_formato_cliente(
     wb.calculation.forceFullCalc = True
     wb.calculation.calcOnSave = True
 
-    # --------------------------- Resumen ---------------------------
-    resumen = wb.active
-    resumen.title = "Resumen"
-    resumen.sheet_view.showGridLines = True
-    resumen.column_dimensions["A"].width = 20
-    resumen.column_dimensions["B"].width = 40
-
-    oportunidad = (
-        f"{project_data.get('project_type', '')} · "
-        f"{project_data.get('budget_level', 'Medio-alto')} · "
-        f"{project_data.get('location', '')} · {project_code} · V{version:02d}"
-    )
-
-    resumen_labels_values = [
-        ("Nombre", project_data.get("name", "")),
-        ("Oportunidad", oportunidad),
-        ("ID Presupuesto", project_code),
-        ("Autor", ""),
-        ("Estado", "draft"),
-        ("Fecha", datetime.now()),
-    ]
-    for row_idx, (label, value) in enumerate(resumen_labels_values, start=1):
-        a = resumen.cell(row_idx, 1, label)
-        a.font = _CLIENTE_HEADER_FONT
-        a.fill = _CLIENTE_HEADER_FILL
-        b = resumen.cell(row_idx, 2, value)
-        b.font = _CLIENTE_DATA_FONT
-        b.alignment = _CLIENTE_RIGHT_ALIGN
-        if label == "Fecha":
-            b.number_format = "[$-409]m/d/yy"
-
-    money_labels = ["Presupuesto", "Extras", "Descuentos", "Impuestos", "Total"]
-    for row_idx, label in enumerate(money_labels, start=7):
-        a = resumen.cell(row_idx, 1, label)
-        a.font = _CLIENTE_HEADER_FONT
-        a.fill = _CLIENTE_HEADER_FILL
-        b = resumen.cell(row_idx, 2)
-        b.font = _CLIENTE_DATA_FONT
-        b.alignment = _CLIENTE_RIGHT_ALIGN
-
-    # --------------------------- Partidas ---------------------------
-    partidas = wb.create_sheet("Partidas")
+    partidas = wb.active
+    partidas.title = "Partidas"
     partidas.sheet_view.showGridLines = True
     partidas.column_dimensions["B"].width = 25
     partidas.column_dimensions["C"].width = 55
@@ -6092,14 +4745,34 @@ def crear_excel_formato_cliente(
         row += 1
 
     last_item_row = row - 1
-    if last_item_row >= 2:
-        resumen["B7"] = f"=SUM(Partidas!I2:I{last_item_row})"
-    else:
-        resumen["B7"] = 0
-    resumen["B8"] = 0
-    resumen["B9"] = 0
-    resumen["B10"] = f"=(B7+B8-B9)*{iva_pct / 100.0:.6f}"
-    resumen["B11"] = "=B7+B8-B9+B10"
+    subtotal_row = row + 1
+    totals = [
+        ("Subtotal", f"=SUM(I2:I{last_item_row})" if last_item_row >= 2 else 0),
+        ("IVA", f"=I{subtotal_row}*{iva_pct / 100.0:.6f}"),
+        ("Total", f"=I{subtotal_row}+I{subtotal_row + 1}"),
+    ]
+    for offset, (label, formula) in enumerate(totals):
+        rr = subtotal_row + offset
+        partidas.cell(rr, 8, label).font = _CLIENTE_HEADER_FONT
+        partidas.cell(rr, 8).fill = _CLIENTE_HEADER_FILL
+        partidas.cell(rr, 9, formula).number_format = '$#,##0.00'
+        partidas.cell(rr, 9).font = Font(bold=True)
+    for col in ('H', 'I'):
+        partidas.column_dimensions[col].width = 20
+    partidas.column_dimensions['D'].width = 65
+    for rr in range(2, last_item_row + 1):
+        partidas.cell(rr, 4).alignment = Alignment(wrap_text=True, vertical='top')
+        partidas.cell(rr, 10, iva_pct)
+        partidas.cell(rr, 8).number_format = '$#,##0.00'
+        partidas.cell(rr, 9).number_format = '$#,##0.00'
+    partidas.freeze_panes = 'E2'
+    partidas.sheet_properties.pageSetUpPr.fitToPage = True
+    partidas.page_setup.orientation = 'landscape'
+    partidas.page_setup.fitToWidth = 1
+    partidas.page_setup.fitToHeight = 0
+    partidas.print_options.horizontalCentered = True
+    partidas.print_title_rows = '1:1'
+    partidas.oddHeader.center.text = f"{project_data.get('name', '')} | {project_code} | V{version:02d}"
 
     out = BytesIO()
     wb.save(out)
@@ -6109,8 +4782,7 @@ def crear_excel_formato_cliente(
 def empaquetar_excels_zip(
     excel_interno: bytes, excel_cliente: bytes, project_code: str, version: int
 ) -> bytes:
-    """Empaqueta el Excel interno (negociación) y el Excel cliente (Resumen +
-    Partidas) en un único .zip para que ambos se descarguen de una sola vez."""
+    """Empaqueta el Excel interno (negociación) y el Excel cliente (Partidas) en un único .zip para que ambos se descarguen de una sola vez."""
     buf = BytesIO()
     tag = f"{project_code}-V{version:02d}"
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -7391,7 +6063,7 @@ if section == "Catálogo e historial":
 def firma_generacion(project_data: dict, params: dict, model_name: str) -> str:
     """Firma estable para saber si un checkpoint corresponde a los mismos datos."""
     payload = {
-        "engine_version": DATABASE_CACHE_VERSION,
+        "engine_version": DATABASE_CACHE_VERSION + "-compact-prices-v1",
         "project_data": project_data,
         "params": params,
         "model_name": model_name or "",
@@ -7800,24 +6472,15 @@ if "generated" not in st.session_state:
             # ETAPA 1 -------------------------------------------------------
             if stage >= 1 and checkpoint_result:
                 result = PresupuestoIA.model_validate(checkpoint_result)
-                ui_progress(25, "1/6 · Recuperando estructura ya generada")
+                ui_progress(25, "1/3 · Recuperando estructura ya generada")
             else:
                 ui_progress(3, "Validando datos y preparando el proyecto")
-                ui_progress(4, "1/6 · Interpretando áreas, necesidades y trabajos implícitos")
-                scope_map = analizar_documento_necesidades_ia(
-                    api_key=api_key,
-                    model_name=model_name,
-                    project_data=project_data,
-                    params=params,
-                    progress_callback=lambda _pct, msg: ui_progress(6, msg),
-                )
-                ui_progress(8, "1/6 · Mapa de necesidades listo; convirtiéndolo en partidas")
+                ui_progress(4, "1/3 · Interpretando alcance y generando partidas")
                 result = generar_presupuesto_ia(
                     api_key=api_key,
                     model_name=model_name,
                     project_data=project_data,
                     params=params,
-                    scope_map=scope_map,
                     progress_callback=lambda _pct, msg: ui_progress(12, msg),
                 )
                 guardar_checkpoint_generacion(
@@ -7825,7 +6488,7 @@ if "generated" not in st.session_state:
                     status="completada",
                     input_signature=input_signature,
                     result=result,
-                    mensaje="Mapa de necesidades interpretado y estructura base generada.",
+                    mensaje="Partidas y alcance generados en una sola lectura.",
                 )
                 stage = 1
 
@@ -7833,16 +6496,11 @@ if "generated" not in st.session_state:
             checkpoint = st.session_state.get("generation_checkpoint") or {}
             if stage >= 2 and checkpoint.get("result"):
                 result = PresupuestoIA.model_validate(checkpoint["result"])
-                ui_progress(45, "2/6 · Recuperando auditoría de partidas")
+                ui_progress(45, "1/3 · Recuperando partidas preparadas")
             else:
-                ui_progress(38, "2/6 · Revisando partidas, subpartidas y secuencia de obra")
-                result = auditar_estructura_presupuesto_ia(
-                    api_key=api_key,
-                    model_name=model_name,
-                    project_data=project_data,
-                    result=result,
-                    progress_callback=lambda _pct, msg: ui_progress(40, msg),
-                )
+                ui_progress(38, "1/3 · Preparando clasificación de partidas")
+                # La clasificación y la secuencia se normalizan en Python.
+                # No se realiza otra llamada a Gemini para auditar las partidas.
                 guardar_checkpoint_generacion(
                     stage=2,
                     status="completada",
@@ -7857,9 +6515,9 @@ if "generated" not in st.session_state:
             checkpoint_items = checkpoint.get("items")
             if stage >= 3 and checkpoint_items:
                 items = checkpoint_items
-                ui_progress(78, "3/6 · Recuperando costeo ya completado")
+                ui_progress(78, "2/3 · Recuperando precios ya revisados")
             else:
-                ui_progress(52, "3/6 · Buscando precios históricos internos")
+                ui_progress(52, "2/3 · Buscando precios históricos internos")
                 # Dejamos explícito que estamos trabajando en esta etapa antes de
                 # entrar a Gemini. Si la etapa 3 falla, las etapas 1 y 2 siguen
                 # guardadas y la siguiente corrida comenzará aquí.
@@ -7889,7 +6547,7 @@ if "generated" not in st.session_state:
                 stage = 3
 
             # ETAPA 4 -------------------------------------------------------
-            ui_progress(93, "Calculando importes y preparando el Excel")
+            ui_progress(93, "3/3 · Calculando importes y preparando los dos Excel")
             items = asignar_codigos_jerarquicos(items)
             financials = calcular_financieros(items, params)
             provisional_code = db.next_project_code(
@@ -8064,9 +6722,8 @@ else:
         use_container_width=True,
     )
     st.caption(
-        "El .zip incluye los dos archivos: el Excel interno de negociación "
-        "(01 Presupuesto / 02 Control Interno / 03 Trazabilidad / 04 Costos "
-        "por Área) y el Excel formato cliente (Resumen + Partidas)."
+        "El .zip incluye el Excel interno (01 Presupuesto) y el Excel cliente "
+        "(Partidas con subtotal, IVA y total). Cada archivo contiene una sola hoja."
     )
 
     # -----------------------------------------------------
