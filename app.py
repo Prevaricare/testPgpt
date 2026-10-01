@@ -3,6 +3,7 @@ import ast
 import base64
 import math
 import operator
+import time
 from copy import copy
 import re
 import json
@@ -933,6 +934,7 @@ class Database:
             "labor_share_pct",
             "other_share_pct",
             "waste_reference_pct",
+            "unit_price_breakdown",
         }
         if table not in allowed_tables or column not in allowed_columns:
             raise ValueError("Migración de columna no permitida.")
@@ -1135,6 +1137,7 @@ class Database:
         self._ensure_column("budget_items", "labor_share_pct", "REAL")
         self._ensure_column("budget_items", "other_share_pct", "REAL")
         self._ensure_column("budget_items", "waste_reference_pct", "REAL")
+        self._ensure_column("budget_items", "unit_price_breakdown", "TEXT")
 
     def stats(self) -> dict:
         return {
@@ -1587,8 +1590,8 @@ class Database:
                     sale_margin_pct, benefit_amount, price_source,
                     price_source_detail, price_confidence,
                     material_share_pct, labor_share_pct, other_share_pct, waste_reference_pct,
-                    quantity_criterion, inclusion_basis, considerations, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    quantity_criterion, inclusion_basis, considerations, created_at, unit_price_breakdown
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -1620,6 +1623,7 @@ class Database:
                     item["inclusion_basis"],
                     item["considerations"],
                     created,
+                    json.dumps(desglose_vigente(item), ensure_ascii=False),
                 ),
             )
 
@@ -1758,8 +1762,8 @@ class Database:
                     sale_margin_pct, benefit_amount, price_source,
                     price_source_detail, price_confidence,
                     material_share_pct, labor_share_pct, other_share_pct, waste_reference_pct,
-                    quantity_criterion, inclusion_basis, considerations, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    quantity_criterion, inclusion_basis, considerations, created_at, unit_price_breakdown
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -1791,6 +1795,7 @@ class Database:
                     item["inclusion_basis"],
                     item["considerations"],
                     created,
+                    json.dumps(desglose_vigente(item), ensure_ascii=False),
                 ),
             )
 
@@ -2081,7 +2086,7 @@ class Database:
         )
 
     def list_budget_items(self, budget_id: str) -> list[dict]:
-        return self.fetchall(
+        rows = self.fetchall(
             """
             SELECT * FROM budget_items
             WHERE budget_id = ?
@@ -2089,6 +2094,15 @@ class Database:
             """,
             (budget_id,),
         )
+
+        for row in rows:
+            raw = row.get('unit_price_breakdown')
+            if isinstance(raw, str):
+                try:
+                    row['unit_price_breakdown'] = json.loads(raw)
+                except (ValueError, TypeError):
+                    row['unit_price_breakdown'] = {}
+        return rows
 
     def delete_budget(self, budget_id: str):
         budget = self.fetchone("SELECT project_id FROM budgets WHERE id = ?", (budget_id,))
@@ -2106,7 +2120,7 @@ class Database:
         return self.fetchall(f"SELECT * FROM {table_name}")
 
 
-DATABASE_CACHE_VERSION = "2026-08-21-v11.2-importe-editable"
+DATABASE_CACHE_VERSION = "2026-10-01-v12-desglose"
 
 
 @st.cache_resource(show_spinner=False)
@@ -2230,6 +2244,173 @@ class RevisionPresupuestoIA(BaseModel):
 
 def get_api_key() -> str | None:
     return get_secret("GEMINI_API_KEY")
+
+
+class ComponentePrecioIA(BaseModel):
+    concepto: str = Field(description='Material, herraje, acabado, mano de obra, equipo o servicio concreto')
+    porcentaje: float = Field(ge=0, le=100, description='Participación estimada dentro del costo directo unitario')
+    considerar: str = Field(description='Especificación o supuesto breve: capas, espesor, calidad, instalación, etc.')
+
+
+class DesgloseConceptoIA(BaseModel):
+    codigo: str
+    componentes: list[ComponentePrecioIA]
+
+
+class DesglosePreciosIA(BaseModel):
+    precios: list[DesgloseConceptoIA]
+
+
+def es_error_503(exc):
+    code = getattr(exc, 'code', None) or getattr(exc, 'status_code', None)
+    if code is not None:
+        return str(code) == '503'
+    return bool(re.search(r'\b503\b', str(exc)))
+
+
+def llamar_gemini_con_reintentos(client, *, model, contents, config, notify=None, sleep_fn=None):
+    """Una llamada inicial y hasta diez reintentos, exclusivamente para HTTP 503."""
+    sleep_fn = sleep_fn or time.sleep
+    status = None if notify else st.empty()
+    notify = notify or status.info
+    try:
+        for attempt in range(11):
+            notify(f'{model} · llamada {attempt+1}/11 · esperando respuesta de Gemini…')
+            try:
+                return client.models.generate_content(model=model, contents=contents, config=config)
+            except Exception as exc:
+                if not es_error_503(exc) or attempt == 10:
+                    raise
+                delay = min(5 * 2**attempt, 30)
+                notify(f'{model} · error 503 · reintento {attempt+1}/10 en {delay} s. {str(exc)[:450]}')
+                sleep_fn(delay)
+    finally:
+        if status is not None:
+            status.empty()
+
+
+def firma_desglose(item):
+    return [descripcion_excel_item(item), item['unit'], float(item['unit_cost'])]
+
+
+def desglose_vigente(item):
+    value = item.get('unit_price_breakdown') or {}
+    return value if isinstance(value, dict) and value.get('firma') == firma_desglose(item) else {}
+
+
+def generar_desglose_precios(api_key, items, project_data, notify=None):
+    """Anexo orientativo; nunca recalcula ni sustituye los precios del presupuesto."""
+    client = genai.Client(api_key=api_key)
+    revised = [dict(item) for item in items]
+    errors = []
+    for start in range(0, len(revised), 5):
+        batch = revised[start:start+5]
+        try:
+            compact = [dict(codigo=x['code'], descripcion=x['description'], unidad=x['unit'],
+                            costo_directo_unitario=x['unit_cost']) for x in batch]
+            prompt = (
+                'Desglosa orientativamente el COSTO DIRECTO por UNA unidad de cada concepto en MXN. '
+                'El costo ya está fijado: NO propongas precios nuevos, no cambies alcance ni cantidades. '
+                'Devuelve de 3 a 8 componentes pertinentes y concretos con porcentajes que sumen 100 por código. '
+                'Distingue materiales, herrajes, consumibles, preparación, capas de pintura, acabados, '
+                'mano de obra de instalación y equipo/transporte cuando correspondan. '
+                'En considerar indica especificaciones y supuestos breves, señalando lo no definido; '
+                'no inventes marcas ni cantidades exactas. Para servicios usa componentes del servicio. '
+                'No añadas desperdicio, IVA, indirectos, utilidad ni la marca de plataforma. '
+                'Es una distribución estimada, sin cotización ni búsqueda de mercado. '
+                f'Nivel: {project_data.get("budget_level", "Medio")}. '
+                + json.dumps(compact, ensure_ascii=False, separators=(',', ':'))
+            )
+            response = llamar_gemini_con_reintentos(client, model='gemini-3.5-flash-lite',
+                contents=prompt, config=types.GenerateContentConfig(
+                    response_mime_type='application/json', response_schema=DesglosePreciosIA), notify=notify)
+            result = DesglosePreciosIA.model_validate_json(response.text or '')
+            by_code = {}
+            for price in result.precios:
+                if price.codigo in by_code:
+                    raise ValueError(f'Código duplicado en el desglose: {price.codigo}')
+                by_code[price.codigo] = price
+            if set(by_code) != {str(x['code']) for x in batch}:
+                raise ValueError('El desglose no corresponde a todos los códigos del lote.')
+            pending = []
+            for item in batch:
+                components = by_code[str(item['code'])].componentes
+                total = sum(c.porcentaje for c in components)
+                if not components or not math.isfinite(total) or total <= 0:
+                    raise ValueError(f'Desglose inválido para {item["code"]}.')
+                pending.append(dict(firma=firma_desglose(item), modelo='gemini-3.5-flash-lite',
+                    componentes=[dict(concepto=c.concepto, porcentaje=c.porcentaje/total*100,
+                                     considerar=c.considerar) for c in components]))
+            for item, breakdown in zip(batch, pending):
+                item['unit_price_breakdown'] = breakdown
+        except Exception as exc:
+            errors.append(f'Desglose lote {start//5+1}: {type(exc).__name__}: {str(exc)[:700]}')
+    return revised, errors
+
+
+def filas_desglose_precio(item):
+    value = desglose_vigente(item)
+    if not value:
+        return []
+    cents = round(float(item['unit_cost'])*100)
+    components = value['componentes']
+    allocations = [int(cents*c['porcentaje']/100) for c in components]
+    # Reparte centavos por mayor residuo, manteniendo la suma exacta del costo.
+    order = sorted(range(len(components)),
+                   key=lambda i: cents*components[i]['porcentaje']/100-allocations[i], reverse=True)
+    for i in order[:cents-sum(allocations)]:
+        allocations[i] += 1
+    rows = [dict(Componente=c['concepto'], **{'Importe por unidad (MXN)':a/100,
+            'Considerar':c['considerar']}) for c, a in zip(components, allocations)]
+    indirect = round(float(item['unit_indirect'])*100)
+    profit = round(float(item['unit_profit'])*100)
+    sale = round(float(item['unit_sale'])*100)
+    for title, amount in [('Indirectos', indirect), ('Utilidad', profit),
+                          ('Ajuste comercial / redondeo', sale-cents-indirect-profit)]:
+        if amount:
+            rows.append(dict(Componente=title, **{'Importe por unidad (MXN)':amount/100,
+                        'Considerar':'Importe del presupuesto; calculado por Python.'}))
+    return rows
+
+
+def agregar_hoja_desglose(wb, items):
+    if not any(desglose_vigente(x) for x in items):
+        return
+    ws = wb.create_sheet('04 Desglose orientativo')
+    ws.append(['DESGLOSE ORIENTATIVO DEL PRECIO UNITARIO'])
+    ws.merge_cells('A1:F1')
+    ws.append(['Estimación de Flash Lite: confirmar con el subcontratista. No altera precios; sin IVA ni marca del 30%.'])
+    ws.merge_cells('A2:F2')
+    ws.append(['Código', 'Concepto / unidad', 'Componente', 'Importe por unidad (MXN)', '% del P.U.', 'Considerar'])
+    for item in estructura_partidas_excel(items):
+        rows = filas_desglose_precio(item)
+        if not rows:
+            ws.append([item['code'], f'{titulo_comercial_item(item)} / {item["unit"]}',
+                       'Desglose pendiente', None, None, 'No se recibió un desglose válido.'])
+            continue
+        for entry in rows:
+            amount = entry['Importe por unidad (MXN)']
+            ws.append([item['code'], f'{titulo_comercial_item(item)} / {item["unit"]}', entry['Componente'],
+                       amount, amount/item['unit_sale'] if item['unit_sale'] else 0, entry['Considerar']])
+        ws.append([item['code'], None, 'TOTAL PRECIO UNITARIO', round(item['unit_sale'], 2),
+                   1 if item['unit_sale'] else 0, None])
+    for row in ws:
+        for cell in row:
+            cell.alignment = Alignment(vertical='top', wrap_text=True)
+        if row[0].row in (1, 3):
+            for cell in row:
+                cell.font = Font(bold=True, color='FFFFFF')
+                cell.fill = PatternFill('solid', fgColor='4A3328')
+        elif row[2].value == 'TOTAL PRECIO UNITARIO':
+            for cell in row:
+                cell.font = Font(bold=True)
+                cell.fill = PatternFill('solid', fgColor='EEE7E2')
+        row[3].number_format = '$#,##0.00'
+        row[4].number_format = '0.00%'
+        ws.row_dimensions[row[0].row].height = 42 if row[0].row > 3 else 30
+    for col, width in zip('ABCDEF', [18, 38, 35, 25, 16, 75]):
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = 'D4'
 
 
 def generar_presupuesto_ia(
@@ -2380,7 +2561,8 @@ CONTROL DE CALIDAD
     last_error = None
     for model in modelos:
         try:
-            response = client.models.generate_content(
+            response = llamar_gemini_con_reintentos(
+                client,
                 model=model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -2520,7 +2702,8 @@ INSTRUCCIONES
     last_error = None
     for model in modelos:
         try:
-            response = client.models.generate_content(
+            response = llamar_gemini_con_reintentos(
+                client,
                 model=model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -3433,6 +3616,7 @@ def crear_excel(
     for col, width in enumerate(trace_widths, 1):
         wt.column_dimensions[get_column_letter(col)].width = width
 
+    agregar_hoja_desglose(wb, ordered_items)
     guardar_metadata_excel(wb, project_code, project_data, ordered_items, params, version, 'revision')
     out = BytesIO()
     wb.save(out)
@@ -5178,6 +5362,7 @@ if "generated" not in st.session_state:
                 if not items:
                     raise RuntimeError("La IA no generó actividades utilizables.")
 
+                items, breakdown_errors = generar_desglose_precios(api_key, items, project_data)
                 financials = calcular_financieros(items, params)
                 provisional_code = db.next_project_code(
                     project_data["name"],
@@ -5207,6 +5392,7 @@ if "generated" not in st.session_state:
                     "excel_bytes": excel_bytes,
                     "revision_history": [],
                     "pending_revision_notes": [],
+                    "breakdown_errors": breakdown_errors,
                 }
                 st.rerun()
             except Exception as exc:
@@ -5328,6 +5514,33 @@ else:
     )
     st.caption('Revisión sin IVA. Plataforma: marca fija del 30% y resumen con IVA del 16%, según la plantilla.')
 
+    with st.expander('Desglose orientativo de precios unitarios'):
+        st.caption('Distribución estimada por Flash Lite 3.5. Confirma materiales, herrajes, capas, acabados y mano de obra con el subcontratista. Los importes suman el precio de revisión; no incluyen la marca del 30%.')
+        for error in g.get('breakdown_errors') or []:
+            st.warning(error)
+        for item in estructura_partidas_excel(items):
+            entries = filas_desglose_precio(item)
+            st.markdown(f"**{item['code']} · {titulo_comercial_item(item)} · {formato_moneda(item['unit_sale'])} / {item['unit']}**")
+            if entries:
+                st.dataframe(pd.DataFrame(entries),hide_index=True,use_container_width=True,
+                    column_config={'Importe por unidad (MXN)':st.column_config.NumberColumn(format='$ %.2f')})
+            else:
+                st.caption('Desglose pendiente para este concepto.')
+        if st.button('Generar / actualizar desglose con Flash Lite 3.5',use_container_width=True):
+            api_key=get_api_key_runtime()
+            if not api_key:
+                st.error('Falta GEMINI_API_KEY en Streamlit Secrets.')
+            else:
+                with st.spinner('Desglosando precios sin cambiar el presupuesto…'):
+                    revised, errors=generar_desglose_precios(api_key,items,g['project_data'])
+                if g.get('project_id') and not g.get('pending_revision'):
+                    g['version']=version+1
+                    g['pending_revision']=True
+                g.update(items=revised,saved=False,breakdown_errors=errors,
+                    excel_bytes=crear_excel(g['project_code'],g['project_data'],result,revised,g['params'],g['version']))
+                st.session_state['generated']=g
+                st.rerun()
+
     st.divider()
     st.subheader('Editar presupuesto sin IA')
     st.caption('Edita partidas, descripciones, cantidades y precios unitarios de revisión. La marca del 30% se aplica únicamente al exportar para plataforma.')
@@ -5402,6 +5615,7 @@ else:
                             project_data=g["project_data"],
                             params=g["params"],
                         )
+                        revised_items, breakdown_errors = generar_desglose_precios(api_key, revised_items, g['project_data'])
                         revised_financials = calcular_financieros(
                             revised_items,
                             g["params"],
@@ -5448,6 +5662,7 @@ else:
                                 "excel_bytes": excel_bytes,
                                 "revision_history": history,
                                 "pending_revision_notes": pending_notes,
+                                "breakdown_errors": breakdown_errors,
                             }
                         )
                         st.session_state["generated"] = g
