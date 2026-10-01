@@ -2128,7 +2128,9 @@ class CosteoPresupuestoIA(BaseModel):
 
 class PrecioCompactoIA(BaseModel):
     codigo: str
-    costo_unitario: float = Field(gt=0, description="MXN sin IVA por unidad comercial; solo para conceptos simples")
+    # El Schema del SDK no admite exclusiveMinimum, generado por gt=0.
+    # El costo definitivo se valida como positivo en resolver_items.
+    costo_unitario: float = Field(ge=0, description="MXN sin IVA por unidad comercial; solo para conceptos simples")
     confianza: str
     requiere_cotizacion: bool
     fundamento: str = Field(description="Base del precio y supuestos; breve")
