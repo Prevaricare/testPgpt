@@ -1,4 +1,9 @@
 import os
+import ast
+import base64
+import math
+import operator
+from copy import copy
 import re
 import json
 import sqlite3
@@ -19,9 +24,10 @@ from pypdf import PdfReader
 import streamlit as st
 from google import genai
 from google.genai import types
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.packaging.custom import StringProperty
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, range_boundaries
 from pydantic import BaseModel, Field
 
 try:
@@ -416,7 +422,7 @@ def aplicar_composicion_costo(item: dict) -> dict:
         out.get("labor_share_pct", 0.0),
         out.get("other_share_pct", 0.0),
     )
-    waste_pct = max(float(out.get("waste_reference_pct", 0.0) or 0.0), 0.0)
+    waste_pct = 0.0
     unit_cost = max(float(out.get("unit_cost", 0.0) or 0.0), 0.0)
 
     out["material_share_pct"] = material_pct
@@ -2276,8 +2282,6 @@ CONSIDERACIONES GENERALES DEL PROYECTO
 PARÁMETROS COMERCIALES
 Indirectos: {params['indirect_pct']:.2f}%
 Utilidad: {params['profit_pct']:.2f}%
-IVA: {params['iva_pct']:.2f}%
-Desperdicio general de referencia: {params['waste_pct']:.2f}%
 
 REVISIÓN DEL ALCANCE
 1. Antes de generar conceptos, revisa el proyecto completo y detecta:
@@ -3024,7 +3028,7 @@ def calcular_financieros(items: list[dict], params: dict) -> dict:
     indirect_cost = direct_cost * params["indirect_pct"] / 100.0
     profit = (direct_cost + indirect_cost) * params["profit_pct"] / 100.0
     sale_before_tax = direct_cost + indirect_cost + profit
-    iva_amount = sale_before_tax * params["iva_pct"] / 100.0
+    iva_amount = 0.0
     total = sale_before_tax + iva_amount
 
     return {
@@ -3154,14 +3158,6 @@ def crear_excel(
     ws.cell(summary_row, 7).fill = PatternFill("solid", fgColor=gray)
     summary_row += 1
 
-    iva_summary_row = summary_row
-    ws.merge_cells(
-        start_row=summary_row, start_column=1, end_row=summary_row, end_column=6
-    )
-    ws.cell(summary_row, 1, f"IVA {params['iva_pct']:.0f}%")
-    ws.cell(summary_row, 1).font = Font(bold=True)
-    summary_row += 1
-
     total_summary_row = summary_row
     ws.merge_cells(
         start_row=summary_row, start_column=1, end_row=summary_row, end_column=6
@@ -3264,22 +3260,13 @@ def crear_excel(
     ws.cell(row, 7).font = Font(bold=True)
 
     row += 1
-    iva_detail_row = row
-    ws.merge_cells(
-        start_row=row, start_column=1, end_row=row, end_column=6
-    )
-    ws.cell(row, 1, f"IVA {params['iva_pct']:.0f}%")
-    ws.cell(row, 7, f"=G{subtotal_detail_row}*'02 Control Interno'!$B$5")
-    ws.cell(row, 7).number_format = '$#,##0.00'
-
-    row += 1
     total_detail_row = row
     ws.merge_cells(
         start_row=row, start_column=1, end_row=row, end_column=6
     )
     ws.cell(row, 1, "Gran Total (MXN)")
     ws.cell(row, 1).font = Font(size=11, bold=True, color=brown)
-    ws.cell(row, 7, f"=G{subtotal_detail_row}+G{iva_detail_row}")
+    ws.cell(row, 7, f"=G{subtotal_detail_row}")
     ws.cell(row, 7).number_format = '$#,##0.00'
     ws.cell(row, 7).font = Font(size=11, bold=True, color=brown)
 
@@ -3298,8 +3285,6 @@ def crear_excel(
 
     ws.cell(subtotal_summary_row, 7, f"=G{subtotal_detail_row}")
     ws.cell(subtotal_summary_row, 7).number_format = '$#,##0.00'
-    ws.cell(iva_summary_row, 7, f"=G{iva_detail_row}")
-    ws.cell(iva_summary_row, 7).number_format = '$#,##0.00'
     ws.cell(total_summary_row, 7, f"=G{total_detail_row}")
     ws.cell(total_summary_row, 7).number_format = '$#,##0.00'
 
@@ -3328,7 +3313,7 @@ def crear_excel(
     wc = wb.create_sheet("02 Control Interno")
     wc.sheet_view.showGridLines = False
 
-    wc.merge_cells("A1:V1")
+    wc.merge_cells("A1:T1")
     wc["A1"] = "CONTROL INTERNO DEL PRESUPUESTO"
     wc["A1"].font = Font(size=15, bold=True, color=white)
     wc["A1"].fill = PatternFill("solid", fgColor=internal_blue)
@@ -3343,38 +3328,17 @@ def crear_excel(
     wc["B3"] = params["indirect_pct"] / 100.0
     wc["A4"] = "Utilidad"
     wc["B4"] = params["profit_pct"] / 100.0
-    wc["A5"] = "IVA"
-    wc["B5"] = params["iva_pct"] / 100.0
-    wc["A6"] = "Desperdicio general de referencia"
-    wc["B6"] = params["waste_pct"] / 100.0
     wc["A7"] = "Nivel de presupuesto"
     wc["B7"] = project_data.get("budget_level", "Medio-alto")
     for rr in range(3, 7):
         wc.cell(rr, 2).number_format = "0.00%"
 
     headers = [
-        "Partida",
-        "Subpartida",
-        "Código",
-        "Título comercial",
-        "Descripción",
-        "Unidad",
-        "Cantidad",
-        "Costo base unit.",
-        "Materiales est. unit.",
-        "M.O. est. unit.",
-        "Otros / integrado est. unit.",
-        "Desperdicio materiales ref. %",
-        "Desperdicio ref. unit. (no aditivo)",
-        "Costo directo",
-        "Indirecto unit.",
-        "Utilidad unit.",
-        "P.U. venta calculado",
-        "P.U. comercial",
-        "Importe comercial",
-        "Beneficio",
-        "Margen venta",
-        "Dif. P.U. vs calculado",
+        "Partida", "Subpartida", "Código", "Título comercial", "Descripción", "Unidad",
+        "Cantidad", "Costo base unit.", "Materiales est. unit.", "M.O. est. unit.",
+        "Otros / integrado est. unit.", "Costo directo", "Indirecto unit.", "Utilidad unit.",
+        "P.U. venta calculado", "P.U. comercial", "Importe comercial", "Beneficio",
+        "Margen venta", "Dif. P.U. vs calculado",
     ]
     header_row = 8
     for col, header in enumerate(headers, 1):
@@ -3382,74 +3346,27 @@ def crear_excel(
         c.font = Font(bold=True, color=white)
         c.fill = PatternFill("solid", fgColor=internal_blue)
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
     for idx, item in enumerate(ordered_items, start=header_row + 1):
-        commercial_row = commercial_row_map.get(item["code"])
-        values = [
-            item.get("partida_excel") or nombre_partida_excel(item.get("category")),
-            item.get("subpartida_excel") or nombre_subpartida_excel(item),
-            item["code"],
-            titulo_comercial_item(item),
-            item["description"],
-            item["unit"],
-        ]
-        for col, val in enumerate(values, 1):
-            wc.cell(idx, col, val)
-
-        # Hoja principal:
-        # E = Cantidad editable
-        # G = Importe Total comercial editable
-        # F = Precio Unitario calculado automáticamente como G / E
-        if commercial_row:
-            wc.cell(idx, 7, f"='01 Presupuesto'!E{commercial_row}")
-        else:
-            wc.cell(idx, 7, float(item["quantity"]))
-
-        wc.cell(idx, 8, float(item["unit_cost"]))
-        wc.cell(idx, 9, float(item.get("material_unit_est", 0.0)))
-        wc.cell(idx, 10, float(item.get("labor_unit_est", 0.0)))
-        wc.cell(idx, 11, float(item.get("other_unit_est", item["unit_cost"])))
-        wc.cell(idx, 12, float(item.get("waste_reference_pct", 0.0)) / 100.0)
-        wc.cell(idx, 13, float(item.get("waste_reference_unit", 0.0)))
-
-        wc.cell(idx, 14, f"=G{idx}*H{idx}")
-        wc.cell(idx, 15, f"=H{idx}*$B$3")
-        wc.cell(idx, 16, f"=(H{idx}+O{idx})*$B$4")
-        wc.cell(idx, 17, f"=H{idx}+O{idx}+P{idx}")
-
-        if commercial_row:
-            wc.cell(idx, 18, f"='01 Presupuesto'!F{commercial_row}")
-            wc.cell(idx, 19, f"='01 Presupuesto'!G{commercial_row}")
-        else:
-            wc.cell(idx, 18, float(item["unit_sale"]))
-            wc.cell(idx, 19, float(item["sale_amount"]))
-
-        wc.cell(idx, 20, f"=S{idx}-N{idx}")
-        wc.cell(idx, 21, f'=IF(S{idx}=0,0,T{idx}/S{idx})')
-
-        # Diferencia entre el P.U. comercial vigente en 01 Presupuesto
-        # y el P.U. original calculado internamente.
-        wc.cell(idx, 22, f"=R{idx}-Q{idx}")
-
-        wc.cell(idx, 7).number_format = "0.00"
-        for col in [8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 22]:
-            wc.cell(idx, col).number_format = '$#,##0.00'
-        wc.cell(idx, 12).number_format = "0.00%"
-        wc.cell(idx, 21).number_format = "0.00%"
-
-        for col in range(1, 23):
-            wc.cell(idx, col).alignment = Alignment(
-                vertical="top",
-                wrap_text=col in {1, 2, 4, 5},
-            )
-            wc.cell(idx, col).border = Border(bottom=thin_gray)
-
-    widths = [
-        29, 20, 14, 30, 58, 10, 11, 17, 18, 18, 21,
-        20, 23, 17, 17, 17, 19, 18, 18, 18, 15, 19,
-    ]
-    for col, width in enumerate(widths, 1):
-        wc.column_dimensions[get_column_letter(col)].width = width
+        commercial_row = commercial_row_map[item['code']]
+        values = [item.get('partida_excel'), item.get('subpartida_excel'), item['code'],
+            titulo_comercial_item(item), item['description'], item['unit'],
+            f"='01 Presupuesto'!E{commercial_row}", float(item['unit_cost']),
+            float(item.get('material_unit_est',0)),float(item.get('labor_unit_est',0)),
+            float(item.get('other_unit_est',item['unit_cost'])),
+            f'=G{idx}*H{idx}',f'=H{idx}*$B$3',f'=(H{idx}+M{idx})*$B$4',
+            f'=H{idx}+M{idx}+N{idx}',f"='01 Presupuesto'!F{commercial_row}",
+            f"='01 Presupuesto'!G{commercial_row}",f'=Q{idx}-L{idx}',
+            f'=IF(Q{idx}=0,0,R{idx}/Q{idx})',f'=P{idx}-O{idx}']
+        for col, value in enumerate(values,1):
+            c=wc.cell(idx,col,value)
+            c.alignment=Alignment(vertical='top',wrap_text=col in {1,2,4,5})
+            c.border=Border(bottom=thin_gray)
+            if col>=8:
+                c.number_format='0.00%' if col==19 else '$#,##0.00'
+        wc.cell(idx,7).number_format='0.00'
+    widths=[29,20,14,30,58,10,11,17,18,18,21,17,17,17,19,18,18,18,15,19]
+    for col,width in enumerate(widths,1):
+        wc.column_dimensions[get_column_letter(col)].width=width
 
     # -----------------------------------------------------
     # 03 TRAZABILIDAD
@@ -3516,10 +3433,329 @@ def crear_excel(
     for col, width in enumerate(trace_widths, 1):
         wt.column_dimensions[get_column_letter(col)].width = width
 
+    guardar_metadata_excel(wb, project_code, project_data, ordered_items, params, version, 'revision')
     out = BytesIO()
     wb.save(out)
     out.seek(0)
     return out.getvalue()
+
+
+# =========================================================
+# EXCEL DE PLATAFORMA E IMPORTACIÓN / EDICIÓN MANUAL
+# =========================================================
+
+MARCA_PLATAFORMA_PCT = 30.0
+IVA_PLATAFORMA_PCT = 16.0
+PLANTILLA_PLATAFORMA_B64 = "UEsDBBQAAAAIAB2/Pl1Gx01IlQAAAM0AAAAQAAAAZG9jUHJvcHMvYXBwLnhtbE3PTQvCMAwG4L9SdreZih6kDkQ9ip68zy51hbYpbYT67+0EP255ecgboi6JIia2mEXxLuRtMzLHDUDWI/o+y8qhiqHke64x3YGMsRoPpB8eA8OibdeAhTEMOMzit7Dp1C5GZ3XPlkJ3sjpRJsPiWDQ6sScfq9wcChDneiU+ixNLOZcrBf+LU8sVU57mym/8ZAW/B7oXUEsDBBQAAAAIAB2/Pl0M/D19+wAAACsCAAARAAAAZG9jUHJvcHMvY29yZS54bWzFksFKxDAQhl9Fcm8naW1hQ7cXxZOCYEHxFpLZ3bBNG5KRdt/etu52Fb17zMyfb76BqbSXug/4HHqPgSzGm9G1XZTab9mByEuAqA/oVEynRDc1d31wiqZn2INX+qj2CBnnJTgkZRQpmIGJX4msroyWOqCiPpzxRq94/xHaBWY0YIsOO4ogUgGsnif609hWcAXMMMLg4lcBzUpcqn9ilw6wc3KMdk0Nw5AO+ZKbdhDw9vT4sqyb2C6S6jROv6KVdPK4ZZfJr/ndffPA6oxnZcI3SZY1nEtRyNv8fXb94XcVdr2xO/v/xoInXDS8kEUpi80344tgXcGvu6g/AVBLAwQUAAAACAAdvz5dmVycIxAGAACcJwAAEwAAAHhsL3RoZW1lL3RoZW1lMS54bWztWltz2jgUfu+v0Hhn9m0LxjaBtrQTc2l227SZhO1OH4URWI1seWSRhH+/RzYQy5YN7ZJNups8BCzp+85FR+foOHnz7i5i6IaIlPJ4YNkv29a7ty/e4FcyJBFBMBmnr/DACqVMXrVaaQDDOH3JExLD3IKLCEt4FMvWXOBbGi8j1uq0291WhGlsoRhHZGB9XixoQNBUUVpvXyC05R8z+BXLVI1lowETV0EmuYi08vlsxfza3j5lz+k6HTKBbjAbWCB/zm+n5E5aiOFUwsTAamc/VmvH0dJIgILJfZQFukn2o9MVCDINOzqdWM52fPbE7Z+Mytp0NG0a4OPxeDi2y9KLcBwE4FG7nsKd9Gy/pEEJtKNp0GTY9tqukaaqjVNP0/d93+ubaJwKjVtP02t33dOOicat0HgNvvFPh8Ouicar0HTraSYn/a5rpOkWaEJG4+t6EhW15UDTIABYcHbWzNIDll4p+nWUGtkdu91BXPBY7jmJEf7GxQTWadIZljRGcp2QBQ4AN8TRTFB8r0G2iuDCktJckNbPKbVQGgiayIH1R4Ihxdyv/fWXu8mkM3qdfTrOa5R/aasBp+27m8+T/HPo5J+nk9dNQs5wvCwJ8fsjW2GHJ247E3I6HGdCfM/29pGlJTLP7/kK6048Zx9WlrBdz8/knoxyI7vd9lh99k9HbiPXqcCzIteURiRFn8gtuuQROLVJDTITPwidhphqUBwCpAkxlqGG+LTGrBHgE323vgjI342I96tvmj1XoVhJ2oT4EEYa4pxz5nPRbPsHpUbR9lW83KOXWBUBlxjfNKo1LMXWeJXA8a2cPB0TEs2UCwZBhpckJhKpOX5NSBP+K6Xa/pzTQPCULyT6SpGPabMjp3QmzegzGsFGrxt1h2jSPHr+BfmcNQockRsdAmcbs0YhhGm78B6vJI6arcIRK0I+Yhk2GnK1FoG2camEYFoSxtF4TtK0EfxZrDWTPmDI7M2Rdc7WkQ4Rkl43Qj5izouQEb8ehjhKmu2icVgE/Z5ew0nB6ILLZv24fobVM2wsjvdH1BdK5A8mpz/pMjQHo5pZCb2EVmqfqoc0PqgeMgoF8bkePuV6eAo3lsa8UK6CewH/0do3wqv4gsA5fy59z6XvufQ9odK3NyN9Z8HTi1veRm5bxPuuMdrXNC4oY1dyzcjHVK+TKdg5n8Ds/Wg+nvHt+tkkhK+aWS0jFpBLgbNBJLj8i8rwKsQJ6GRbJQnLVNNlN4oSnkIbbulT9UqV1+WvuSi4PFvk6a+hdD4sz/k8X+e0zQszQ7dyS+q2lL61JjhK9LHMcE4eyww7ZzySHbZ3oB01+/ZdduQjpTBTl0O4GkK+A226ndw6OJ6YkbkK01KQb8P56cV4GuI52QS5fZhXbefY0dH758FRsKPvPJYdx4jyoiHuoYaYz8NDh3l7X5hnlcZQNBRtbKwkLEa3YLjX8SwU4GRgLaAHg69RAvJSVWAxW8YDK5CifEyMRehw55dcX+PRkuPbpmW1bq8pdxltIlI5wmmYE2eryt5lscFVHc9VW/Kwvmo9tBVOz/5ZrcifDBFOFgsSSGOUF6ZKovMZU77nK0nEVTi/RTO2EpcYvOPmx3FOU7gSdrYPAjK5uzmpemUxZ6by3y0MCSxbiFkS4k1d7dXnm5yueiJ2+pd3wWDy/XDJRw/lO+df9F1Drn723eP6bpM7SEycecURAXRFAiOVHAYWFzLkUO6SkAYTAc2UyUTwAoJkphyAmPoLvfIMuSkVzq0+OX9FLIOGTl7SJRIUirAMBSEXcuPv75Nqd4zX+iyBbYRUMmTVF8pDicE9M3JD2FQl867aJguF2+JUzbsaviZgS8N6bp0tJ//bXtQ9tBc9RvOjmeAes4dzm3q4wkWs/1jWHvky3zlw2zreA17mEyxDpH7BfYqKgBGrYr66r0/5JZw7tHvxgSCb/NbbpPbd4Ax81KtapWQrET9LB3wfkgZjjFv0NF+PFGKtprGtxtoxDHmAWPMMoWY434dFmhoz1YusOY0Kb0HVQOU/29QNaPYNNByRBV4xmbY2o+ROCjzc/u8NsMLEjuHti78BUEsDBBQAAAAIAB2/Pl1pV4Z2IQIAAKsGAAAYAAAAeGwvd29ya3NoZWV0cy9zaGVldDEueG1shZXbcpswEIZfheEBAsbnDPZMHDdtZnrwJD1cy7A2mkgslZaSvn0lgVVfYLgBSbv/frsSWtIG1ZsuACh4l6LUm7Agqu6jSGcFSKbvsILSWE6oJCMzVedIVwpY7kRSREkcLyLJeBluU7d2UNsUaxK8hIMKdC0lU393ILDZhJPwsvDCzwXZhWibVuwMr0A/qoMys8hHybmEUnMsAwWnTfgwud9NnMB5/OTQ6KtxoAtsPiqefzZk7Vi2uCPimzU/55swtjmCgIxsUGZef+ARhLCxTWa/O0zos7DC6/GF9+S2w5R3ZBoeUfziORWbcBUGOZxYLegFm0/QlTi38TIU2j2DpvVN4jDIak0oO7HJQPKyfbP3bmuuBLNbgqQTJC7vFuSy3DNi21RhEyjrbaLZgSvVqU1yvLTn9ErKWLnR0fYryqOCNCITy65EWafbtbrE6expW0tkontE4hHJIOJbhYrqkucs7+MkY5yp50wHOc/74KBA11UNZtv6UNMx1MyjZoOoh5pQ9RFmY4S5J8wHCR80sby3iPkYYuERi0HEE2QF6yO0svltwtITloOEkeNoxYvbnJXnrIY3650U032I1Rhi7RHrQcQedFZDSdiLWY9hJvH/+xgPf8Wy3bBeTqcdAl1d/OGb/x2JiV7I5CYkumo0to1/YerMSx0IOBnf+G5pPhrV9sF2Qli5DI5IppO5YWH+JqCsg7GfEOkyse3M/5+2/wBQSwMEFAAAAAgAHb8+XRZdsnPLBAAA/RsAABgAAAB4bC93b3Jrc2hlZXRzL3NoZWV0Mi54bWyNmV9vo0YUxb8Komofg+eav1nbUuNsSFatFO027TOBsY0WGAp4vfn2ZWDiJs4chpfYcDlnuMcX9AusTqL53h4476yfZVG1a/vQdfW147TpgZdJeyVqXvWVnWjKpOs3m73T1g1PskFUFg4tFr5TJnllb1bDvsdmsxLHrsgr/thY7bEsk+blhhfitLaZ/brja74/dHKHs1nVyZ5/491T/dj0W87ZJctLXrW5qKyG79b27+z6C/lSMBzxd85P7ZvvVnsQp7jJsz/6ldthLdncsxDfZfkhW9sLeY684GknTZP+4wff8qKQ3v2Z/auWsc9nIYVvv7+udzfE0bf3nLR8K4p/8qw7rO3QtjK+S45F91Wc7rlq0ZN+qSja4a91Go9lS9tKj20nSiXuz6DMq/Ez+amieSMgDwhICehC4CHBUgmWF4IICVwlcC8EbAEEnhJ4lwICAl8J/LkrBEoQXApcIAiVIJwriJQgmiuQ5zr+cothgsaffJiX26RLNqtGnKxGHt/7yS/D0A36fkzySl4x37qmr+a9rttsf/uF3OWnLN+LldP1hnK3kyrxjUGc1L18GXzqjoVOvp2WPyZNl2eJRng7LbzlbdrkdZqPJ19pHD5POzxl7ZVGdTet+iuvhfWU6ZTxtPLPpNlz3XneGxIWbcc1sgdDsg1Pc90v8mVa96v1UNZH3s9d+17s9GN1nq3++pL3HDpfNue70HnoaFjGHZaRN+3/J2qs0LvKO/fl6O4Rdl8i9+1S4z5O1FgJPlY+j5XwY+UOusVjJfpYuR8r/sfKw1iRFzBq3TW37sLWXdi6C1t3YevQLXZh6y5s3TW27plnyoMz5ZlmyjcH68NgfRisD4P1YbDQLfZhsD4M1jcGG5hbD2DrAWw9gK0HsHXoFgew9QC2HhhbD80zFcKZCk0zFZmDjWCwEQw2gsFGMFjoFkcw2AgGGxmDlTVT7/IY0Lwq6bpXJV37qqTrHxvGqqRLQJV0EajSZAZsRgYMZ8BwBgxnwHAG0DBWJW0GDGfAzBnQjAwgCmyZjgVUBoQzIJwBNIxVSZsB4QzInMHSfJdhEFhumI4x3i+gqCCcWgBjAcNcwDAYMEwG2DBmmA0YhgNmpgPmzRg0yAdbpgMElYGHM/BwBtAwViVtBh7OwDNnMANiGKYYhjGGYY5hGGSwYcwwyjDMMswMM0zRzDKcyADjDMM8wzDQMEw02DBmmGkYhhpmphoWzpgDyDVbpgMblUGIMwhxBtAwViVtBiHOIDRnEM2YA0xfDOMXw/zFMIBhw5hhBGOYwZgZwkhBmO9P/BuOIYwwhBGGMMIQhg1jwhBGGMLIDGE0A8IIQxhhCCMMYYQhDBvGhCGMMISRGcJoBoQRhjDCEEYYwghDGDaMCUMYYQgjM4TRDAgjDGFkhDByZ1xsGMIIQxhhCCMMYdgwJgxhhCGMzBBGM57REH5IQ8anNOTPCBkTDmHCIUw4hAkHG8aECYcw4dAE4ThvnuHLd1XyiXFetVbBd/2xi6ugj68Z0xg3OlEPD3KfRdcnNXw98CTjjTygr++E6F43nM2q4PskfbltklNe7cf3cNfNnDdxYrfLU34r0mPJq258FdfwIpGvt9pDXrf9eV3n2dpOqpf2R1kMryXOb/w2/wFQSwMEFAAAAAgAHb8+XQYzQkouCAAAWCQAABgAAAB4bC9jb21tZW50cy9jb21tZW50MS54bWzdWk1v2zgavvdXEEEOsxjVkmznw3EaINsWmAJpF5gCxV4pibaZkUQNSQVxDvNfetzDHgZzm6v/2D4vKUp2kwUWqOewOhS1JFIkn+d93i/lOldVJWpr2GNV1ubNycba5iqOTb4RFTcT1YgaT1ZKV9ziUq9j02jBC7MRwlZlPE2S87jisj65ueat3Shtwo+bf2Dy7YfruLsMPzCgW/VOGttfMC1Wb07ezU6YH/aheHOSnDCz4Y3wv2+urXjEBHvzd24EKwTDVnKpWMxyLa3QUl29em+srHgud3/UNMK0Wa5qq7nt7jVcc8xTVuT+Rrb7amTOJ4xeesUw2rSVzEph2I+4KlXezfwRO7RSqyUrOVu3u39zvwW1FblVTBjLMSsXLJ2xauqeSaNYt9pa6MmrV3fKMFk1Slu83qiaZrntqho3Xtovr61/IutCalrJRKy1spQFL+g+NiMqAGHwP/vw5XbCaBG8JBcNBmOFBiBxOg9nlSgwD9MyUdOYlQSxGmDiN+3zQYhC6cl1DJhjj3bc8fMtUfPvJOpnsRJa1Ngae/vu4z+vWAlgpHjyqCpjX6sMVHHs6hEQFZzWFux0fvb69CKJgfDWs+DQ2Z/s5tGBAGPG7xUNMLh/Oo3mSbJk2BIvVGMBB6BWQBb0aNzyxkGX+oF25uylrW3LS3qv53W7t1ariR5YxkrWvBwXv+fH43eaTM+vmIA4rJY5RA/OsD+iHYsRWrzG+XG/HJRLMHHAEfOGr0GOpinAe60Gm1A0ENaQvD5dJIk7JPwU1ndweGUTI3VetrJQZsn4rzAZZwH3LdZj/HBdQxsuS292DyLf8BqL5CRsWk08YvNkhuOi+uLYVOdS562EtOpWPEBWII90pDohPtP04iyBrp4zPlDbmcuEfXYHNLIQkGogG3qWBLzXaU/XluFxBWk6/MfF2eJ4nAFzeLgr9pOqBHsHPVr2cfevR0gHrGUlgiND3INm796/Y/nuK53dYXLGquBaZ/MF+wHPv9x+evv+b0BeNR2qXXz9dkJ6cTZh70ucHIoKLtitE7FG6JUs40LLB6Gjg5C8Bee1Cl5+XJSmyXdy+lGaitPLArMYRojuE9fRsCSnqAWt7vVZqnotbVsE9CPGEedEHVAbNfDp8cREx2jJ58AvOcVcsbcwcfVJWFa1wAh0hAGqkxR0p7tzeXUUSCNrL5lGGAxzHtTlHDhspQpRqiG+LRFaOx358BbU1NYczJSthx+4wmvSJsu4X9LByKODRNd5YoS6LhCfed9tRsb59C8uNDJuEOD6pMX4dAcj9/MgwrqLlSb2MPuYaVyaOkQ6bICS0y5LkfhHNoRXaKdJModSrZWVzeiIOnqh8RPPpJXGyEqF9DOUCvQKqDQ7OEW3Z7pSCFzn0fw8pdxiqC6QcujG1Q1UFe6NnUXpxWxJRkDyKgepk2T7cd0mKME0mJRGs0sfHH19YsTgrLlzBYU0Yve76jGP2EoLRyDduVfQc5tJQQejzbVcP9E9fk9Mq7wtLS6xqjSUiQd/4Q0BHmlkBnR2PAN6niJdMcv1vffV5G8tPDvxzXOhqbREoltQPhpSKUqdeKlFQft35cvicvH6NI3OF4v90vTQd+NEDdI0R+eaVx4fb5k8zxEiKJhEmI7axSW+Iw7WRyxMP0KMhNedzLQYGIUUfomRBuUb4hAb6yrNSliqNQ7Ym0ZpkkSU8MIVGzfVdFNCNO/8P86gAFdc8S3970qZEKkHbx6RXzGBRaqI7kdWbaZHLzeftw40ydAQh0ZyyqRMi7DLlEF1z6mTYDUVLQmVndDebJY4v2qEfqBCcl+IHeqOf0/HQU+IVSPr+6SXx463+4FyYGTb00QvMRTbDsLsNJrNKcx26uFVU1LCbMR69yfOyB1QcUE1inEwL7+Rc8i2rShhCv1iGQzlF9VaJoDN7o+KatOoK4HYr60YWkT7abRHeyVDjmzahk6rHcAEeGgn91xs3cKUv8Pnj8xE/oLmwxDGeu/purEZR6ITr3mdb1S4A1UaCm0kV17/t6bSGfWOoO0kOSyf+s5E8Oj7ah9C7vNIO0pvPP3epsNh7Qu91Mx/LkIg5XVb03iqcmmn/N4N4q4Ali6mTifg55Glk2nCqj5JUjT8dDqPLvGUyh0g4srckKdrAalq6VNmcirU/JNPmBn5iorc/NbjAcHzONME5YHQcSTPGxTe1c8vUeei/DRKXLDAHCCdU8S+F5a+7uQoup7G2GGcHrcrsuKZ7t0nGYG3jdACqR2uat88lq6s7YyJzml3X+sCvDZEPtyCGezFfVAIXUsrRS3qbkvw+BR8XF/LfaUTPXbUz18LbyCsN5DBmNxeqVBCXiZ90yZ0SDAj67LCEL28CbDP4zeM722dvOD+P93e3t36FonHratknXX0u79MHlP6zlM59+C9Aw7ef+BhP+BmOrscsMNT141GfZwLb0uGUZeEkbUth96cs5m93qkv6zU1aVyid86qCi96qXfgd+qQZ2X7NHyr6Nvbg6dxESydXCT+U+JaIN+xrmsQ2BqZrRyxe/M/fKdYablWGVzE57YB0F+4LNn8gt05e5lF88UCoP+stuA0nZxTTmCCKR2W33vhIFRmsasa1h2HcEFkRV1hrg7ThZFxeMSKO3DY6y6IqJNajCWpP8qRiPWyO6y40yhJU//93ysvDjLNEfRVP4s6rwdypizxt9OLi9SlhXP6G4IoJBcvfIt6kAV2H7kyRYCKglbT7kMjipInxIisRLzgxUYY+eAL99r4YnF70FAnVHgtfH8//FWIFcho/98NJfzyf8kTrszNfwBQSwMEFAAAAAgAHb8+XaE3eUfiAgAAsjcAACAAAAB4bC9kcmF3aW5ncy9jb21tZW50c0RyYXdpbmcxLnZtbO2bz2/aMBTH/5XIu5aSBGiLIUhTp962SdukHasQG+LWsaP4QcP++tlJYIVD10nTO70cSPL8bL8fn3DIF5ZtpVdL42LuyryWOj/YHUTeaBz31oztGsNdUcoqd6NKFY11dgOjwlbcbjaqkMOJneYkb83ZV5pF3ofLFjImhQLW765EldcXI5HIIc9Ywsar5fgixDAr7Q1wqOVp9/Svux89J/+QmxIZe2xjfzxCGqcsKqxthFO/ZMbS5CaOr7rPkNqEu9on0HnVOZQZq650P9z0rro/tZINSUBjn2X0ZJVxcNB+yUqBbELWYTgsEm2bXChpoEvYPmcM+r0Ka4wsIJQgY42/Gmr1qjSvuvu+vp5V6c1uXlSpj+LDWaGGjGrrFChreL52Vu9ALqIqb7bKjLTcAJ/Nr9NZDYvBBrbmyXUwvCgBJU+m07pdlFJtS+C3c3/9a6SMkC1PFnvl1FppBQdeKiGkYdFGaV1YbRsfzMYfMumZ8/WVUFnh48l3YM/a6pI4vRlYDPOjboH0zwrjUx2FfYmG5dc6L55ZZNeu2DVShLYMfl3XwqZnHTLWyKMHeNDXtj1WqHJ2JFRooS/TKNfAuxhXS6H2R58wxQ+preGhbKfnYliq5+VeB1A++UfnfQ/F0ETZFtL3/ev6yYfwo4v2i4Ujo5/tXv5UUN5Lrd0A5neP/6Xto4/5wZdv9ZBrJ3sST7bO45t9WaX9QLjsQ/ZIVGY16c3D3XBzyub1dwAx/V6mb4lpHKYnxDQW03fENA7TM2Iai+k5MY3D9A0xjcT0JCamcZi+I6axmE6IaRym58Q0FtMpMY3DdBIT1FhQTwhqJKgTghoL6ilBjQQ1vc5Dg3pGUCNBPSWosaAmLRELanpJjQY1iYlYUNNbajSoSU3EgvqWoMaCmuRELKhJe8GCekp6IhbUJL6gQU2CItaPTkl8QYOaFEUsqEl8QYOaFEUsqEl8QYOaFEUsqP/De+px+LPeb1BLAwQUAAAACAAdvz5d8yTIq6gAAACVAQAAIwAAAHhsL3dvcmtzaGVldHMvX3JlbHMvc2hlZXQyLnhtbC5yZWxztZFLDoIwEIav0vQADLhwYcAVG7eGC0xKKY19pa0It7dEQUhcuHE3/zy+fMmUV64wSmtCL10go1YmVLSP0Z0AAuu5xpBZx02adNZrjCl6AQ7ZDQWHQ54fwW8Z9FxumaSZHP+FaLtOMl5bdtfcxC9gYFbPo0BJg17wWFEY1dpdiiJLYEoubUXXA/ib06BV7fEhjdhbta/mR/q9VWTDYodmCnNIcrD7wvkJUEsDBBQAAAAIAB2/Pl1Sq5JMLQMAACYRAAANAAAAeGwvc3R5bGVzLnhtbN1YbWvbMBD+K0btx61+a514xIE2LDDYRqH9MBj7oMRyIpAtT1a6pL9+OstxXqor3daxMIdi6c7P89ydTpbpqNEbwe6WjGlvXYqqychS6/qd7zfzJStpcyFrVhlPIVVJtZmqhd/UitG8AVAp/CgIEr+kvCLjUbUqp6VuvLlcVTojUW/y7O1DnpEwuSSepZvInGXk6/nbyyD9Vvq5v9kQ3wm5OoScn705OwsuggAe9zvV8aiQ1U48JtZg+GjJvAcqMjKhgs8UB1RBSy421hyBYS6FVJ42WRuBECzNo3WHdgYF6XhKXknValuFZ3RmHcdOQi1mGZlO37fXgU70MsoDmngQXYY3KE17g9JwIfrSXBJrGI9qqjVT1dRMWkxrfOLyuvH9pja1WSi6CaMr8mJAIwXPQXIxcUfu70H/kHRwPRgMEpS0vZlyzKTKmeoLEpKtaTwSrNAGrvhiCXcta1hFqbUszSDndCEr2lZri+gGhnbOhLiDHfWlOOBeF3vdHEAvV/3QBNQNLY2dAP8+m+Xep/09Xq/mD1LfrEw6VTv/vpKa3SpW8HU7Xxd9ABh7uGOPXp89wmOndS0214IvqpLZ0r5YcDyiW5y3lIo/GjXYLO0yt9VeF0cxdS+qE4vKXan4ldbhNHPu3v8nFtU/7lnvgSnN52Aw7yji/VC0vmdr3Z01T+ONTrCG4SnGhHTb8R7761H53St/71w5OFV6qwefCRn5DF9IYqfizVZcaF51syXPc1Y9OVwMvaYz8xF4wG+ez1lBV0Lf986M7MafWM5XZdo/dQuZd0/txh8hnzDpP1qMFq9ytmb5pJuaY3vv/A66CwDHnml7uT0YxvrcHvBhOlgEGMaiMJ3/KZ8hmo/1YbENnZ4hihmiGItyeSbtD9NxY1JzuTNN0zhOEqyik4kzgglWtySBPzcbFhsgMB1Q+rVa46uNd8jzfYCt6XMdgmWKdyKWKV5r8LjrBog0da82pgMIbBWw3gF9tw70lBsTx7CqWGzYDsY9aYp5oBfdPZokSHUS+LnXB9slcZymbg/43BHEMeaB3Yh7sAggBswTx+05eHQe+dtzyt/9Z2T8E1BLAwQUAAAACAAdvz5dl4q7HMAAAAATAgAACwAAAF9yZWxzLy5yZWxznZK5bsMwDEB/xdCeMAfQIYgzZfEWBPkBVqIP2BIFikWdv6/apXGQCxl5PTwS3B5pQO04pLaLqRj9EFJpWtW4AUi2JY9pzpFCrtQsHjWH0kBE22NDsFosPkAuGWa3vWQWp3OkV4hc152lPdsvT0FvgK86THFCaUhLMw7wzdJ/MvfzDDVF5UojlVsaeNPl/nbgSdGhIlgWmkXJ06IdpX8dx/aQ0+mvYyK0elvo+XFoVAqO3GMljHFitP41gskP7H4AUEsDBBQAAAAIAB2/Pl39J+F9XQEAAOMCAAAPAAAAeGwvd29ya2Jvb2sueG1stVLLTsMwEPyVyB9A2goqUTVcqAqVeFQt6t1xNs2qtjeynRb69awdIiohIS6ckpldTWZmMz+RO5REh+zdaOsL0YTQzvLcqwaM9FfUguVJTc7IwNDtc986kJVvAILR+WQ0muZGohV380Fr7fJLQAFUQLJMRmKHcPLf8wizI3osUWP4KER61yAygxYNnqEqxEhkvqHTIzk8kw1Sb5UjrQsx7gc7cAHVD3obTb7J0icmyHIj2UghpiMWrNH5kDaSvmSPR+DlHnWBlqgDuIUM8OCoa9HuowynyC9ipB6GZ1/izP2lRqprVLAg1Rmwoe/RgY4GrW+w9SKz0kAhNuDjSkzEn1hVfbrAti66cjPkgVtVyeD/mVlLLrqS/sLN5Bc3k1TX0FEFNVqoXljJM8/3UmuXxUdKNbm+Gd+KhJ+pYr14BL5Tp/U9c6/2iWSfXiW4lUdIkJMoWH6tDTca/q+7T1BLAwQUAAAACAAdvz5djfcsWrQAAACJAgAAGgAAAHhsL19yZWxzL3dvcmtib29rLnhtbC5yZWxzxZJNCoMwEEavEnKAjtrSRVFX3bgtXiDo+IPRhMyU6u1rdaGBLrqRrsI3Ie97MIkfqBW3ZqCmtSTGXg+UyIbZ3gCoaLBXdDIWh/mmMq5XPEdXg1VFp2qEKAiu4PYMmcZ7psgni78QTVW1Bd5N8exx4C9geBnXUYPIUuTK1ciJhFFvY4LlCE8zWYqsTKTLylDCv4UiTyg6UIh40kibzZq9+vOB9Ty/xa19ievQ38nl4wDez0vfUEsDBBQAAAAIAB2/Pl1/u17TOwEAAD8FAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbMWUz27CMAzGX6XqdWrDOOwwAZex68ZhL5ClLo3IP8WmwNvPKSvSJtqBQNqlaWt/38+x084+DgEw21vjcJ43ROFZCFQNWImlD+A4UvtoJfFjXIsg1UauQUwnkyehvCNwVFDyyBezJdRyayh73fNr1N7N8wgG8+zlmJhY81yGYLSSxHHRuuoXpfgmlKzscrDRAR84IRdnCSkyDBjWtaO6M4X5utYKKq+2liUl65dR7rRbJ8B7CzHqCrKVjPQmLduJvRFIBwNYjtf4NwtDBFlhA0DWlEfTviUDZOIRwvH6eDO/sxkDcuYq+oB8JCJcj+tnntRFYCOIpMe3eCKy9c37g3QsKqguZHN7dz5uunmg6Jbbe/xzxif/K+uY/lMdytukxv7m3v3o/S9ox6f3m3t/cWktrdSu54vuv7n4AlBLAQIUABQAAAAIAB2/Pl1Gx01IlQAAAM0AAAAQAAAAAAAAAAAAAACAAQAAAABkb2NQcm9wcy9hcHAueG1sUEsBAhQAFAAAAAgAHb8+XQz8PX37AAAAKwIAABEAAAAAAAAAAAAAAIABwwAAAGRvY1Byb3BzL2NvcmUueG1sUEsBAhQAFAAAAAgAHb8+XZlcnCMQBgAAnCcAABMAAAAAAAAAAAAAAIAB7QEAAHhsL3RoZW1lL3RoZW1lMS54bWxQSwECFAAUAAAACAAdvz5daVeGdiECAACrBgAAGAAAAAAAAAAAAAAAtoEuCAAAeGwvd29ya3NoZWV0cy9zaGVldDEueG1sUEsBAhQAFAAAAAgAHb8+XRZdsnPLBAAA/RsAABgAAAAAAAAAAAAAALaBhQoAAHhsL3dvcmtzaGVldHMvc2hlZXQyLnhtbFBLAQIUABQAAAAIAB2/Pl0GM0JKLggAAFgkAAAYAAAAAAAAAAAAAACAAYYPAAB4bC9jb21tZW50cy9jb21tZW50MS54bWxQSwECFAAUAAAACAAdvz5doTd5R+ICAACyNwAAIAAAAAAAAAAAAAAAgAHqFwAAeGwvZHJhd2luZ3MvY29tbWVudHNEcmF3aW5nMS52bWxQSwECFAAUAAAACAAdvz5d8yTIq6gAAACVAQAAIwAAAAAAAAAAAAAAgAEKGwAAeGwvd29ya3NoZWV0cy9fcmVscy9zaGVldDIueG1sLnJlbHNQSwECFAAUAAAACAAdvz5dUquSTC0DAAAmEQAADQAAAAAAAAAAAAAAgAHzGwAAeGwvc3R5bGVzLnhtbFBLAQIUABQAAAAIAB2/Pl2XirscwAAAABMCAAALAAAAAAAAAAAAAACAAUsfAABfcmVscy8ucmVsc1BLAQIUABQAAAAIAB2/Pl39J+F9XQEAAOMCAAAPAAAAAAAAAAAAAACAATQgAAB4bC93b3JrYm9vay54bWxQSwECFAAUAAAACAAdvz5djfcsWrQAAACJAgAAGgAAAAAAAAAAAAAAgAG+IQAAeGwvX3JlbHMvd29ya2Jvb2sueG1sLnJlbHNQSwECFAAUAAAACAAdvz5df7te0zsBAAA/BQAAEwAAAAAAAAAAAAAAgAGqIgAAW0NvbnRlbnRfVHlwZXNdLnhtbFBLBQYAAAAADQANAGkDAAAWJAAAAAA="
+
+
+def guardar_metadata_excel(wb, project_code, project_data, items, params, version, formato):
+    """Datos para recargar nuestros archivos sin perder costos ni sumar márgenes otra vez."""
+    payload = dict(version_app=1, formato=formato, project_code=project_code,
+                   project_data=project_data, items=items, params=params, version=version)
+    if "presupuesto_app" in wb.custom_doc_props.names:
+        del wb.custom_doc_props["presupuesto_app"]
+    wb.custom_doc_props.append(StringProperty(name="presupuesto_app",
+        value=json.dumps(payload, ensure_ascii=False, default=str, separators=(',', ':'))))
+
+
+def crear_excel_plataforma(project_code, project_data, items, params, version=1):
+    """Mismo formato de la plantilla; Coste/Precio son totales, no precios unitarios."""
+    wb = load_workbook(BytesIO(base64.b64decode(PLANTILLA_PLATAFORMA_B64)))
+    resumen, ws = wb['Resumen'], wb['Partidas']
+    chapter_styles = [copy(ws.cell(2, col)._style) for col in range(1, 11)]
+    item_styles = [copy(ws.cell(3, col)._style) for col in range(1, 11)]
+    ws.delete_rows(2, ws.max_row)
+    ws.row_dimensions.clear()
+    structured = estructura_partidas_excel(items)
+    row = 2
+    current = None
+    for item in structured:
+        part_num, sub_num = item['part_number'], item['subpart_number']
+        section = item['category']
+        if section != current:
+            current = section
+            for col in range(1, 11):
+                ws.cell(row, col)._style = copy(chapter_styles[col-1])
+            ws.cell(row, 1, item.get('platform_chapter_code') or part_num * 1000)
+            ws.cell(row, 2, nombre_partida_excel(section).upper())
+            row += 1
+        for col in range(1, 11):
+            ws.cell(row, col)._style = copy(item_styles[col-1])
+        values = [item.get('platform_code') or part_num * 1000 + sub_num, None,
+                  nombre_subpartida_excel(item), descripcion_excel_item(item),
+                  float(item['quantity']), str(item['unit']).lower(),
+                  MARCA_PLATAFORMA_PCT, float(item['sale_amount']),
+                  f'=H{row}*(1+G{row}/100)', None]
+        for col, value in enumerate(values, 1):
+            ws.cell(row, col, value)
+        row += 1
+    last = row - 1
+    oportunidad = project_data.get('platform_opportunity') or (
+        f"{project_data['project_type']} · {project_data.get('budget_level', 'Medio-alto')} · "
+        f"{project_data.get('location', '')} · {project_code} · V{version:02d}")
+    resumen_values = [project_data['name'], oportunidad,
+        project_data.get('platform_budget_id') or project_code,
+        project_data.get('platform_author') or None, 'draft', datetime.now(),
+        f'=SUM(Partidas!I2:I{last})' if last >= 2 else 0, 0, 0,
+        f'=(B7+B8-B9)*{IVA_PLATAFORMA_PCT / 100:.6f}', '=B7+B8-B9+B10']
+    for rr, value in enumerate(resumen_values, 1):
+        resumen.cell(rr, 2, value)
+    wb.calculation.calcMode = 'auto'
+    wb.calculation.fullCalcOnLoad = True
+    guardar_metadata_excel(wb, project_code, project_data, structured, params, version, 'plataforma')
+    out = BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def valor_excel(wb, cached, sheet, coordinate, visiting=None):
+    """Lee valores/caché y evalúa solo aritmética, IF y SUM; nunca ejecuta código del Excel."""
+    value = wb[sheet][coordinate].value
+    if not isinstance(value, str) or not value.startswith('='):
+        return value
+    saved = cached[sheet][coordinate].value
+    if saved is not None:
+        return saved
+    visiting = set() if visiting is None else set(visiting)
+    key = (sheet, coordinate)
+    if key in visiting:
+        raise ValueError(f'Fórmula circular en {sheet}!{coordinate}.')
+    visiting.add(key)
+    formula = value[1:].replace('$', '')
+    reference = r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_ ]*))!)?([A-Z]+\d+)"
+    def cell_value(match):
+        other = match.group(1) or match.group(2) or sheet
+        v = valor_excel(wb, cached, other, match.group(3), visiting)
+        return repr(0 if v is None else v)
+    def sum_range(match):
+        other = match.group(1) or match.group(2) or sheet
+        start_col, start_row, end_col, end_row = range_boundaries(match.group(3))
+        vals = [valor_excel(wb, cached, other, f'{get_column_letter(cc)}{rr}', visiting)
+                for rr in range(start_row, end_row+1) for cc in range(start_col, end_col+1)]
+        return repr(sum(float(v or 0) for v in vals if not isinstance(v, str)))
+    formula = re.sub(r"SUM\((?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_ ]*))!)?([A-Z]+\d+:[A-Z]+\d+)\)",
+                     sum_range, formula, flags=re.I)
+    formula = re.sub(reference, cell_value, formula)
+    formula = re.sub(r'(?<![<>=!])=(?!=)', '==', formula).replace('<>', '!=')
+    node = ast.parse(formula, mode='eval').body
+    def calculate(n):
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float, str)):
+            return n.value
+        if isinstance(n, ast.BinOp) and type(n.op) in {ast.Add, ast.Sub, ast.Mult, ast.Div}:
+            a, b = calculate(n.left), calculate(n.right)
+            return {ast.Add: operator.add, ast.Sub: operator.sub,
+                    ast.Mult: operator.mul, ast.Div: operator.truediv}[type(n.op)](a, b)
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.USub, ast.UAdd)):
+            return -calculate(n.operand) if isinstance(n.op, ast.USub) else calculate(n.operand)
+        if isinstance(n, ast.Compare) and len(n.ops) == 1 and type(n.ops[0]) in {ast.Eq, ast.NotEq}:
+            a, b = calculate(n.left), calculate(n.comparators[0])
+            return a == b if isinstance(n.ops[0], ast.Eq) else a != b
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id.upper() == 'IF' and len(n.args) == 3:
+            return calculate(n.args[1] if calculate(n.args[0]) else n.args[2])
+        raise ValueError(f'Fórmula no compatible en {sheet}!{coordinate}; abre y guarda el archivo en Excel para actualizar sus valores.')
+    return calculate(node)
+
+
+def numero_presupuesto(value, label):
+    try:
+        number = float(value)
+    except (ValueError, TypeError):
+        raise ValueError(f'{label}: se requiere un número.')
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f'{label}: se requiere un número finito mayor o igual a cero.')
+    return number
+
+
+def item_importado(code, category, subcategory, description, unit, quantity, unit_sale, params, previous=None):
+    item = dict(previous or {})
+    factor = (1 + params['indirect_pct']/100) * (1 + params['profit_pct']/100)
+    cost = float(item.get('unit_cost', unit_sale / factor))
+    item.update(code=str(code), concept_id=item.get('concept_id'), category=category,
+        subcategory=subcategory, commercial_title=item.get('commercial_title') or subcategory,
+        description=description, unit=normalizar_unidad(unit), quantity=quantity,
+        unit_cost=cost, unit_sale=unit_sale, direct_amount=quantity*cost,
+        unit_indirect=cost*params['indirect_pct']/100,
+        unit_profit=cost*(1+params['indirect_pct']/100)*params['profit_pct']/100,
+        sale_amount=quantity*unit_sale, benefit_amount=quantity*(unit_sale-cost),
+        sale_margin_pct=(unit_sale-cost)/unit_sale*100 if unit_sale else 0,
+        price_source=item.get('price_source') or 'IMPORTADO_EXCEL',
+        price_source_detail=item.get('price_source_detail') or 'Precio recuperado del Excel; no se consultó IA.',
+        price_status=item.get('price_status') or 'IMPORTADO',
+        price_confidence=item.get('price_confidence') or 'Por confirmar',
+        material_share_pct=item.get('material_share_pct', 0),
+        labor_share_pct=item.get('labor_share_pct', 0), other_share_pct=item.get('other_share_pct', 100),
+        waste_reference_pct=0, quantity_criterion=item.get('quantity_criterion') or 'Cantidad del archivo importado.',
+        inclusion_basis=item.get('inclusion_basis') or 'Concepto del archivo importado.',
+        quantity_confidence=item.get('quantity_confidence') or 'Por confirmar',
+        considerations=item.get('considerations') or '')
+    return aplicar_composicion_costo(item)
+
+
+def resultado_desde_items(project_data, items, previous=None):
+    return PresupuestoIA(nombre_proyecto=project_data['name'],
+        actividad_principal=project_data['project_type'],
+        alcance_resumido=previous.alcance_resumido if previous else 'Presupuesto importado o editado manualmente.',
+        consideraciones_generales=previous.consideraciones_generales if previous else [],
+        datos_faltantes=previous.datos_faltantes if previous else [],
+        actividades=[item_a_actividad(item) for item in items])
+
+
+def importar_presupuesto_excel(data, file_name, default_params):
+    wb = load_workbook(BytesIO(data), data_only=False)
+    cached = load_workbook(BytesIO(data), data_only=True)
+    metadata = {}
+    if 'presupuesto_app' in wb.custom_doc_props.names:
+        metadata = json.loads(wb.custom_doc_props['presupuesto_app'].value)
+    params = dict(default_params)
+    params.update(metadata.get('params') or {})
+    params.update(iva_pct=0.0, waste_pct=0.0)
+    for key in ('indirect_pct', 'profit_pct'):
+        params[key] = numero_presupuesto(params[key], key)
+    project = dict(metadata.get('project_data') or {})
+    project.setdefault('name', Path(file_name).stem)
+    project.setdefault('location', 'Importado de Excel')
+    project.setdefault('project_type', 'Remodelación interior general')
+    project.setdefault('budget_level', 'Medio-alto')
+    for key in ('description', 'guide_text', 'dimensions_text'):
+        project.setdefault(key, '')
+    project.setdefault('dimension_mode', 'Integradas en descripción')
+    previous_items = metadata.get('items') or []
+    old_by_code = {str(x['code']): x for x in previous_items}
+    items = []
+    is_platform = 'Partidas' in wb.sheetnames and [wb['Partidas'].cell(1,c).value for c in range(1,11)] == [
+        'Código', 'Capítulo', 'Partida', 'Descripción', 'Uds.', 'Tipo Ud.', 'Margen', 'Coste', 'Precio', '% Impuestos']
+    if is_platform:
+        ws = wb['Partidas']
+        if 'Resumen' in wb.sheetnames:
+            summary = wb['Resumen']
+            project['name'] = str(summary['B1'].value or project['name'])
+            project.update(platform_opportunity=summary['B2'].value,
+                           platform_budget_id=summary['B3'].value, platform_author=summary['B4'].value)
+        category, chapter_code = 'OTROS TRABAJOS', None
+        by_platform = {str(x.get('platform_code') or x.get('part_number',0)*1000+x.get('subpart_number',0)):x for x in previous_items}
+        for row in range(2, ws.max_row+1):
+            if ws.cell(row,2).value and not ws.cell(row,4).value:
+                category, chapter_code = str(ws.cell(row,2).value), ws.cell(row,1).value
+                continue
+            description = ws.cell(row,4).value
+            if not description:
+                continue
+            code = ws.cell(row,1).value
+            qty = numero_presupuesto(valor_excel(wb,cached,ws.title,f'E{row}'), f'Cantidad fila {row}')
+            margin = numero_presupuesto(valor_excel(wb,cached,ws.title,f'G{row}') or 0, f'Margen fila {row}')
+            # Precio manual tiene prioridad; las fórmulas se calculan con Coste.
+            raw_price = ws.cell(row,9).value
+            if raw_price is not None and not (isinstance(raw_price,str) and raw_price.startswith('=')):
+                total = numero_presupuesto(raw_price,f'Precio fila {row}') / (1+margin/100)
+            else:
+                raw_cost = valor_excel(wb,cached,ws.title,f'H{row}')
+                if raw_cost is None:
+                    raw_cost = numero_presupuesto(valor_excel(wb,cached,ws.title,f'I{row}'),f'Precio fila {row}')/(1+margin/100)
+                total = numero_presupuesto(raw_cost,f'Coste fila {row}')
+            if qty == 0 and total != 0:
+                raise ValueError(f'Fila {row}: hay importe con cantidad cero; corrige la cantidad en Excel.')
+            prev = by_platform.get(str(code))
+            item = item_importado(str(prev['code']) if prev else str(code or uuid.uuid4().hex[:12]), category,
+                str(ws.cell(row,3).value or 'Concepto'), str(description),
+                str(ws.cell(row,6).value or 'LOTE'), qty, total/qty if qty else 0, params, prev)
+            item.update(platform_code=code, platform_chapter_code=chapter_code)
+            items.append(item)
+    else:
+        matches = []
+        for ws in wb:
+            for rr in range(1,min(ws.max_row,100)+1):
+                labels = {normalizar_texto(str(ws.cell(rr,cc).value)):cc for cc in range(1,ws.max_column+1) if ws.cell(rr,cc).value}
+                if all(k in labels for k in ('partida','subpartida','descripcion tecnica','unidad','cant')):
+                    matches.append((ws,rr,labels))
+                    break
+        if not matches:
+            raise ValueError('Formato no reconocido: sube el Excel de revisión o el Excel de plataforma (Resumen/Partidas).')
+        ws, header, labels = matches[0]
+        if not metadata and ws['A2'].value:
+            project['name'] = str(ws['A2'].value)
+        control_items = []
+        if '02 Control Interno' in wb.sheetnames:
+            ctrl=wb['02 Control Interno']
+            if not metadata:
+                for key, coord in [('indirect_pct','B3'),('profit_pct','B4')]:
+                    params[key]=numero_presupuesto(valor_excel(wb,cached,ctrl.title,coord),key)*100
+            for rr in range(9,ctrl.max_row+1):
+                if ctrl.cell(rr,3).value is not None:
+                    control_items.append(dict(code=str(ctrl.cell(rr,3).value), unit_cost=numero_presupuesto(ctrl.cell(rr,8).value,f'Costo fila {rr}')))
+        pu_col = next((cc for label,cc in labels.items() if label.startswith('precio unitario')),None)
+        total_col = next((cc for label,cc in labels.items() if label.startswith('importe total')),None)
+        if not pu_col and not total_col:
+            raise ValueError('La hoja de revisión no tiene precio unitario ni importe total.')
+        for rr in range(header+1,ws.max_row+1):
+            description=ws.cell(rr,labels['descripcion tecnica']).value
+            if not description or not ws.cell(rr,labels['unidad']).value:
+                continue
+            idx=len(items)
+            control=control_items[idx] if idx<len(control_items) else {}
+            prev=old_by_code.get(control.get('code')) or (previous_items[idx] if idx<len(previous_items) else control)
+            qty=numero_presupuesto(valor_excel(wb,cached,ws.title,f"{get_column_letter(labels['cant'])}{rr}"),f'Cantidad fila {rr}')
+            # Importe Total es la entrada editable en el formato antiguo.
+            if total_col:
+                total=numero_presupuesto(valor_excel(wb,cached,ws.title,f'{get_column_letter(total_col)}{rr}'),f'Importe fila {rr}')
+                if qty == 0 and total != 0:
+                    raise ValueError(f'Fila {rr}: hay importe con cantidad cero.')
+                pu=total/qty if qty else 0
+            else:
+                pu=numero_presupuesto(valor_excel(wb,cached,ws.title,f'{get_column_letter(pu_col)}{rr}'),f'Precio fila {rr}')
+            category=re.sub(r'^\d+\.\s*','',str(ws.cell(rr,labels['partida']).value or 'OTROS TRABAJOS'))
+            sub=re.sub(r'^\d+\.\d+\s*','',str(ws.cell(rr,labels['subpartida']).value or 'Concepto'))
+            items.append(item_importado(str(prev.get('code') or f'IMP-{idx+1:03d}'),category,sub,str(description),
+                str(ws.cell(rr,labels['unidad']).value),qty,pu,params,prev))
+    if not items:
+        raise ValueError('No se encontraron conceptos utilizables en el archivo.')
+    if len({str(x['code']) for x in items}) != len(items):
+        raise ValueError('El archivo contiene códigos de concepto duplicados.')
+    project['description'] = project.get('description') or '\n'.join(x['description'] for x in items)
+    result=resultado_desde_items(project,items)
+    project_code=str(metadata.get('project_code') or project.get('platform_budget_id') or 'IMPORTADO')
+    version=int(metadata.get('version') or 1)
+    return dict(project_id=None,budget_id=None,saved=False,pending_revision=False,
+        project_code=project_code,version=version,project_data=project,params=params,
+        result=result.model_dump(),items=items,financials=financieros_importados(items,params),
+        excel_bytes=crear_excel(project_code,project,result,items,params,version),
+        revision_history=[],pending_revision_notes=[],editor_revision=0)
+
+
+def financieros_importados(items, params):
+    figures=calcular_financieros(items,dict(params,iva_pct=0))
+    figures['sale_before_tax']=sum(x['sale_amount'] for x in items)
+    figures['total']=figures['sale_before_tax']
+    figures['iva_amount']=0.0
+    return figures
+
+
+def aplicar_editor_manual(frame, current_items, params):
+    previous={str(x['code']):x for x in current_items}
+    revised=[]
+    used=set()
+    for _,row in frame.iterrows():
+        desc=str(row.get('Descripción Técnica') or '').strip()
+        if desc in ('','nan','None'):
+            continue
+        code=str(row.get('__code') or '')
+        if code in ('','nan','None'):
+            code='MAN-'+uuid.uuid4().hex[:10].upper()
+        if code in used:
+            raise ValueError('El editor contiene un identificador repetido.')
+        used.add(code)
+        qty=numero_presupuesto(row.get('Cant.'), 'Cantidad')
+        pu=numero_presupuesto(row.get('Precio Unitario (MXN)'), 'Precio unitario')
+        subcategory=str(row.get('Subpartida') or 'Concepto')
+        previous_item=dict(previous.get(code) or {})
+        if previous_item.get('subcategory') != subcategory:
+            previous_item['commercial_title']=subcategory
+        revised.append(item_importado(code,str(row.get('Partida') or 'OTROS TRABAJOS'),
+            subcategory,desc,str(row.get('Unidad') or 'LOTE'),
+            qty,pu,params,previous_item))
+    if not revised:
+        raise ValueError('El presupuesto debe conservar al menos un concepto.')
+    return revised
 
 
 # =========================================================
@@ -4754,26 +4990,12 @@ with st.sidebar:
             "Utilidad (%)",
             min_value=0.0,
             max_value=100.0,
-            value=10.0,
+            value=18.0,
             step=0.5,
             key="profit_pct",
         )
-        iva_pct = st.number_input(
-            "IVA (%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=16.0,
-            step=1.0,
-            key="iva_pct",
-        )
-        waste_pct = st.number_input(
-            "Desperdicio (%)",
-            min_value=0.0,
-            max_value=50.0,
-            value=5.0,
-            step=0.5,
-            key="waste_pct",
-        )
+        iva_pct = 0.0
+        waste_pct = 0.0
 
         with st.expander("Configuración"):
             model_name = st.text_input(
@@ -4842,6 +5064,16 @@ def volver_a_entrada():
 
 
 if "generated" not in st.session_state:
+    with st.expander("Abrir un presupuesto de revisión o plataforma", expanded=False):
+        uploaded_budget = st.file_uploader("Archivo Excel", type=['xlsx'], key='upload_existing_budget')
+        if st.button("Abrir y editar presupuesto", disabled=uploaded_budget is None):
+            try:
+                st.session_state['generated'] = importar_presupuesto_excel(
+                    uploaded_budget.getvalue(), uploaded_budget.name,
+                    dict(indirect_pct=float(indirect_pct),profit_pct=float(profit_pct),iva_pct=0.0,waste_pct=0.0))
+                st.rerun()
+            except Exception as exc:
+                st.error(f'No fue posible abrir el presupuesto: {exc}')
     if "guide_text" not in st.session_state:
         st.session_state["guide_text"] = DEFAULT_GUIDE_TEXT
 
@@ -5047,10 +5279,9 @@ else:
         key=f"locked_guide_{version}_{saved}",
     )
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Presupuesto de obra", formato_moneda(financials["sale_before_tax"]))
-    m2.metric("IVA", formato_moneda(financials["iva_amount"]))
-    m3.metric("Total", formato_moneda(financials["total"]))
+    m1, m2 = st.columns(2)
+    m1.metric("Presupuesto de revisión (sin IVA)", formato_moneda(financials["sale_before_tax"]))
+    m2.metric("Plataforma antes de impuestos (+30%)", formato_moneda(sum(it['sale_amount'] for it in items)*1.30))
 
     with st.expander("Detalle interno"):
         i1, i2, i3 = st.columns(3)
@@ -5081,12 +5312,49 @@ else:
 
     file_status = f"V{version:02d}" if g.get("project_id") else "BORRADOR"
     st.download_button(
-        "Descargar Excel",
+        "Descargar Excel de revisión",
         data=g["excel_bytes"],
         file_name=f"{g['project_code']}-{file_status}_Presupuesto.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+
+    st.download_button(
+        "Descargar Excel para plataforma (+30%)",
+        data=crear_excel_plataforma(g['project_code'],g['project_data'],items,g['params'],version),
+        file_name=f"{g['project_code']}-{file_status}_Plataforma.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    st.caption('Revisión sin IVA. Plataforma: marca fija del 30% y resumen con IVA del 16%, según la plantilla.')
+
+    st.divider()
+    st.subheader('Editar presupuesto sin IA')
+    st.caption('Edita partidas, descripciones, cantidades y precios unitarios de revisión. La marca del 30% se aplica únicamente al exportar para plataforma.')
+    editor_revision=int(g.get('editor_revision') or 0)
+    rows=[dict(__code=str(it['code']),Partida=it['category'],Subpartida=it['subcategory'],
+        **{'Descripción Técnica':it['description'],'Unidad':it['unit'],'Cant.':float(it['quantity']),
+           'Precio Unitario (MXN)':float(it['unit_sale'])}) for it in items]
+    edited=st.data_editor(pd.DataFrame(rows),num_rows='dynamic',hide_index=True,
+        use_container_width=True,key=f'manual_editor_{g["project_code"]}_{version}_{editor_revision}',
+        column_order=['Partida','Subpartida','Descripción Técnica','Unidad','Cant.','Precio Unitario (MXN)'],
+        column_config={'__code':None,'Cant.':st.column_config.NumberColumn(min_value=0.0,format='%.2f'),
+            'Precio Unitario (MXN)':st.column_config.NumberColumn(min_value=0.0,format='$ %.2f'),
+            'Descripción Técnica':st.column_config.TextColumn(width='large')})
+    if st.button('Aplicar cambios manuales',type='primary',use_container_width=True):
+        try:
+            revised=aplicar_editor_manual(edited,items,g['params'])
+            revised_result=resultado_desde_items(g['project_data'],revised,result)
+            target_version=version+1 if g.get('project_id') and not g.get('pending_revision') else version
+            g.update(saved=False,pending_revision=bool(g.get('project_id')),version=target_version,
+                result=revised_result.model_dump(),items=revised,
+                financials=financieros_importados(revised,g['params']),
+                excel_bytes=crear_excel(g['project_code'],g['project_data'],revised_result,revised,g['params'],target_version),
+                editor_revision=editor_revision+1)
+            st.session_state['generated']=g
+            st.rerun()
+        except Exception as exc:
+            st.error(f'No fue posible aplicar los cambios: {exc}')
 
     # -----------------------------------------------------
     # Ajuste sencillo con IA
