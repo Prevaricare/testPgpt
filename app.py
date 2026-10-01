@@ -2195,10 +2195,10 @@ Responde compacto, sin razonamiento extenso.
 CONCEPTOS
 {json.dumps(packets, ensure_ascii=False, separators=(',', ':'))}
 """
-    client = genai.Client(api_key=api_key)
-    for model in _modelos_gemini_disponibles(model_name):
+    client = crear_cliente_gemini(api_key)
+    for model in [model_name or "gemini-3.8-flash"]:
         try:
-            response = generar_con_gemini_resistente(
+            response = generar_con_respaldo_gemini(
                 client, model, prompt,
                 configuracion_gemini_razonada(PreciosCompactosIA, thinking_level="low",
                                               max_output_tokens=12288, ground_with_search=True),
@@ -2307,6 +2307,19 @@ def get_api_key() -> str | None:
     return get_secret("GEMINI_API_KEY")
 
 
+def crear_cliente_gemini(api_key):
+    # El SDK también reintenta por su cuenta. Un intento HTTP por llamada
+    # permite que nuestro registro y la alternancia controlen cada reintento.
+    if hasattr(types, "HttpRetryOptions"):
+        return genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=120000, retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        )
+    return genai.Client(api_key=api_key)
+
+
 def actualizar_progreso(progress_callback, porcentaje: int, mensaje: str):
     if progress_callback is None:
         return
@@ -2400,6 +2413,7 @@ def generar_con_gemini_resistente(
     progress_callback=None,
     etapa: str = "Procesando",
     max_reintentos_transitorios: int = MAX_REINTENTOS_GEMINI,
+    modelos_intentados=None,
 ):
     """
     Ejecuta una etapa Gemini sin abandonarla por saturación temporal.
@@ -2418,6 +2432,8 @@ def generar_con_gemini_resistente(
     }.get(model)
 
     for intento in range(1, max_reintentos_transitorios + 1):
+        if modelos_intentados is not None:
+            modelos_intentados.add(model)
         try:
             actualizar_progreso(
                 progress_callback,
@@ -2506,12 +2522,70 @@ def generar_con_gemini_resistente(
     raise ultimo_error if ultimo_error else RuntimeError("Error desconocido de Gemini.")
 
 
+def generar_con_respaldo_gemini(client, model, contents, config,
+                              progress_callback=None, etapa="Procesando"):
+    """Al agotar 3.8/3.7 continúa con los demás modelos configurados."""
+    agotados = set()
+    last_error = None
+    for candidate in _modelos_gemini_disponibles(model):
+        if candidate in agotados:
+            continue
+        attempted = set()
+        try:
+            return generar_con_gemini_resistente(
+                client, candidate, contents, config,
+                progress_callback=progress_callback, etapa=etapa,
+                max_reintentos_transitorios=(MAX_REINTENTOS_GEMINI
+                    if candidate in {"gemini-3.8-flash", "gemini-3.7-flash"} else 2),
+                modelos_intentados=attempted,
+            )
+        except Exception as exc:
+            last_error = exc
+            if not (error_gemini_modelo_no_disponible(exc) or error_gemini_transitorio(exc)):
+                raise
+            agotados.update(attempted)
+            actualizar_progreso(
+                progress_callback, 0,
+                f"{etapa} · {candidate} no pudo completar la solicitud; "
+                "continuando con el siguiente modelo de respaldo configurado.",
+            )
+    actualizar_progreso(progress_callback, 0,
+        f"{etapa} · se agotaron todos los modelos configurados sin respuesta utilizable.")
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("No hay modelos Gemini configurados.")
+
+
+def diagnosticar_conexion_gemini(api_key, model_name, progress_callback=None):
+    """Prueba mínima por modelo, sin documento, esquema JSON ni búsqueda web."""
+    client = crear_cliente_gemini(api_key)
+    results = []
+    for model in _modelos_gemini_disponibles(model_name):
+        started = time.monotonic()
+        try:
+            response = generar_con_gemini_resistente(
+                client, model, "Responde solamente OK.",
+                types.GenerateContentConfig(max_output_tokens=128),
+                progress_callback=progress_callback, etapa="Prueba mínima de conexión",
+                max_reintentos_transitorios=1,
+            )
+            results.append(dict(modelo=model, resultado="Respuesta recibida",
+                                segundos=round(time.monotonic() - started, 1)))
+        except Exception as exc:
+            results.append(dict(modelo=model, resultado=limpiar_log_generacion(exc),
+                                segundos=round(time.monotonic() - started, 1)))
+            # Un fallo de credenciales afecta a todos los modelos; no repetirlo.
+            if not (error_gemini_transitorio(exc) or error_gemini_modelo_no_disponible(exc)):
+                break
+    return results
+
+
 
 
 def generar_presupuesto_ia(api_key, model_name, project_data, params,
                           progress_callback=None) -> PresupuestoIA:
     """Una sola lectura del alcance; las referencias de precios se revisan después."""
-    client = genai.Client(api_key=api_key)
+    client = crear_cliente_gemini(api_key)
     prompt = f"""
 Eres presupuestista de remodelación e interiorismo en México. La empresa subcontrata.
 Genera conceptos comerciales claros a partir del alcance, no una fila por recurso.
@@ -2543,9 +2617,9 @@ REGLAS
    El desperdicio ya está incluido y no se suma otra vez.
 7. Criterios y advertencias breves. Devuelve solo el objeto estructurado.
 """
-    for model in _modelos_gemini_disponibles(model_name):
+    for model in [model_name or "gemini-3.8-flash"]:
         try:
-            response = generar_con_gemini_resistente(
+            response = generar_con_respaldo_gemini(
                 client, model, prompt,
                 configuracion_gemini_razonada(PresupuestoIA, thinking_level="low",
                                               max_output_tokens=16384),
@@ -2600,7 +2674,7 @@ def revisar_presupuesto_ia(
     progress_callback=None,
 ) -> RevisionPresupuestoIA:
     """Interpreta una petición libre como operaciones granulares sobre el presupuesto vigente."""
-    client = genai.Client(api_key=api_key)
+    client = crear_cliente_gemini(api_key)
 
     presupuesto_actual = []
     for idx, x in enumerate(current_items, start=1):
@@ -2666,14 +2740,14 @@ REGLAS DEL EDITOR
 """
 
     modelos = []
-    for model in _modelos_gemini_disponibles(model_name):
+    for model in [model_name or "gemini-3.8-flash"]:
         if model and model not in modelos:
             modelos.append(model)
 
     last_error = None
     for model in modelos:
         try:
-            response = generar_con_gemini_resistente(
+            response = generar_con_respaldo_gemini(
                 client=client,
                 model=model,
                 contents=prompt,
@@ -6037,6 +6111,25 @@ with st.sidebar:
                 key="model_name",
             )
 
+        with st.expander("Diagnóstico de Gemini"):
+            st.caption("Comprueba cada modelo con una petición mínima, sin enviar tu presupuesto.")
+            if st.button("Probar conexión Gemini", disabled=st.session_state.get("generation_in_progress", False)):
+                diagnostic_key = get_api_key_runtime()
+                if not diagnostic_key:
+                    st.error("Falta GEMINI_API_KEY.")
+                else:
+                    diagnostic_status = st.empty()
+                    st.session_state["gemini_diagnostic"] = diagnosticar_conexion_gemini(
+                        diagnostic_key, model_name,
+                        progress_callback=lambda _pct, msg: diagnostic_status.text(limpiar_log_generacion(msg)),
+                    )
+                    diagnostic_status.empty()
+            if st.session_state.get("gemini_diagnostic"):
+                st.dataframe(st.session_state["gemini_diagnostic"], hide_index=True,
+                             use_container_width=True)
+                st.caption("Un 503 en esta prueba también ocurre sin un prompt grande. "
+                           "Una respuesta correcta solo confirma esta petición mínima.")
+
         st.divider()
         if st.button("Reiniciar página", use_container_width=True):
             st.session_state.clear()
@@ -6582,12 +6675,13 @@ if "generated" not in st.session_state:
             checkpoint = st.session_state.get("generation_checkpoint") or {}
             st.session_state["generation_last_error"] = limpiar_log_generacion(exc)
             st.session_state["generation_error_trace"] = limpiar_log_generacion(traceback.format_exc())
-            ui_progress(progress_state["pct"], f"ERROR del programa · {type(exc).__name__}: {exc}")
+            error_origin = "ERROR de API Gemini" if error_gemini_transitorio(exc) or error_gemini_modelo_no_disponible(exc) else "ERROR del programa"
+            ui_progress(progress_state["pct"], f"{error_origin} · {type(exc).__name__}: {exc}")
             st.text(st.session_state["generation_error_trace"])
             stage = int(checkpoint.get("stage") or 0)
             if error_gemini_transitorio(exc):
                 st.error(
-                    "Gemini sigue rechazando temporalmente la solicitud después de todos los reintentos. "
+                    "Los modelos Gemini configurados siguen rechazando temporalmente la solicitud después de los reintentos. "
                     f"Se conservó el avance hasta la etapa {stage}/4. "
                     "Al volver a pulsar Generar presupuesto se reanudará desde el último checkpoint compatible."
                 )
