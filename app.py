@@ -310,13 +310,22 @@ def nombre_subpartida_excel(item: dict) -> str:
 
 def estructura_partidas_excel(items: list[dict]) -> list[dict]:
     """
-    Asigna numeración jerárquica estable según el orden comercial:
-      1. Trámites       / 1.1 Licencias
-      2. Acabados       / 2.1 Pisos
-      3. Carpintería    / 3.1 Frentes
+    Asigna numeración jerárquica estable.
+
+    Regla importante:
+      - Presupuestos generados por la app: usan el orden comercial de ejecución.
+      - Presupuestos importados: conservan exactamente el orden de las filas
+        del archivo original para no alterar la secuencia definida por el usuario.
+
     La numeración se genera en Python y no se deja a criterio de Gemini.
     """
-    ordered = ordenar_items_comercialmente(items)
+    # Los archivos importados se marcan durante la importación. En esos casos
+    # el orden de origen es parte de los datos y NO debe ser reordenado por
+    # la lógica comercial de la aplicación.
+    preserve_input_order = bool(items) and all(
+        bool(item.get("_preserve_input_order")) for item in items
+    )
+    ordered = [dict(item) for item in items] if preserve_input_order else ordenar_items_comercialmente(items)
     section_numbers = {}
     section_counts = {}
     output = []
@@ -2908,10 +2917,17 @@ def resolver_items(
             price_status = "REFERENCIA_EXTERNA"
             price_confidence = external.get("confidence", "Media")
         else:
+            # Gemini entrega el costo base estimado. El +10% comercial se aplica
+            # exclusivamente aquí, desde Python, para no contaminar el Excel con
+            # una fórmula ni reaplicarlo a precios históricos o de catálogo.
             unit_cost = float(act.costo_unitario_estimado)
+            unit_cost *= 1.0 + AJUSTE_PRECIO_IA_PCT / 100.0
             concept_id = None
             source = "IA_ESTIMADO"
-            source_detail = "Estimación inicial de Gemini; requiere validación comercial."
+            source_detail = (
+                "Estimación inicial de Gemini; requiere validación comercial. "
+                f"Ajuste Python aplicado: +{AJUSTE_PRECIO_IA_PCT:.0f}%."
+            )
             if external:
                 source_detail += (
                     " | Referencia CDMX encontrada pero no aplicada automáticamente: "
@@ -3245,8 +3261,8 @@ def crear_excel(
       Partida | Subpartida | Descripción Técnica | Unidad | Cant. |
       Precio Unitario | Importe Total
 
-      El Importe Total es el valor comercial editable. El Precio Unitario se
-      obtiene automáticamente como Importe Total / Cantidad.
+      El Precio Unitario es el valor comercial editable. El Importe Total se
+      calcula automáticamente como Precio Unitario * Cantidad.
 
     02 Control Interno:
       costos, indirectos, utilidad y comparación de precios.
@@ -3388,13 +3404,11 @@ def crear_excel(
         ws.cell(row, 4, item["unit"])
         ws.cell(row, 5, float(item["quantity"]))
 
-        # El importe total es el dato comercial que se puede editar libremente
-        # para subir, bajar o redondear el precio final del concepto.
-        ws.cell(row, 7, float(item["sale_amount"]))
-
-        # El precio unitario se deriva siempre del importe comercial / cantidad.
-        # Si cambia el importe o la cantidad, el P.U. se actualiza automáticamente.
-        ws.cell(row, 6, f"=IF(E{row}=0,0,G{row}/E{row})")
+        # El Precio Unitario es el dato comercial editable.
+        # El Importe Total siempre se deriva de P.U. * Cantidad, de modo que
+        # cambiar el número de piezas/metros actualiza el total sin alterar el P.U.
+        ws.cell(row, 6, float(item["unit_sale"]))
+        ws.cell(row, 7, f"=E{row}*F{row}")
 
         ws.cell(row, 5).number_format = "0.00"
         ws.cell(row, 6).number_format = '$#,##0.00'
@@ -3413,9 +3427,9 @@ def crear_excel(
         ws.cell(row, 6).alignment = Alignment(horizontal="right")
 
         # Diferencia visual discreta:
-        # G es editable; F es un valor derivado.
-        ws.cell(row, 7).fill = PatternFill("solid", fgColor=editable_fill)
-        ws.cell(row, 6).fill = PatternFill("solid", fgColor=formula_fill)
+        # F es editable; G es un valor derivado.
+        ws.cell(row, 6).fill = PatternFill("solid", fgColor=editable_fill)
+        ws.cell(row, 7).fill = PatternFill("solid", fgColor=formula_fill)
 
         ws.row_dimensions[row].height = max(
             34,
@@ -3630,6 +3644,10 @@ def crear_excel(
 
 MARCA_PLATAFORMA_PCT = 30.0
 IVA_PLATAFORMA_PCT = 16.0
+
+# Ajuste fijo aplicado en Python únicamente a los precios base estimados por Gemini.
+# No se escribe como fórmula en el Excel y no se reaplica a referencias internas/CDMX.
+AJUSTE_PRECIO_IA_PCT = 10.0
 PLANTILLA_PLATAFORMA_B64 = "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"
 
 
@@ -3772,7 +3790,8 @@ def item_importado(code, category, subcategory, description, unit, quantity, uni
         waste_reference_pct=0, quantity_criterion=item.get('quantity_criterion') or 'Cantidad del archivo importado.',
         inclusion_basis=item.get('inclusion_basis') or 'Concepto del archivo importado.',
         quantity_confidence=item.get('quantity_confidence') or 'Por confirmar',
-        considerations=item.get('considerations') or '')
+        considerations=item.get('considerations') or '',
+        _preserve_input_order=bool(item.get('_preserve_input_order')))
     return aplicar_composicion_costo(item)
 
 
@@ -3843,7 +3862,8 @@ def importar_presupuesto_excel(data, file_name, default_params):
             item = item_importado(str(prev['code']) if prev else str(code or uuid.uuid4().hex[:12]), category,
                 str(ws.cell(row,3).value or 'Concepto'), str(description),
                 str(ws.cell(row,6).value or 'LOTE'), qty, total/qty if qty else 0, params, prev)
-            item.update(platform_code=code, platform_chapter_code=chapter_code)
+            item.update(platform_code=code, platform_chapter_code=chapter_code,
+                        _preserve_input_order=True)
             items.append(item)
     else:
         matches = []
@@ -3879,18 +3899,28 @@ def importar_presupuesto_excel(data, file_name, default_params):
             control=control_items[idx] if idx<len(control_items) else {}
             prev=old_by_code.get(control.get('code')) or (previous_items[idx] if idx<len(previous_items) else control)
             qty=numero_presupuesto(valor_excel(wb,cached,ws.title,f"{get_column_letter(labels['cant'])}{rr}"),f'Cantidad fila {rr}')
-            # Importe Total es la entrada editable en el formato antiguo.
-            if total_col:
-                total=numero_presupuesto(valor_excel(wb,cached,ws.title,f'{get_column_letter(total_col)}{rr}'),f'Importe fila {rr}')
+            # El Precio Unitario es la fuente de verdad del formato de revisión.
+            # Esto funciona tanto con archivos nuevos (P.U. manual + total fórmula)
+            # como con archivos antiguos (P.U. fórmula + total manual).
+            if pu_col:
+                pu=numero_presupuesto(
+                    valor_excel(wb,cached,ws.title,f'{get_column_letter(pu_col)}{rr}'),
+                    f'Precio unitario fila {rr}'
+                )
+            elif total_col:
+                total=numero_presupuesto(
+                    valor_excel(wb,cached,ws.title,f'{get_column_letter(total_col)}{rr}'),
+                    f'Importe fila {rr}'
+                )
                 if qty == 0 and total != 0:
                     raise ValueError(f'Fila {rr}: hay importe con cantidad cero.')
                 pu=total/qty if qty else 0
-            else:
-                pu=numero_presupuesto(valor_excel(wb,cached,ws.title,f'{get_column_letter(pu_col)}{rr}'),f'Precio fila {rr}')
             category=re.sub(r'^\d+\.\s*','',str(ws.cell(rr,labels['partida']).value or 'OTROS TRABAJOS'))
             sub=re.sub(r'^\d+\.\d+\s*','',str(ws.cell(rr,labels['subpartida']).value or 'Concepto'))
-            items.append(item_importado(str(prev.get('code') or f'IMP-{idx+1:03d}'),category,sub,str(description),
-                str(ws.cell(rr,labels['unidad']).value),qty,pu,params,prev))
+            imported_item = item_importado(str(prev.get('code') or f'IMP-{idx+1:03d}'),category,sub,str(description),
+                str(ws.cell(rr,labels['unidad']).value),qty,pu,params,prev)
+            imported_item['_preserve_input_order'] = True
+            items.append(imported_item)
     if not items:
         raise ValueError('No se encontraron conceptos utilizables en el archivo.')
     if len({str(x['code']) for x in items}) != len(items):
@@ -5336,7 +5366,9 @@ if "generated" not in st.session_state:
         params = {
             "indirect_pct": float(indirect_pct),
             "profit_pct": float(profit_pct),
-            "iva_pct": float(iva_pct),
+            # El presupuesto de revisión NO lleva IVA. El IVA solo se usa en
+            # el archivo de plataforma, donde forma parte de la plantilla.
+            "iva_pct": 0.0,
             "waste_pct": float(waste_pct),
         }
         project_data = {
